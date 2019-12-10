@@ -49,7 +49,6 @@ type Backend interface {
 	ProtocolVersion() int
 	SuggestPrice(ctx context.Context) (*big.Int, error)
 	ChainDb() ethdb.Database
-	EventMux() *event.TypeMux
 	AccountManager() *accounts.Manager
 	XDCxService() *XDCx.XDCX
 	LendingService() *XDCxlending.Lending
