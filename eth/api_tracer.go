@@ -222,7 +222,7 @@ func (api *PrivateDebugAPI) traceChain(ctx context.Context, start, end *types.Bl
 							balance = value
 						}
 					}
-					msg, _ := tx.AsMessage(signer, balance, task.block.Number())
+					msg, _ := tx.AsMessage(signer, task.block.BaseFee(), balance, task.block.Number())
 					txctx := &txTraceContext{
 						index: i,
 						hash:  tx.Hash(),
@@ -468,7 +468,7 @@ func (api *PrivateDebugAPI) traceBlock(ctx context.Context, block *types.Block, 
 						balance = value
 					}
 				}
-				msg, _ := txs[task.index].AsMessage(signer, balance, block.Number())
+				msg, _ := txs[task.index].AsMessage(signer, block.BaseFee(), balance, block.Number())
 				txctx := &txTraceContext{
 					index: task.index,
 					hash:  txs[task.index].Hash(),
@@ -502,7 +502,7 @@ func (api *PrivateDebugAPI) traceBlock(ctx context.Context, block *types.Block, 
 			}
 		}
 		// Generate the next state snapshot fast without tracing
-		msg, _ := tx.AsMessage(signer, balance, block.Number())
+		msg, _ := tx.AsMessage(signer, block.BaseFee(), balance, block.Number())
 		statedb.Prepare(tx.Hash(), block.Hash(), i)
 		vmctx := core.NewEVMContext(msg, block.Header(), api.eth.blockchain, nil)
 
@@ -782,7 +782,7 @@ func (api *PrivateDebugAPI) computeTxEnv(blockHash common.Hash, txIndex int, ree
 					balanceFee = value
 				}
 			}
-			msg, err := tx.AsMessage(types.MakeSigner(api.config, block.Header().Number), balanceFee, block.Number())
+			msg, err := tx.AsMessage(types.MakeSigner(api.config, block.Header().Number), block.BaseFee(), balanceFee, block.Number())
 			if err != nil {
 				return nil, vm.Context{}, nil, fmt.Errorf("tx %x failed: %v", tx.Hash(), err)
 			}
