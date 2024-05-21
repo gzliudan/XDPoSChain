@@ -427,12 +427,10 @@ func (tx *Transaction) AsMessage(s Signer, baseFee *big.Int, balanceFee *big.Int
 		checkNonce:      true,
 		balanceTokenFee: balanceFee,
 	}
-
 	// If baseFee provided, set gasPrice to effectiveGasPrice.
 	if baseFee != nil {
 		msg.gasPrice = math.BigMin(msg.gasPrice.Add(msg.tip, baseFee), msg.feeCap)
 	}
-
 	if balanceFee != nil {
 		if number.Cmp(common.BlockNumberGas50x) >= 0 {
 			msg.gasPrice = common.GasPrice50x
