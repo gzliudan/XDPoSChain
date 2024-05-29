@@ -216,6 +216,14 @@ func (self *worker) pendingBlock() *types.Block {
 	return self.current.Block
 }
 
+// pendingBlockAndReceipts returns pending block and corresponding receipts.
+func (w *worker) pendingBlockAndReceipts() (*types.Block, types.Receipts) {
+	// return a snapshot to avoid contention on currentMu mutex
+	w.currentMu.Lock()
+	defer w.currentMu.Unlock()
+	return w.current.Block, w.current.receipts
+}
+
 func (self *worker) start() {
 	self.mu.Lock()
 	defer self.mu.Unlock()
