@@ -1205,7 +1205,7 @@ func (s *PublicBlockChainAPI) getCandidatesFromSmartContract() ([]utils.Masterno
 		return []utils.Masternode{}, err
 	}
 
-	addr := common.HexToAddress(common.MasternodeVotingSMC)
+	addr := common.MasternodeVotingSMCBinary
 	validator, err := contractValidator.NewXDCValidator(addr, client)
 	if err != nil {
 		return []utils.Masternode{}, err
