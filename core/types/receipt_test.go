@@ -18,12 +18,66 @@ package types
 
 import (
 	"bytes"
+	"math"
 	"math/big"
 	"reflect"
 	"testing"
 
 	"github.com/XinFinOrg/XDPoSChain/common"
 	"github.com/XinFinOrg/XDPoSChain/rlp"
+)
+
+var (
+	legacyReceipt = &Receipt{
+		Status:            ReceiptStatusFailed,
+		CumulativeGasUsed: 1,
+		Logs: []*Log{
+			{
+				Address: common.BytesToAddress([]byte{0x11}),
+				Topics:  []common.Hash{common.HexToHash("dead"), common.HexToHash("beef")},
+				Data:    []byte{0x01, 0x00, 0xff},
+			},
+			{
+				Address: common.BytesToAddress([]byte{0x01, 0x11}),
+				Topics:  []common.Hash{common.HexToHash("dead"), common.HexToHash("beef")},
+				Data:    []byte{0x01, 0x00, 0xff},
+			},
+		},
+	}
+	accessListReceipt = &Receipt{
+		Status:            ReceiptStatusFailed,
+		CumulativeGasUsed: 1,
+		Logs: []*Log{
+			{
+				Address: common.BytesToAddress([]byte{0x11}),
+				Topics:  []common.Hash{common.HexToHash("dead"), common.HexToHash("beef")},
+				Data:    []byte{0x01, 0x00, 0xff},
+			},
+			{
+				Address: common.BytesToAddress([]byte{0x01, 0x11}),
+				Topics:  []common.Hash{common.HexToHash("dead"), common.HexToHash("beef")},
+				Data:    []byte{0x01, 0x00, 0xff},
+			},
+		},
+		Type: AccessListTxType,
+	}
+	eip1559Receipt = &Receipt{
+		Status:            ReceiptStatusFailed,
+		CumulativeGasUsed: 1,
+		Logs: []*Log{
+			{
+				Address: common.BytesToAddress([]byte{0x11}),
+				Topics:  []common.Hash{common.HexToHash("dead"), common.HexToHash("beef")},
+				Data:    []byte{0x01, 0x00, 0xff},
+			},
+			{
+				Address: common.BytesToAddress([]byte{0x01, 0x11}),
+				Topics:  []common.Hash{common.HexToHash("dead"), common.HexToHash("beef")},
+				Data:    []byte{0x01, 0x00, 0xff},
+			},
+		},
+		Type: DynamicFeeTxType,
+	}
 )
 
 func TestDecodeEmptyTypedReceipt(t *testing.T) {
@@ -148,4 +202,78 @@ func TestTypedReceiptEncodingDecoding(t *testing.T) {
 		}
 		check(bundle)
 	}
+}
+
+func TestReceiptUnmarshalBinary(t *testing.T) {
+	// Legacy Receipt
+	legacyBinary := common.FromHex("f901c58001b9010000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000500000000000000000000000000000000000014000000000000000000000000000000000000000000000000000000000000000000000000000010000080000000000000000000004000000000000000000000000000040000000000000000000000000000800000000000000000000000000000000000000000000000000000400000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000f8bef85d940000000000000000000000000000000000000011f842a0000000000000000000000000000000000000000000000000000000000000deada0000000000000000000000000000000000000000000000000000000000000beef830100fff85d940000000000000000000000000000000000000111f842a0000000000000000000000000000000000000000000000000000000000000deada0000000000000000000000000000000000000000000000000000000000000beef830100ff")
+	gotLegacyReceipt := new(Receipt)
+	if err := gotLegacyReceipt.UnmarshalBinary(legacyBinary); err != nil {
+		t.Fatalf("unmarshal binary error: %v", err)
+	}
+	legacyReceipt.Bloom = CreateBloom(Receipts{legacyReceipt})
+	if !reflect.DeepEqual(gotLegacyReceipt, legacyReceipt) {
+		t.Errorf("receipt unmarshalled from binary mismatch, got %v want %v", gotLegacyReceipt, legacyReceipt)
+	}
+
+	// 2930 Receipt
+	accessListBinary := common.FromHex("01f901c58001b9010000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000500000000000000000000000000000000000014000000000000000000000000000000000000000000000000000000000000000000000000000010000080000000000000000000004000000000000000000000000000040000000000000000000000000000800000000000000000000000000000000000000000000000000000400000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000f8bef85d940000000000000000000000000000000000000011f842a0000000000000000000000000000000000000000000000000000000000000deada0000000000000000000000000000000000000000000000000000000000000beef830100fff85d940000000000000000000000000000000000000111f842a0000000000000000000000000000000000000000000000000000000000000deada0000000000000000000000000000000000000000000000000000000000000beef830100ff")
+	gotAccessListReceipt := new(Receipt)
+	if err := gotAccessListReceipt.UnmarshalBinary(accessListBinary); err != nil {
+		t.Fatalf("unmarshal binary error: %v", err)
+	}
+	accessListReceipt.Bloom = CreateBloom(Receipts{accessListReceipt})
+	if !reflect.DeepEqual(gotAccessListReceipt, accessListReceipt) {
+		t.Errorf("receipt unmarshalled from binary mismatch, got %v want %v", gotAccessListReceipt, accessListReceipt)
+	}
+
+	// 1559 Receipt
+	eip1559RctBinary := common.FromHex("02f901c58001b9010000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000500000000000000000000000000000000000014000000000000000000000000000000000000000000000000000000000000000000000000000010000080000000000000000000004000000000000000000000000000040000000000000000000000000000800000000000000000000000000000000000000000000000000000400000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000f8bef85d940000000000000000000000000000000000000011f842a0000000000000000000000000000000000000000000000000000000000000deada0000000000000000000000000000000000000000000000000000000000000beef830100fff85d940000000000000000000000000000000000000111f842a0000000000000000000000000000000000000000000000000000000000000deada0000000000000000000000000000000000000000000000000000000000000beef830100ff")
+	got1559Receipt := new(Receipt)
+	if err := got1559Receipt.UnmarshalBinary(eip1559RctBinary); err != nil {
+		t.Fatalf("unmarshal binary error: %v", err)
+	}
+	eip1559Receipt.Bloom = CreateBloom(Receipts{eip1559Receipt})
+	if !reflect.DeepEqual(got1559Receipt, eip1559Receipt) {
+		t.Errorf("receipt unmarshalled from binary mismatch, got %v want %v", got1559Receipt, eip1559Receipt)
+	}
+}
+
+func clearComputedFieldsOnReceipts(t *testing.T, receipts Receipts) {
+	t.Helper()
+
+	for _, receipt := range receipts {
+		clearComputedFieldsOnReceipt(t, receipt)
+	}
+}
+
+func clearComputedFieldsOnReceipt(t *testing.T, receipt *Receipt) {
+	t.Helper()
+
+	receipt.TxHash = common.Hash{}
+	receipt.BlockHash = common.Hash{}
+	receipt.BlockNumber = big.NewInt(math.MaxUint32)
+	receipt.TransactionIndex = math.MaxUint32
+	receipt.ContractAddress = common.Address{}
+	receipt.GasUsed = 0
+
+	clearComputedFieldsOnLogs(t, receipt.Logs)
+}
+
+func clearComputedFieldsOnLogs(t *testing.T, logs []*Log) {
+	t.Helper()
+
+	for _, log := range logs {
+		clearComputedFieldsOnLog(t, log)
+	}
+}
+
+func clearComputedFieldsOnLog(t *testing.T, log *Log) {
+	t.Helper()
+
+	log.BlockNumber = math.MaxUint32
+	log.BlockHash = common.Hash{}
+	log.TxHash = common.Hash{}
+	log.TxIndex = math.MaxUint32
+	log.Index = math.MaxUint32
 }
