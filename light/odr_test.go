@@ -185,7 +185,7 @@ func odrContractCall(ctx context.Context, db ethdb.Database, bc *core.BlockChain
 		if value, ok := feeCapacity[testContractAddr]; ok {
 			balanceTokenFee = value
 		}
-		msg := callmsg{types.NewMessage(testBankAddress, &testContractAddr, 0, new(big.Int), 1000000, big.NewInt(params.InitialBaseFee), big.NewInt(params.InitialBaseFee), new(big.Int), data, nil, false, balanceTokenFee, header.Number)}
+		msg := callmsg{types.NewMessage(testBankAddress, &testContractAddr, 0, new(big.Int), 1000000, big.NewInt(params.InitialBaseFee), big.NewInt(params.InitialBaseFee), new(big.Int), data, nil, true, balanceTokenFee, header.Number)}
 		context := core.NewEVMContext(msg, header, chain, nil)
 		vmenv := vm.NewEVM(context, st, nil, config, vm.Config{NoBaseFee: true})
 		gp := new(core.GasPool).AddGas(math.MaxUint64)
