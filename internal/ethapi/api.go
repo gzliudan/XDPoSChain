@@ -893,6 +893,10 @@ func (s *PublicBlockChainAPI) GetCandidateStatus(ctx context.Context, coinbaseAd
 			result[fieldSuccess] = false
 			return result, err
 		}
+		if statedb == nil {
+			result[fieldSuccess] = false
+			return result, errors.New("nil statedb in GetCandidateStatus")
+		}
 		candidatesAddresses := state.GetCandidates(statedb)
 		candidates = make([]utils.Masternode, 0, len(candidatesAddresses))
 		for _, address := range candidatesAddresses {
@@ -1047,6 +1051,10 @@ func (s *PublicBlockChainAPI) GetCandidates(ctx context.Context, epoch rpc.Epoch
 		if err != nil {
 			result[fieldSuccess] = false
 			return result, err
+		}
+		if statedb == nil {
+			result[fieldSuccess] = false
+			return result, errors.New("nil statedb in GetCandidates")
 		}
 		candidatesAddresses := state.GetCandidates(statedb)
 		candidates = make([]utils.Masternode, 0, len(candidatesAddresses))
