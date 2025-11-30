@@ -50,6 +50,7 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/eth/filters"
 	"github.com/XinFinOrg/XDPoSChain/eth/gasprice"
 	"github.com/XinFinOrg/XDPoSChain/eth/hooks"
+	"github.com/XinFinOrg/XDPoSChain/eth/scaner"
 	"github.com/XinFinOrg/XDPoSChain/eth/tracers"
 	"github.com/XinFinOrg/XDPoSChain/ethdb"
 	"github.com/XinFinOrg/XDPoSChain/event"
@@ -90,6 +91,7 @@ type Ethereum struct {
 
 	bloomRequests chan chan *bloombits.Retrieval // Channel receiving bloom data retrieval requests
 	bloomIndexer  *core.ChainIndexer             // Bloom indexer operating during block imports
+	scanTasks     *scaner.Runner
 
 	APIBackend *EthAPIBackend
 
@@ -105,6 +107,7 @@ type Ethereum struct {
 	lock    sync.RWMutex // Protects the variadic fields (e.g. gas price and etherbase)
 	XDCX    *XDCx.XDCX
 	Lending *XDCxlending.Lending
+	scanCfg scaner.ScanTasksConfig
 }
 
 // New creates a new Ethereum object (including the
@@ -427,6 +430,11 @@ func New(stack *node.Node, config *ethconfig.Config, XDCXServ *XDCx.XDCX, lendin
 	return eth, nil
 }
 
+func (e *Ethereum) SetScanTasksConfig(cfg scaner.ScanTasksConfig) {
+	e.scanCfg = cfg
+	e.scanTasks = scaner.NewRunner(e.blockchain, cfg)
+}
+
 func makeExtraData(extra []byte) []byte {
 	if len(extra) == 0 {
 		// create default extradata
@@ -611,6 +619,12 @@ func (e *Ethereum) Protocols() []p2p.Protocol {
 // Start implements node.Lifecycle, starting all internal goroutines needed by the
 // Ethereum protocol implementation.
 func (e *Ethereum) Start() error {
+	if e.scanTasks != nil {
+		if err := e.scanTasks.Start(); err != nil {
+			return err
+		}
+	}
+
 	e.startEthEntryUpdate(e.p2pServer.LocalNode())
 
 	// Start the bloom bits servicing goroutines
@@ -632,6 +646,12 @@ func (e *Ethereum) Start() error {
 // Stop implements node.Lifecycle, terminating all internal goroutines used by the
 // Ethereum protocol.
 func (e *Ethereum) Stop() error {
+	log.Info("Stopping scan tasks")
+	if e.scanTasks != nil {
+		e.scanTasks.Stop()
+	}
+	log.Info("Scan tasks stopped")
+
 	log.Info("Stopping Ethereum bloomIndexer start")
 	e.bloomIndexer.Close()
 	log.Info("Ethereum bloomIndexer stopped")

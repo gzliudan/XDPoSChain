@@ -36,6 +36,7 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/cmd/utils"
 	"github.com/XinFinOrg/XDPoSChain/common"
 	"github.com/XinFinOrg/XDPoSChain/eth/ethconfig"
+	"github.com/XinFinOrg/XDPoSChain/eth/scaner"
 	"github.com/XinFinOrg/XDPoSChain/internal/ethapi"
 	"github.com/XinFinOrg/XDPoSChain/internal/flags"
 	"github.com/XinFinOrg/XDPoSChain/internal/version"
@@ -96,6 +97,7 @@ type Bootnodes struct {
 
 type XDCConfig struct {
 	Eth       ethconfig.Config
+	ScanTasks scaner.ScanTasksConfig `toml:"-"`
 	Node      node.Config
 	Ethstats  ethstatsConfig
 	Metrics   metrics.Config
@@ -137,6 +139,7 @@ func loadBaseConfig(ctx *cli.Context) XDCConfig {
 	// Load defaults.
 	cfg := XDCConfig{
 		Eth:       ethconfig.Defaults,
+		ScanTasks: scaner.ScanTasksConfig{},
 		XDCX:      XDCx.DefaultConfig,
 		Node:      defaultNodeConfig(),
 		Metrics:   metrics.DefaultConfig,
@@ -203,6 +206,8 @@ func makeConfigNode(ctx *cli.Context) (*node.Node, XDCConfig) {
 
 	applyMetricConfig(ctx, &cfg)
 
+	utils.SetScanTasks(ctx, stack, &cfg.ScanTasks)
+
 	return stack, cfg
 }
 
@@ -216,7 +221,7 @@ func makeFullNode(ctx *cli.Context) (*node.Node, ethapi.Backend, XDCConfig) {
 	// Register XDCX's OrderBook service if requested.
 	// enable in default
 	XDCXServ, lendingServ := utils.RegisterXDCXService(stack, &cfg.XDCX)
-	backend, eth := utils.RegisterEthService(stack, &cfg.Eth, XDCXServ, lendingServ)
+	backend, eth := utils.RegisterEthService(stack, &cfg.Eth, cfg.ScanTasks, XDCXServ, lendingServ)
 
 	// Create gauge with geth system and build information
 	if eth != nil { // The 'eth' backend may be nil in light mode
