@@ -141,6 +141,8 @@ var (
 		utils.LogBacktraceAtFlag,
 		utils.AnnounceTxsFlag,
 		utils.StoreRewardFlag,
+		utils.ScanTxInfoFlag,
+		utils.ScanKycFlag,
 		utils.SetHeadFlag,
 		utils.DeleteAllBadBlocksFlag,
 	}, utils.NetworkFlags, utils.DatabaseFlags)

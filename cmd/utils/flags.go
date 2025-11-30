@@ -49,6 +49,7 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/eth/ethconfig"
 	"github.com/XinFinOrg/XDPoSChain/eth/filters"
 	"github.com/XinFinOrg/XDPoSChain/eth/gasprice"
+	"github.com/XinFinOrg/XDPoSChain/eth/scaner"
 	"github.com/XinFinOrg/XDPoSChain/eth/tracers"
 	"github.com/XinFinOrg/XDPoSChain/ethdb"
 	"github.com/XinFinOrg/XDPoSChain/ethstats"
@@ -868,6 +869,18 @@ var (
 		Value:    false,
 		Category: flags.MiscCategory,
 	}
+	ScanTxInfoFlag = &cli.StringFlag{
+		Name:     "scan-txinfo",
+		Usage:    "[start]:[block-batch]:[tx-batch], e.g. 1:2000:20000, empty field use default value",
+		Value:    "",
+		Category: flags.MiscCategory,
+	}
+	ScanKycFlag = &cli.StringFlag{
+		Name:     "scan-kyc",
+		Usage:    "[start]:[block-batch], e.g. 1:10000,  empty field use default value",
+		Value:    "",
+		Category: flags.MiscCategory,
+	}
 
 	// XDC settings
 	EnableXDCPrefixFlag = &cli.BoolFlag{
@@ -1504,6 +1517,132 @@ func SetXDCXConfig(ctx *cli.Context, cfg *XDCx.Config, XDCDataDir string) {
 	log.Info("Set XDCX config", "DataDir", cfg.DataDir, "DBName", cfg.DBName)
 }
 
+// SetScanTasks parses the scan task CLI flags and updates the eth scan task
+// configuration.
+//
+// Scan tasks are CLI-only: config files do not enable or configure them.
+//
+// Format:
+//   - --scan-txinfo=[start]:[block-batch]:[tx-batch]
+//   - --scan-kyc=[start]:[block-batch]
+//   - Empty values or omitted fields use defaults.
+//   - If neither flag is provided, all scan tasks remain disabled.
+func SetScanTasks(ctx *cli.Context, stack *node.Node, cfg *scaner.ScanTasksConfig) {
+	cfg.TxInfo = scaner.ScanTaskConfig{}
+	cfg.Kyc = scaner.ScanTaskConfig{}
+	cfg.OutputDir = ""
+	cfg.StateDir = ""
+
+	parseField := func(flagName, fieldName, raw string, fallback uint64, zeroUsesDefault bool) uint64 {
+		if raw == "" {
+			return fallback
+		}
+		parsed, err := strconv.ParseUint(raw, 10, 64)
+		if err != nil {
+			Fatalf("Invalid value for --%s %s: %v", flagName, fieldName, err)
+		}
+		if zeroUsesDefault && parsed == 0 {
+			return fallback
+		}
+		return parsed
+	}
+
+	if ctx.IsSet(ScanTxInfoFlag.Name) {
+		raw := strings.TrimSpace(ctx.String(ScanTxInfoFlag.Name))
+		parts := []string{}
+		if raw != "" {
+			parts = strings.Split(raw, ":")
+			for i := range parts {
+				parts[i] = strings.TrimSpace(parts[i])
+			}
+		}
+		if len(parts) > 3 {
+			Fatalf("Invalid value for --%s: too many fields", ScanTxInfoFlag.Name)
+		}
+		taskCfg := scaner.ScanTaskConfig{Enabled: true, FromBlock: 1}
+		var batchSizeSet, batchTxLimitSet bool
+		var batchSizeVal, batchTxLimitVal uint64
+		if len(parts) > 0 {
+			// both "0" and empty string will start from block 1, skip genesis
+			taskCfg.FromBlock = parseField(ScanTxInfoFlag.Name, "start block", parts[0], 1, true)
+		}
+		if taskCfg.FromBlock > ^uint64(0)-cfg.Confirmations {
+			Fatalf(
+				"Invalid value for --%s: start block %d is too large for confirmation window %d",
+				ScanTxInfoFlag.Name,
+				taskCfg.FromBlock,
+				cfg.Confirmations,
+			)
+		}
+		if len(parts) > 1 && parts[1] != "" {
+			batchSizeVal = parseField(ScanTxInfoFlag.Name, "batch size", parts[1], scaner.DefaultTxinfoBatchSize, true)
+			batchSizeSet = true
+		}
+		if len(parts) > 2 && parts[2] != "" {
+			batchTxLimitVal = parseField(ScanTxInfoFlag.Name, "tx batch limit", parts[2], 0, false)
+			batchTxLimitSet = true
+		}
+		if !batchSizeSet && !batchTxLimitSet {
+			taskCfg.BatchSize = scaner.DefaultTxinfoBatchSize
+			taskCfg.BatchTxLimit = scaner.DefaultTxinfoTxLimit
+		} else if !batchSizeSet && batchTxLimitSet {
+			taskCfg.BatchSize = scaner.DefaultTxinfoBatchSize
+			taskCfg.BatchTxLimit = batchTxLimitVal
+		} else if batchSizeSet && !batchTxLimitSet {
+			taskCfg.BatchSize = batchSizeVal
+			if batchSizeVal <= ^uint64(0)/20 {
+				taskCfg.BatchTxLimit = batchSizeVal * 20
+			} else {
+				taskCfg.BatchTxLimit = ^uint64(0)
+			}
+		} else {
+			taskCfg.BatchSize = batchSizeVal
+			taskCfg.BatchTxLimit = batchTxLimitVal
+		}
+		cfg.TxInfo = taskCfg
+		log.Info("Scan task txinfo is configured", "fromBlock", taskCfg.FromBlock, "batchSize", taskCfg.BatchSize, "txBatchLimit", taskCfg.BatchTxLimit)
+	}
+
+	if ctx.IsSet(ScanKycFlag.Name) {
+		raw := strings.TrimSpace(ctx.String(ScanKycFlag.Name))
+		parts := []string{}
+		if raw != "" {
+			parts = strings.Split(raw, ":")
+			for i := range parts {
+				parts[i] = strings.TrimSpace(parts[i])
+			}
+		}
+		if len(parts) > 2 {
+			Fatalf("Invalid value for --%s: too many fields", ScanKycFlag.Name)
+		}
+		taskCfg := scaner.ScanTaskConfig{Enabled: true, FromBlock: 1, BatchSize: scaner.DefaultKycBatchSize}
+		if len(parts) > 0 {
+			// both "0" and empty string will start from block 1, skip genesis
+			taskCfg.FromBlock = parseField(ScanKycFlag.Name, "start block", parts[0], 1, true)
+		}
+		if taskCfg.FromBlock > ^uint64(0)-cfg.Confirmations {
+			Fatalf(
+				"Invalid value for --%s: start block %d is too large for confirmation window %d",
+				ScanKycFlag.Name,
+				taskCfg.FromBlock,
+				cfg.Confirmations,
+			)
+		}
+		if len(parts) > 1 {
+			taskCfg.BatchSize = parseField(ScanKycFlag.Name, "batch size", parts[1], scaner.DefaultKycBatchSize, true)
+		}
+		cfg.Kyc = taskCfg
+		log.Info("Scan task kyc is configured", "fromBlock", taskCfg.FromBlock, "batchSize", taskCfg.BatchSize)
+	}
+
+	if cfg.TxInfo.Enabled || cfg.Kyc.Enabled {
+		if stack.DataDir() != "" {
+			cfg.OutputDir = filepath.Join(stack.DataDir(), "scan-tasks")
+			cfg.StateDir = filepath.Join(cfg.OutputDir, "state")
+		}
+	}
+}
+
 // SetEthConfig applies eth-related command line flags to the config.
 func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 	// Avoid conflicting network flags
@@ -1696,7 +1835,7 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 }
 
 // RegisterEthService adds an Ethereum client to the stack.
-func RegisterEthService(stack *node.Node, cfg *ethconfig.Config, XDCXServ *XDCx.XDCX, lendingServ *XDCxlending.Lending) (ethapi.Backend, *eth.Ethereum) {
+func RegisterEthService(stack *node.Node, cfg *ethconfig.Config, scanCfg scaner.ScanTasksConfig, XDCXServ *XDCx.XDCX, lendingServ *XDCxlending.Lending) (ethapi.Backend, *eth.Ethereum) {
 	if cfg.SyncMode == downloader.LightSync {
 		Fatalf("can't register eth service in light sync mode, light mode has been deprecated")
 		return nil, nil
@@ -1705,6 +1844,7 @@ func RegisterEthService(stack *node.Node, cfg *ethconfig.Config, XDCXServ *XDCx.
 	if err != nil {
 		Fatalf("Failed to register the Ethereum service: %s", FormatChainConfigError(err))
 	}
+	backend.SetScanTasksConfig(scanCfg)
 	stack.RegisterAPIs(tracers.APIs(backend.APIBackend))
 	return backend.APIBackend, backend
 }
