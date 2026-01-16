@@ -410,6 +410,41 @@ var (
 		},
 	}
 
+	AllDevChainProtocolChanges = &ChainConfig{
+		ChainID:             big.NewInt(1337),
+		HomesteadBlock:      big.NewInt(0),
+		DAOForkBlock:        nil,
+		DAOForkSupport:      false,
+		EIP150Block:         big.NewInt(0),
+		EIP155Block:         big.NewInt(0),
+		EIP158Block:         big.NewInt(0),
+		ByzantiumBlock:      big.NewInt(0),
+		ConstantinopleBlock: big.NewInt(0),
+		PetersburgBlock:     big.NewInt(0),
+		IstanbulBlock:       big.NewInt(0),
+		BerlinBlock:         big.NewInt(0),
+		LondonBlock:         big.NewInt(0),
+		ShanghaiBlock:       big.NewInt(0),
+		Eip1559Block:        nil,
+		CancunBlock:         nil,
+		PragueBlock:         nil,
+		Ethash:              new(EthashConfig),
+		Clique:              nil,
+		XDPoS: &XDPoSConfig{
+			Epoch:               900,
+			Gap:                 450,
+			SkipV1Validation:    true,
+			FoudationWalletAddr: common.HexToAddress("0x0000000000000000000000000000000000000068"),
+			Reward:              250,
+			V2: &V2{
+				SwitchEpoch:   1,
+				SwitchBlock:   big.NewInt(900),
+				CurrentConfig: UnitTestV2Configs[0],
+				AllConfigs:    UnitTestV2Configs,
+			},
+		},
+	}
+
 	// TestChainConfig contains every protocol change (EIPs) introduced
 	// and accepted by the Ethereum core developers for testing purposes.
 	TestChainConfig = &ChainConfig{

@@ -38,7 +38,6 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/common/math"
 	"github.com/XinFinOrg/XDPoSChain/consensus/XDPoS"
 	"github.com/XinFinOrg/XDPoSChain/consensus/XDPoS/utils"
-	"github.com/XinFinOrg/XDPoSChain/consensus/ethash"
 	"github.com/XinFinOrg/XDPoSChain/core"
 	"github.com/XinFinOrg/XDPoSChain/core/bloombits"
 	"github.com/XinFinOrg/XDPoSChain/core/rawdb"
@@ -156,32 +155,6 @@ func NewXDCSimulatedBackend(alloc types.GenesisAlloc, gasLimit uint64, chainConf
 	backend.events = filters.NewEventSystem(backend.filterSystem, false)
 
 	blockchain.Client = backend
-
-	header := backend.blockchain.CurrentBlock()
-	block := backend.blockchain.GetBlock(header.Hash(), header.Number.Uint64())
-
-	backend.rollback(block)
-	return backend
-}
-
-// SimulOldNewSimulatedBackendatedBackend creates a new binding backend based on the given database
-// and uses a simulated blockchain for testing purposes.
-// A simulated backend always uses chainID 1337.
-func NewSimulatedBackend(alloc types.GenesisAlloc, gasLimit uint64) *SimulatedBackend {
-	database := rawdb.NewMemoryDatabase()
-	genesis := core.Genesis{Config: params.AllEthashProtocolChanges, GasLimit: gasLimit, Alloc: alloc}
-	genesis.MustCommit(database)
-	blockchain, _ := core.NewBlockChain(database, nil, genesis.Config, ethash.NewFaker(), vm.Config{})
-
-	backend := &SimulatedBackend{
-		database:   database,
-		blockchain: blockchain,
-		config:     genesis.Config,
-	}
-
-	filterBackend := &filterBackend{database, blockchain, backend}
-	backend.filterSystem = filters.NewFilterSystem(filterBackend, filters.Config{})
-	backend.events = filters.NewEventSystem(backend.filterSystem, false)
 
 	header := backend.blockchain.CurrentBlock()
 	block := backend.blockchain.GetBlock(header.Hash(), header.Number.Uint64())
