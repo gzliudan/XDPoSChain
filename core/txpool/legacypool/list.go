@@ -28,6 +28,7 @@ import (
 
 	"github.com/XinFinOrg/XDPoSChain/common"
 	"github.com/XinFinOrg/XDPoSChain/core/types"
+	"github.com/holiman/uint256"
 )
 
 // nonceHeap is a heap.Interface implementation over 64bit unsigned integers for
@@ -273,9 +274,9 @@ type list struct {
 	strict bool       // Whether nonces are strictly continuous or not
 	txs    *sortedMap // Heap indexed sorted hash map of the transactions
 
-	costcap   *big.Int // Price of the highest costing transaction (reset only if exceeds balance)
-	gascap    uint64   // Gas limit of the highest spending transaction (reset only if exceeds block limit)
-	totalcost *big.Int // Total cost of all transactions in the list
+	costcap   *big.Int     // Price of the highest costing transaction (reset only if exceeds balance)
+	gascap    uint64       // Gas limit of the highest spending transaction (reset only if exceeds block limit)
+	totalcost *uint256.Int // Total cost of all transactions in the list
 }
 
 // newList create a new transaction list for maintaining nonce-indexable fast,
@@ -285,7 +286,7 @@ func newList(strict bool) *list {
 		strict:    strict,
 		txs:       newSortedMap(),
 		costcap:   new(big.Int),
-		totalcost: new(big.Int),
+		totalcost: new(uint256.Int),
 	}
 }
 
@@ -330,7 +331,12 @@ func (l *list) Add(tx *types.Transaction, priceBump uint64) (bool, *types.Transa
 		l.subTotalCost([]*types.Transaction{old})
 	}
 	// Add new tx cost to totalcost
-	l.totalcost.Add(l.totalcost, tx.Cost())
+	cost, overflow := uint256.FromBig(tx.Cost())
+	if overflow {
+		return false, nil
+	}
+	l.totalcost.Add(l.totalcost, cost)
+
 	// Otherwise overwrite the old transaction with the current one
 	l.txs.Put(tx)
 	if cost := tx.Cost(); l.costcap.Cmp(cost) < 0 {
@@ -467,7 +473,10 @@ func (l *list) LastElement() *types.Transaction {
 // total cost of all transactions.
 func (l *list) subTotalCost(txs []*types.Transaction) {
 	for _, tx := range txs {
-		l.totalcost.Sub(l.totalcost, tx.Cost())
+		_, underflow := l.totalcost.SubOverflow(l.totalcost, uint256.MustFromBig(tx.Cost()))
+		if underflow {
+			panic("totalcost underflow")
+		}
 	}
 }
 

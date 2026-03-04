@@ -21,6 +21,7 @@ import (
 	"math/rand"
 	"testing"
 
+	"github.com/XinFinOrg/XDPoSChain/common"
 	"github.com/XinFinOrg/XDPoSChain/core/types"
 	"github.com/XinFinOrg/XDPoSChain/crypto"
 )
@@ -48,6 +49,21 @@ func TestStrictListAdd(t *testing.T) {
 		if list.txs.items[tx.Nonce()] != tx {
 			t.Errorf("item %d: transaction mismatch: have %v, want %v", i, list.txs.items[tx.Nonce()], tx)
 		}
+	}
+}
+
+// TestListAddVeryExpensive tests adding txs which exceed 256 bits in cost. It is
+// expected that the list does not panic.
+func TestListAddVeryExpensive(t *testing.T) {
+	key, _ := crypto.GenerateKey()
+	list := newList(true)
+	for i := 0; i < 3; i++ {
+		value := big.NewInt(100)
+		gasprice, _ := new(big.Int).SetString("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", 0)
+		gaslimit := uint64(i)
+		tx, _ := types.SignTx(types.NewTransaction(uint64(i), common.Address{}, value, gaslimit, gasprice, nil), types.HomesteadSigner{}, key)
+		t.Logf("cost: %x bitlen: %d\n", tx.Cost(), tx.Cost().BitLen())
+		list.Add(tx, DefaultConfig.PriceBump)
 	}
 }
 
