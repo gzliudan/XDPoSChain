@@ -263,9 +263,9 @@ func (x *XDPoS_v2) initial(chain consensus.ChainReader, header *types.Header) er
 			return fmt.Errorf("masternodes are empty v2 switch number: %d", x.config.V2.SwitchBlock.Uint64())
 		}
 
-		snap := newSnapshot(lastGapNum, lastGapHeader.Hash(), masternodes)
+		snap := NewSnapshot(lastGapNum, lastGapHeader.Hash(), masternodes)
 		x.snapshots.Add(snap.Hash, snap)
-		err = storeSnapshot(snap, x.db)
+		err = StoreSnapshot(snap, x.db)
 		if err != nil {
 			log.Error("[initial] Error while store snapshot", "error", err)
 			return err
@@ -603,11 +603,11 @@ func (x *XDPoS_v2) UpdateMasternodes(chain consensus.ChainReader, header *types.
 	}
 
 	x.lock.RLock()
-	snap := newSnapshot(number, header.Hash(), masterNodes)
+	snap := NewSnapshot(number, header.Hash(), masterNodes)
 	log.Info("[UpdateMasternodes] take snapshot", "number", number, "hash", header.Hash())
 	x.lock.RUnlock()
 
-	err := storeSnapshot(snap, x.db)
+	err := StoreSnapshot(snap, x.db)
 	if err != nil {
 		log.Error("[UpdateMasternodes] Error while store snapshot", "hash", header.Hash(), "currentRound", x.currentRound, "error", err)
 		return err
@@ -890,13 +890,18 @@ func (x *XDPoS_v2) VerifyBlockInfo(blockChainReader consensus.ChainReader, block
 	return nil
 }
 
-func (x *XDPoS_v2) verifyQC(blockChainReader consensus.ChainReader, quorumCert *types.QuorumCert, parentHeader *types.Header) error {
+func (x *XDPoS_v2) verifyQC(blockChainReader consensus.ChainReader, quorumCert *types.QuorumCert, parents []*types.Header) error {
 	if quorumCert == nil {
 		log.Warn("[verifyQC] QC is Nil")
 		return utils.ErrInvalidQC
 	}
 
-	epochInfo, err := x.getEpochSwitchInfo(blockChainReader, parentHeader, quorumCert.ProposedBlockInfo.Hash)
+	// Find the parent header from the parents slice if available
+	var parentHeader *types.Header
+	if len(parents) != 0 {
+		parentHeader = parents[len(parents)-1]
+	}
+	epochInfo, err := x.getEpochSwitchInfo(blockChainReader, parents, quorumCert.ProposedBlockInfo.Hash)
 	if err != nil {
 		log.Error("[verifyQC] Error when getting epoch switch Info to verify QC", "Error", err)
 		return errors.New("fail to verify QC due to failure in getting epoch switch info")
@@ -1121,7 +1126,7 @@ func (x *XDPoS_v2) GetMasternodesFromEpochSwitchHeader(epochSwitchHeader *types.
 
 // Given header, get master node from the epoch switch block of that epoch
 func (x *XDPoS_v2) GetMasternodes(chain consensus.ChainReader, header *types.Header) []common.Address {
-	epochSwitchInfo, err := x.getEpochSwitchInfo(chain, header, header.Hash())
+	epochSwitchInfo, err := x.getEpochSwitchInfo(chain, []*types.Header{header}, header.Hash())
 	if err != nil {
 		log.Error("[GetMasternodes] Adaptor v2 getEpochSwitchInfo has error", "err", err)
 		return []common.Address{}
@@ -1131,7 +1136,7 @@ func (x *XDPoS_v2) GetMasternodes(chain consensus.ChainReader, header *types.Hea
 
 // Given header, get master node from the epoch switch block of that epoch
 func (x *XDPoS_v2) GetPenalties(chain consensus.ChainReader, header *types.Header) []common.Address {
-	epochSwitchInfo, err := x.getEpochSwitchInfo(chain, header, header.Hash())
+	epochSwitchInfo, err := x.getEpochSwitchInfo(chain, []*types.Header{header}, header.Hash())
 	if err != nil {
 		log.Error("[GetPenalties] Adaptor v2 getEpochSwitchInfo has error", "err", err)
 		return []common.Address{}
@@ -1140,7 +1145,7 @@ func (x *XDPoS_v2) GetPenalties(chain consensus.ChainReader, header *types.Heade
 }
 
 func (x *XDPoS_v2) GetStandbynodes(chain consensus.ChainReader, header *types.Header) []common.Address {
-	epochSwitchInfo, err := x.getEpochSwitchInfo(chain, header, header.Hash())
+	epochSwitchInfo, err := x.getEpochSwitchInfo(chain, []*types.Header{header}, header.Hash())
 	if err != nil {
 		log.Error("[GetStandbynodes] Adaptor v2 getEpochSwitchInfo has error", "err", err)
 		return []common.Address{}

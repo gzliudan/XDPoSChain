@@ -253,32 +253,38 @@ func (x *XDPoS_v1) verifyCascadingFields(chain consensus.ChainReader, header *ty
 		return x.verifySeal(chain, header, parents, fullVerify)
 	}
 
-	/*
-		BUG: snapshot returns wrong signers sometimes
-		when it happens we get the signers list by requesting smart contract
-	*/
-	// Retrieve the snapshot needed to verify this header and cache it
-	snap, err := x.snapshot(chain, number-1, header.ParentHash, parents, nil)
-	if err != nil {
-		return err
-	}
+	if fullVerify {
+		/*
+			BUG: snapshot returns wrong signers sometimes
+			when it happens we get the signers list by requesting smart contract
+		*/
+		// Retrieve the snapshot needed to verify this header and cache it
+		snap, err := x.snapshot(chain, number-1, header.ParentHash, parents, nil)
+		if err != nil {
+			log.Error("[verifyCascadingFields] Fail to get snapshot", "number", number, "hash", header.ParentHash, "err", err)
+			return err
+		}
 
-	signers := snap.GetSigners()
-	err = x.checkSignersOnCheckpoint(chain, header, signers)
-	if err == nil {
+		signers := snap.GetSigners()
+		err = x.checkSignersOnCheckpoint(chain, header, signers)
+		if err == nil {
+			return x.verifySeal(chain, header, parents, fullVerify)
+		}
+		log.Debug("[verifyCascadingFields] checkSignersOnCheckpoint failed, fallback to smart contract check", "number", number, "err", err)
+		signers, err = x.getSignersFromContract(chain, header)
+		if err != nil {
+			log.Error("[verifyCascadingFields] Fail to get signers from smart contract", "number", number, "hash", header.Hash(), "err", err)
+			return err
+		}
+		err = x.checkSignersOnCheckpoint(chain, header, signers)
+		if err != nil {
+			log.Error("[verifyCascadingFields] checkSignersOnCheckpoint failed with signers from smart contract", "number", number, "hash", header.Hash(), "err", err)
+			return err
+		}
 		return x.verifySeal(chain, header, parents, fullVerify)
 	}
 
-	signers, err = x.getSignersFromContract(chain, header)
-	if err != nil {
-		return err
-	}
-	err = x.checkSignersOnCheckpoint(chain, header, signers)
-	if err == nil {
-		return x.verifySeal(chain, header, parents, fullVerify)
-	}
-
-	return err
+	return x.verifySeal(chain, header, parents, fullVerify)
 }
 
 func (x *XDPoS_v1) checkSignersOnCheckpoint(chain consensus.ChainReader, header *types.Header, signers []common.Address) error {

@@ -185,6 +185,24 @@ var (
 		Value:    ethconfig.Defaults.SyncMode.String(),
 		Category: flags.EthCategory,
 	}
+	FastSyncPivotNumberFlag = &cli.Uint64Flag{
+		Name:     "fastsyncpivotnumber",
+		Usage:    "Pivot block number for fast sync (0 = use default calculation)",
+		Value:    0,
+		Category: flags.EthCategory,
+	}
+	FastSyncPivotHashFlag = &cli.StringFlag{
+		Name:     "fastsyncpivothash",
+		Usage:    "Pivot block hash for fast sync verification (hex string, must be set if fastsyncpivotnumber is set)",
+		Value:    "",
+		Category: flags.EthCategory,
+	}
+	FastSyncPivotRootFlag = &cli.StringFlag{
+		Name:     "fastsyncpivotroot",
+		Usage:    "State root of pivot block for fast sync state download (hex string, zero = use latest.Root)",
+		Value:    "",
+		Category: flags.EthCategory,
+	}
 	GCModeFlag = &cli.StringFlag{
 		Name:     "gcmode",
 		Usage:    `Blockchain garbage collection mode ("full", "archive")`,
@@ -1526,6 +1544,37 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 	if ctx.IsSet(SyncModeFlag.Name) {
 		if err = cfg.SyncMode.UnmarshalText([]byte(ctx.String(SyncModeFlag.Name))); err != nil {
 			Fatalf("invalid --syncmode flag: %v", err)
+		}
+	}
+	pivotNumberSet := ctx.IsSet(FastSyncPivotNumberFlag.Name)
+	pivotHashSet := ctx.IsSet(FastSyncPivotHashFlag.Name)
+	pivotRootSet := ctx.IsSet(FastSyncPivotRootFlag.Name)
+	pivotHash := ctx.String(FastSyncPivotHashFlag.Name)
+	pivotRoot := ctx.String(FastSyncPivotRootFlag.Name)
+
+	if pivotNumberSet {
+		if !pivotHashSet || pivotHash == "" {
+			Fatalf("--%s must be set if --%s is set", FastSyncPivotHashFlag.Name, FastSyncPivotNumberFlag.Name)
+		}
+		if !pivotRootSet || pivotRoot == "" {
+			Fatalf("--%s must be set if --%s is set", FastSyncPivotRootFlag.Name, FastSyncPivotNumberFlag.Name)
+		}
+		cfg.FastSyncPivotNumber = ctx.Uint64(FastSyncPivotNumberFlag.Name)
+		if cfg.FastSyncPivotNumber == 0 {
+			Fatalf("--%s must be greater than 0 when explicitly set", FastSyncPivotNumberFlag.Name)
+		}
+		if err = cfg.FastSyncPivotHash.UnmarshalText([]byte(pivotHash)); err != nil {
+			Fatalf("invalid --%s flag: %v", FastSyncPivotHashFlag.Name, err)
+		}
+		if err = cfg.FastSyncPivotRoot.UnmarshalText([]byte(pivotRoot)); err != nil {
+			Fatalf("invalid --%s flag: %v", FastSyncPivotRootFlag.Name, err)
+		}
+	} else {
+		if pivotHashSet {
+			Fatalf("--%s must not be set without --%s", FastSyncPivotHashFlag.Name, FastSyncPivotNumberFlag.Name)
+		}
+		if pivotRootSet {
+			Fatalf("--%s must not be set without --%s", FastSyncPivotRootFlag.Name, FastSyncPivotNumberFlag.Name)
 		}
 	}
 
