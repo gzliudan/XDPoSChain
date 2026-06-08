@@ -111,7 +111,33 @@ func (rw *meteredMsgReadWriter) ReadMsg() (p2p.Msg, error) {
 }
 
 func (rw *meteredMsgReadWriter) WriteMsg(msg p2p.Msg) error {
-	// Account for the data traffic
+	rw.meterOut(msg)
+	// Send the packet to the p2p layer
+	return rw.MsgReadWriter.WriteMsg(msg)
+}
+
+// Compile-time check that meteredMsgReadWriter forwards the priority lane.
+// Without this, a future refactor could silently drop the wrapper back to
+// MsgReadWriter and downgrade BFT consensus messages to the normal lane.
+var _ p2p.PriorityMsgWriter = (*meteredMsgReadWriter)(nil)
+
+// WriteMsgPriority implements p2p.PriorityMsgWriter so that consensus messages
+// retain their priority routing when the metrics wrapper is enabled. The
+// outbound counters are updated identically to WriteMsg before the message is
+// forwarded to the underlying writer's priority lane (falling back to WriteMsg
+// if the underlying writer does not support priorities).
+func (rw *meteredMsgReadWriter) WriteMsgPriority(msg p2p.Msg, high bool) error {
+	rw.meterOut(msg)
+	if pw, ok := rw.MsgReadWriter.(p2p.PriorityMsgWriter); ok {
+		return pw.WriteMsgPriority(msg, high)
+	}
+	return rw.MsgReadWriter.WriteMsg(msg)
+}
+
+// meterOut updates the outbound packet/traffic meters for msg. It is shared
+// between WriteMsg and WriteMsgPriority so both paths produce identical
+// metrics.
+func (rw *meteredMsgReadWriter) meterOut(msg p2p.Msg) {
 	packets, traffic := miscOutPacketsMeter, miscOutTrafficMeter
 	switch {
 	case msg.Code == BlockHeadersMsg:
@@ -133,7 +159,4 @@ func (rw *meteredMsgReadWriter) WriteMsg(msg p2p.Msg) error {
 	}
 	packets.Mark(1)
 	traffic.Mark(int64(msg.Size))
-
-	// Send the packet to the p2p layer
-	return rw.MsgReadWriter.WriteMsg(msg)
 }

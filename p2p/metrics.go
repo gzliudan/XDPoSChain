@@ -49,6 +49,17 @@ var (
 	dialUnexpectedIdentity  = metrics.NewRegisteredMeter("p2p/dials/error/id/unexpected", nil)
 	dialEncHandshakeError   = metrics.NewRegisteredMeter("p2p/dials/error/rlpx/enc", nil)
 	dialProtoHandshakeError = metrics.NewRegisteredMeter("p2p/dials/error/rlpx/proto", nil)
+
+	// Per-Peer write queue depth, sampled on every enqueue attempt (depth
+	// measured before the slot is added). Useful for tuning writeReqQueueSize
+	// and for spotting peers whose downstream transport is back-pressuring.
+	writeQueueHiDepth = metrics.NewRegisteredHistogram("p2p/peer/writeq/hi/depth", nil, metrics.NewExpDecaySample(1028, 0.015))
+	writeQueueLoDepth = metrics.NewRegisteredHistogram("p2p/peer/writeq/lo/depth", nil, metrics.NewExpDecaySample(1028, 0.015))
+
+	// Number of enqueue attempts that found the queue already full and had
+	// to block (back-pressure events).
+	writeQueueHiBlocked = metrics.NewRegisteredMeter("p2p/peer/writeq/hi/blocked", nil)
+	writeQueueLoBlocked = metrics.NewRegisteredMeter("p2p/peer/writeq/lo/blocked", nil)
 )
 
 func markDialError(err error) {

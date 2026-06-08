@@ -473,6 +473,29 @@ func TestServerPeerLimits(t *testing.T) {
 	conn.Close()
 }
 
+func removePeerTracking(peers map[enode.ID]*Peer, pd peerDrop, connCount int) int {
+	if _, exists := peers[pd.ID()]; exists {
+		delete(peers, pd.ID())
+		connCount--
+	}
+	return connCount
+}
+
+func TestRemovePeerTracking(t *testing.T) {
+	id := randomID()
+	primary := newPeer(&conn{node: newNode(id, nil)}, nil)
+
+	peers := map[enode.ID]*Peer{id: primary}
+	connCount := removePeerTracking(peers, peerDrop{Peer: primary}, 1)
+
+	if connCount != 0 {
+		t.Fatalf("unexpected connection count: got %d want %d", connCount, 0)
+	}
+	if _, exists := peers[id]; exists {
+		t.Fatal("primary peer was not removed on drop")
+	}
+}
+
 func TestServerSetupConn(t *testing.T) {
 	var (
 		clientkey, srvkey = newkey(), newkey()
@@ -612,7 +635,7 @@ func randomID() (id enode.ID) {
 	return id
 }
 
-func TestEncHandshakeChecksAllowsSecondConnectionUntilPaired(t *testing.T) {
+func TestEncHandshakeChecksRejectsAlreadyConnectedPeer(t *testing.T) {
 	db, _ := enode.OpenDB("")
 	srv := &Server{
 		Config:    Config{MaxPeers: 10},
@@ -622,30 +645,11 @@ func TestEncHandshakeChecksAllowsSecondConnectionUntilPaired(t *testing.T) {
 
 	id := randomID()
 	existing := &Peer{rw: &conn{node: newNode(id, nil)}}
-	c := &conn{node: newNode(id, nil)}
-
-	err := srv.encHandshakeChecks(map[enode.ID]*Peer{id: existing}, 0, c)
-	if err != nil {
-		t.Fatalf("expected second connection to be allowed before pairing, got %v", err)
-	}
-}
-
-func TestEncHandshakeChecksRejectsWhenPaired(t *testing.T) {
-	db, _ := enode.OpenDB("")
-	srv := &Server{
-		Config:    Config{MaxPeers: 10},
-		localnode: enode.NewLocalNode(db, newkey()),
-	}
-	defer db.Close()
-
-	id := randomID()
-	existing := &Peer{rw: &conn{node: newNode(id, nil)}}
-	existing.SetPairPeer(&Peer{})
 	c := &conn{node: newNode(id, nil)}
 
 	err := srv.encHandshakeChecks(map[enode.ID]*Peer{id: existing}, 0, c)
 	if err != DiscAlreadyConnected {
-		t.Fatalf("expected paired peer to reject second connection, got %v", err)
+		t.Fatalf("expected %v, got %v", DiscAlreadyConnected, err)
 	}
 }
 
@@ -660,24 +664,5 @@ func TestRemovePeerTrackingDeletesPrimaryPeer(t *testing.T) {
 	}
 	if peers[id] != nil {
 		t.Fatal("expected primary peer to be removed from tracking")
-	}
-}
-
-func TestRemovePeerTrackingClearsPairPeer(t *testing.T) {
-	id := randomID()
-	primary := &Peer{rw: &conn{node: newNode(id, nil)}}
-	pair := &Peer{rw: &conn{node: newNode(id, nil)}}
-	primary.SetPairPeer(pair)
-	peers := map[enode.ID]*Peer{id: primary}
-
-	remaining := removePeerTracking(peers, peerDrop{Peer: pair}, 2)
-	if remaining != 1 {
-		t.Fatalf("unexpected connection count: got %d want 1", remaining)
-	}
-	if peers[id] != primary {
-		t.Fatal("expected primary peer to remain tracked")
-	}
-	if primary.PairPeer() != nil {
-		t.Fatal("expected pair peer link to be cleared")
 	}
 }

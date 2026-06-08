@@ -44,9 +44,16 @@ var discard = Protocol{
 }
 
 func testPeer(protos []Protocol) (func(), *conn, *Peer, <-chan error) {
+	return testPeerWithTransport(protos, nil)
+}
+
+func testPeerWithTransport(protos []Protocol, wrap func(transport) transport) (func(), *conn, *Peer, <-chan error) {
 	fd1, fd2 := net.Pipe()
 	c1 := &conn{fd: fd1, node: newNode(randomID(), nil), transport: newTestTransport(&newkey().PublicKey, fd1)}
 	c2 := &conn{fd: fd2, node: newNode(randomID(), nil), transport: newTestTransport(&newkey().PublicKey, fd2)}
+	if wrap != nil {
+		c1.transport = wrap(c1.transport)
+	}
 	for _, p := range protos {
 		c1.caps = append(c1.caps, p.cap())
 		c2.caps = append(c2.caps, p.cap())
@@ -194,34 +201,6 @@ func TestPeerDisconnectRace(t *testing.T) {
 			// show the stacks.
 			panic("Peer.run took to long to return.")
 		}
-	}
-}
-
-func TestPeerRunDisconnectsPairPeer(t *testing.T) {
-	closer, _, peer, errc := testPeer(nil)
-	defer closer()
-
-	pairPeer := &Peer{
-		disc:   make(chan DiscReason, 1),
-		closed: make(chan struct{}),
-	}
-	peer.SetPairPeer(pairPeer)
-
-	closer()
-
-	select {
-	case <-errc:
-	case <-time.After(2 * time.Second):
-		t.Fatal("peer did not stop")
-	}
-
-	select {
-	case reason := <-pairPeer.disc:
-		if reason != DiscPairPeerStop {
-			t.Fatalf("unexpected pair disconnect reason: got %v want %v", reason, DiscPairPeerStop)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("pair peer was not disconnected")
 	}
 }
 

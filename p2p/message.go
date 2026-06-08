@@ -100,6 +100,23 @@ func Send(w MsgWriter, msgcode uint64, data interface{}) error {
 	return w.WriteMsg(Msg{Code: msgcode, Size: uint32(size), Payload: r})
 }
 
+// SendPriority is like Send, but if w implements PriorityMsgWriter the message
+// is routed to the high-priority lane. SendPriority always requests the high
+// lane; callers that want the normal lane should use Send. Writers without
+// priority support fall back to the regular Send path so that callers do not
+// have to know whether the wrapper chain preserves priority.
+func SendPriority(w MsgWriter, msgcode uint64, data interface{}) error {
+	size, r, err := rlp.EncodeToReader(data)
+	if err != nil {
+		return err
+	}
+	msg := Msg{Code: msgcode, Size: uint32(size), Payload: r}
+	if pw, ok := w.(PriorityMsgWriter); ok {
+		return pw.WriteMsgPriority(msg, true)
+	}
+	return w.WriteMsg(msg)
+}
+
 // SendItems writes an RLP with the given code and data elements.
 // For a call such as:
 //
@@ -311,6 +328,33 @@ func (ev *msgEventer) WriteMsg(msg Msg) error {
 	})
 	return nil
 }
+
+// WriteMsgPriority forwards a priority-tagged write to the underlying writer
+// if it implements PriorityMsgWriter, falling back to WriteMsg otherwise. It
+// emits a "message sent" event identical to WriteMsg so that priority and
+// non-priority sends are observable through the same feed.
+func (ev *msgEventer) WriteMsgPriority(msg Msg, high bool) error {
+	var err error
+	if pw, ok := ev.MsgReadWriter.(PriorityMsgWriter); ok {
+		err = pw.WriteMsgPriority(msg, high)
+	} else {
+		err = ev.MsgReadWriter.WriteMsg(msg)
+	}
+	if err != nil {
+		return err
+	}
+	ev.feed.Send(&PeerEvent{
+		Type:     PeerEventTypeMsgSend,
+		Peer:     ev.peerID,
+		Protocol: ev.Protocol,
+		MsgCode:  &msg.Code,
+		MsgSize:  &msg.Size,
+	})
+	return nil
+}
+
+// Compile-time check that msgEventer forwards the PriorityMsgWriter contract.
+var _ PriorityMsgWriter = (*msgEventer)(nil)
 
 // Close closes the underlying MsgReadWriter if it implements the io.Closer
 // interface

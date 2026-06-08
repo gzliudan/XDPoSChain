@@ -23,6 +23,7 @@ import (
 	"math/rand"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -72,9 +73,6 @@ func newTestService(ctx *adapters.ServiceContext, stack *node.Node) (node.Lifecy
 type testPeer struct {
 	testReady chan struct{}
 	dumReady  chan struct{}
-	testOnce  sync.Once
-	dumOnce   sync.Once
-	testRuns  int
 }
 
 func (t *testService) peer(id enode.ID) *testPeer {
@@ -163,24 +161,11 @@ func (t *testService) RunTest(p *p2p.Peer, rw p2p.MsgReadWriter) error {
 	}
 
 	// close the testReady channel so that other protocols can run
-	peer.testOnce.Do(func() { close(peer.testReady) })
+	close(peer.testReady)
 
-	// Track unique active test sessions per peer ID. Duplicate protocol runs for
-	// the same remote peer should not inflate peerCount.
-	t.peersMtx.Lock()
-	peer.testRuns++
-	if peer.testRuns == 1 {
-		atomic.AddInt64(&t.peerCount, 1)
-	}
-	t.peersMtx.Unlock()
-	defer func() {
-		t.peersMtx.Lock()
-		peer.testRuns--
-		if peer.testRuns == 0 {
-			atomic.AddInt64(&t.peerCount, -1)
-		}
-		t.peersMtx.Unlock()
-	}()
+	// track the peer
+	atomic.AddInt64(&t.peerCount, 1)
+	defer atomic.AddInt64(&t.peerCount, -1)
 
 	// block until the peer is dropped
 	for {
@@ -203,7 +188,7 @@ func (t *testService) RunDum(p *p2p.Peer, rw p2p.MsgReadWriter) error {
 	}
 
 	// close the dumReady channel so that other protocols can run
-	peer.dumOnce.Do(func() { close(peer.dumReady) })
+	close(peer.dumReady)
 
 	// block until the peer is dropped
 	for {
@@ -466,20 +451,11 @@ loop:
 				Proto: event.Msg.Protocol,
 				Code:  int64(event.Msg.Code),
 			}
-			expectedCount, ok := expected[filter]
-			if !ok {
-				t.Fatalf("received unexpected msg for filter: %v", filter)
-			}
 			actual[filter]++
-
-			allReached := true
-			for wantFilter, wantCount := range expected {
-				if actual[wantFilter] < wantCount {
-					allReached = false
-					break
-				}
+			if actual[filter] > expected[filter] {
+				t.Fatalf("received too many msgs for filter: %v", filter)
 			}
-			if allReached && actual[filter] >= expectedCount {
+			if reflect.DeepEqual(actual, expected) {
 				return
 			}
 

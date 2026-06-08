@@ -295,10 +295,7 @@ func (srv *Server) LocalNode() *enode.LocalNode {
 	return srv.localnode
 }
 
-// Peers returns the public view of connected remote nodes.
-//
-// The returned slice contains one entry per remote NodeID, so multiple physical
-// connections associated with the same node are represented by a single entry.
+// Peers returns all connected peers.
 func (srv *Server) Peers() []*Peer {
 	var ps []*Peer
 	select {
@@ -316,11 +313,7 @@ func (srv *Server) Peers() []*Peer {
 	return ps
 }
 
-// PeerCount returns the number of connected remote nodes.
-//
-// Multiple physical connections associated with the same remote NodeID
-// (for example pair peers) are counted once because the public peer view is
-// keyed by NodeID.
+// PeerCount returns the number of connected peers.
 func (srv *Server) PeerCount() int {
 	var count int
 	select {
@@ -751,11 +744,7 @@ running:
 				name := truncateName(c.name)
 				p.log.Debug("Adding p2p peer", "addr", p.RemoteAddr(), "peers", len(peers)+1, "name", name)
 				go srv.runPeer(p)
-				if peers[c.node.ID()] != nil {
-					peers[c.node.ID()].SetPairPeer(p)
-				} else {
-					peers[c.node.ID()] = p
-				}
+				peers[c.node.ID()] = p
 				if p.Inbound() {
 					inboundCount++
 					serveSuccessMeter.Mark(1)
@@ -807,18 +796,6 @@ running:
 	}
 }
 
-func removePeerTracking(peers map[enode.ID]*Peer, pd peerDrop, connCount int) int {
-	if connCount > 0 {
-		connCount--
-	}
-	if current := peers[pd.ID()]; current == pd.Peer {
-		delete(peers, pd.ID())
-	} else if current != nil {
-		current.ClearPairPeer(pd.Peer)
-	}
-	return connCount
-}
-
 func (srv *Server) protoHandshakeChecks(peers map[enode.ID]*Peer, inboundCount int, c *conn) error {
 	// Drop connections with no matching protocols.
 	if len(srv.Protocols) > 0 && countMatchingProtocols(srv.Protocols, c.caps) == 0 {
@@ -836,11 +813,7 @@ func (srv *Server) encHandshakeChecks(peers map[enode.ID]*Peer, inboundCount int
 	case !c.is(trustedConn) && c.is(inboundConn) && inboundCount >= srv.maxInboundConns():
 		return DiscTooManyPeers
 	case peers[c.node.ID()] != nil:
-		existingPeer := peers[c.node.ID()]
-		if existingPeer.PairPeer() != nil {
-			return DiscAlreadyConnected
-		}
-		return nil
+		return DiscAlreadyConnected
 	case c.node.ID() == srv.localnode.ID():
 		return DiscSelf
 	default:

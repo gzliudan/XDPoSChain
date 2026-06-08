@@ -54,8 +54,6 @@ func (pe *peerError) Error() string {
 
 var errProtocolReturned = errors.New("protocol returned")
 
-var ErrAddPairPeer = errors.New("add a pair peer")
-
 type DiscReason uint
 
 const (
@@ -71,6 +69,9 @@ const (
 	DiscUnexpectedIdentity
 	DiscSelf
 	DiscReadTimeout
+	// DiscPairPeerStop is kept only as an iota slot for wire compatibility
+	// with legacy XDPoSChain peers that still send this reason code. This
+	// node never sends it anymore; do not remove or reorder.
 	DiscPairPeerStop
 	DiscNonAllowlistedPeer
 	DiscDenylistedPeer

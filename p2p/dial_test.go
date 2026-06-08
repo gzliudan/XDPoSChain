@@ -52,11 +52,6 @@ func runDialTest(t *testing.T, test dialtest) {
 	pm := func(ps []*Peer) map[enode.ID]*Peer {
 		m := make(map[enode.ID]*Peer)
 		for _, p := range ps {
-			// Generic dialstate scenarios model peers that are already fully occupied.
-			// Pair-connection admission is covered by dedicated tests.
-			if p.PairPeer() == nil {
-				p.SetPairPeer(&Peer{})
-			}
 			m[p.ID()] = p
 		}
 		return m
@@ -708,26 +703,50 @@ func (t *resolveMock) Close()                                {}
 func (t *resolveMock) LookupRandom() []*enode.Node           { return nil }
 func (t *resolveMock) ReadRandomNodes(buf []*enode.Node) int { return 0 }
 
-// This test checks that static dials are launched.
-func TestDialStateCheckDialAllowsSecondConnectionUntilPaired(t *testing.T) {
-	id := uintID(1)
-	state := newDialState(enode.ID{}, nil, nil, fakeTable{}, 10, nil)
-	existing := &Peer{rw: &conn{node: newNode(id, nil)}}
+// countingDialer counts the number of times Dial is invoked. It returns one
+// end of a net.Pipe so that the (test) transport can be set up on top of it
+// without performing any real I/O.
+type countingDialer struct {
+	count int
+}
 
-	err := state.checkDial(newNode(id, nil), map[enode.ID]*Peer{id: existing})
-	if err != nil {
-		t.Fatalf("expected second connection to be allowed before pairing, got %v", err)
+func (d *countingDialer) Dial(*enode.Node) (net.Conn, error) {
+	d.count++
+	c, _ := net.Pipe()
+	return c, nil
+}
+
+// TestDialTaskDoSingleDial verifies that a successful dial does not trigger a
+// second "pair" dial against the same node. The legacy XDPoSChain dialer used
+// to open two TCP connections per peer; the dual-connection behaviour has been
+// removed and the upstream single-connection semantics restored.
+func TestDialTaskDoSingleDial(t *testing.T) {
+	remkey := newkey()
+	srv := startTestServer(t, &remkey.PublicKey, func(p *Peer) {})
+	defer srv.Stop()
+
+	dialer := &countingDialer{}
+	srv.Dialer = dialer
+
+	task := &dialTask{
+		flags: dynDialedConn,
+		dest:  enode.NewV4(&remkey.PublicKey, net.IP{127, 0, 0, 1}, 30303, 30303),
+	}
+	task.Do(srv)
+
+	if dialer.count != 1 {
+		t.Fatalf("Dialer.Dial called %d times, want 1", dialer.count)
 	}
 }
 
-func TestDialStateCheckDialRejectsWhenPaired(t *testing.T) {
+// This test checks that a second connection to an already connected peer is rejected.
+func TestDialStateCheckDialRejectsAlreadyConnectedPeer(t *testing.T) {
 	id := uintID(1)
 	state := newDialState(enode.ID{}, nil, nil, fakeTable{}, 10, nil)
 	existing := &Peer{rw: &conn{node: newNode(id, nil)}}
-	existing.SetPairPeer(&Peer{})
 
 	err := state.checkDial(newNode(id, nil), map[enode.ID]*Peer{id: existing})
 	if err != errAlreadyConnected {
-		t.Fatalf("expected paired peer to reject second connection, got %v", err)
+		t.Fatalf("expected %v, got %v", errAlreadyConnected, err)
 	}
 }
