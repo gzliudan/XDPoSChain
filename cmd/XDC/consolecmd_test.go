@@ -26,11 +26,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/XinFinOrg/XDPoSChain/params"
+	"github.com/XinFinOrg/XDPoSChain/internal/version"
 )
 
 const (
-	ipcAPIs  = "XDCx:1.0 XDCxlending:1.0 XDPoS:1.0 admin:1.0 debug:1.0 eth:1.0 miner:1.0 net:1.0 rpc:1.0 txpool:1.0 web3:1.0"
+	ipcAPIs  = "XDPoS:1.0 admin:1.0 debug:1.0 eth:1.0 miner:1.0 net:1.0 rpc:1.0 txpool:1.0 web3:1.0"
 	httpAPIs = "eth:1.0 net:1.0 rpc:1.0 web3:1.0"
 )
 
@@ -50,7 +50,10 @@ func TestConsoleWelcome(t *testing.T) {
 	XDC.SetTemplateFunc("goos", func() string { return runtime.GOOS })
 	XDC.SetTemplateFunc("goarch", func() string { return runtime.GOARCH })
 	XDC.SetTemplateFunc("gover", runtime.Version)
-	XDC.SetTemplateFunc("XDCver", func() string { return params.Version })
+	XDC.SetTemplateFunc("XDCver", func() string {
+		git, _ := version.VCS()
+		return version.WithCommit(git.Commit, git.Date)
+	})
 	XDC.SetTemplateFunc("niltime", func() string {
 		return time.Unix(1559211559, 0).Format("Mon Jan 02 2006 15:04:05 GMT-0700 (MST)")
 	})
@@ -66,6 +69,7 @@ at block: 0 ({{niltime}})
  datadir: {{.Datadir}}
  modules: {{apis}}
 
+To exit, press ctrl-d or type exit
 > {{.InputLine "exit"}}
 `)
 	XDC.ExpectExit()
@@ -136,7 +140,10 @@ func testAttachWelcome(t *testing.T, XDC *testXDC, endpoint, apis string) {
 	attach.SetTemplateFunc("goos", func() string { return runtime.GOOS })
 	attach.SetTemplateFunc("goarch", func() string { return runtime.GOARCH })
 	attach.SetTemplateFunc("gover", runtime.Version)
-	attach.SetTemplateFunc("XDCver", func() string { return params.Version })
+	attach.SetTemplateFunc("XDCver", func() string {
+		git, _ := version.VCS()
+		return version.WithCommit(git.Commit, git.Date)
+	})
 	attach.SetTemplateFunc("etherbase", func() string { return XDC.Etherbase })
 	attach.SetTemplateFunc("niltime", func() string {
 		return time.Unix(1559211559, 0).Format("Mon Jan 02 2006 15:04:05 GMT-0700 (MST)")
@@ -155,9 +162,81 @@ at block: 0 ({{niltime}}){{if ipc}}
  datadir: {{datadir}}{{end}}
  modules: {{apis}}
 
+To exit, press ctrl-d or type exit
 > {{.InputLine "exit" }}
 `)
 	attach.ExpectExit()
+}
+
+func TestResolveConsoleEndpoint(t *testing.T) {
+	tests := []struct {
+		name         string
+		endpoint     string
+		wantEndpoint string
+		wantLocal    bool
+	}{
+		{name: "default ipc endpoint", endpoint: "", wantEndpoint: "", wantLocal: true},
+		{name: "plain ipc path", endpoint: "/tmp/XDC.ipc", wantEndpoint: "/tmp/XDC.ipc", wantLocal: true},
+		{name: "legacy ipc prefix", endpoint: "ipc:/tmp/XDC.ipc", wantEndpoint: "/tmp/XDC.ipc", wantLocal: true},
+		{name: "legacy rpc prefix", endpoint: "rpc:/tmp/XDC.ipc", wantEndpoint: "/tmp/XDC.ipc", wantLocal: true},
+		{name: "windows drive path stays unsupported", endpoint: `C:\\Users\\tester\\XDC.ipc`, wantEndpoint: `C:\\Users\\tester\\XDC.ipc`, wantLocal: false},
+		{name: "windows drive slash path stays unsupported", endpoint: "C:/Users/tester/XDC.ipc", wantEndpoint: "C:/Users/tester/XDC.ipc", wantLocal: false},
+		{name: "legacy rpc windows drive path stays unsupported", endpoint: `rpc:C:\\Users\\tester\\XDC.ipc`, wantEndpoint: `C:\\Users\\tester\\XDC.ipc`, wantLocal: false},
+		{name: "legacy rpc http endpoint", endpoint: "rpc:http://localhost:8545", wantEndpoint: "http://localhost:8545", wantLocal: false},
+		{name: "legacy rpc ws endpoint", endpoint: "rpc:ws://localhost:8546", wantEndpoint: "ws://localhost:8546", wantLocal: false},
+		{name: "stdio endpoint", endpoint: "stdio", wantEndpoint: "stdio", wantLocal: false},
+		{name: "legacy rpc stdio endpoint", endpoint: "rpc:stdio", wantEndpoint: "stdio", wantLocal: false},
+		{name: "http endpoint", endpoint: "http://localhost:8545", wantEndpoint: "http://localhost:8545", wantLocal: false},
+		{name: "ws endpoint", endpoint: "ws://localhost:8546", wantEndpoint: "ws://localhost:8546", wantLocal: false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			gotEndpoint, gotLocal := resolveConsoleEndpoint(test.endpoint)
+			if gotLocal != test.wantLocal {
+				t.Fatalf("unexpected local transport classification: got %v want %v", gotLocal, test.wantLocal)
+			}
+			if test.wantEndpoint == "" {
+				if !strings.HasSuffix(gotEndpoint, "XDC.ipc") {
+					t.Fatalf("expected default IPC endpoint, got %q", gotEndpoint)
+				}
+				return
+			}
+			if gotEndpoint != test.wantEndpoint {
+				t.Fatalf("unexpected resolved endpoint: got %q want %q", gotEndpoint, test.wantEndpoint)
+			}
+		})
+	}
+}
+
+func TestDialRPCRejectsWindowsDrivePaths(t *testing.T) {
+	tests := []struct {
+		name     string
+		endpoint string
+	}{
+		{name: "windows drive path", endpoint: `C:\\Users\\tester\\XDC.ipc`},
+		{name: "windows drive slash path", endpoint: "C:/Users/tester/XDC.ipc"},
+		{name: "legacy rpc windows drive path", endpoint: `rpc:C:\\Users\\tester\\XDC.ipc`},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client, local, err := dialRPC(test.endpoint)
+			if client != nil {
+				client.Close()
+				t.Fatal("expected dialRPC to reject Windows drive-letter path")
+			}
+			if err == nil {
+				t.Fatal("expected dialRPC to fail for Windows drive-letter path")
+			}
+			if local {
+				t.Fatal("expected Windows drive-letter path to stay classified as non-local")
+			}
+			if !strings.Contains(err.Error(), `no known transport for URL scheme "c"`) {
+				t.Fatalf("unexpected dialRPC error: %v", err)
+			}
+		})
+	}
 }
 
 // trulyRandInt generates a crypto random integer used by the console tests to

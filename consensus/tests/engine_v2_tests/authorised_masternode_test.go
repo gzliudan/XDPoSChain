@@ -1,7 +1,6 @@
 package engine_v2_tests
 
 import (
-	"math/big"
 	"testing"
 	"time"
 
@@ -12,6 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+// TestIsAuthorisedMNForConsensusV2 tests is authorised mn for consensus v 2.
 func TestIsAuthorisedMNForConsensusV2(t *testing.T) {
 	// we skip test for v1 since it's hard to make a real genesis block
 	blockchain, _, currentBlock, signer, signFn, _ := PrepareXDCTestBlockChainForV2Engine(t, 901, params.TestXDPoSMockChainConfig, nil)
@@ -32,7 +32,9 @@ func TestIsAuthorisedMNForConsensusV2(t *testing.T) {
 	assert.False(t, isAuthorisedMN)
 }
 
+// TestIsYourTurnConsensusV2 tests is your turn consensus v 2.
 func TestIsYourTurnConsensusV2(t *testing.T) {
+	skipLongInShortMode(t)
 	// we skip test for v1 since it's hard to make a real genesis block
 	blockchain, _, currentBlock, signer, signFn, _ := PrepareXDCTestBlockChainForV2Engine(t, 900, params.TestXDPoSMockChainConfig, nil)
 	minePeriod := params.UnitTestV2Configs[0].MinePeriod
@@ -41,7 +43,7 @@ func TestIsYourTurnConsensusV2(t *testing.T) {
 	blockCoinBase := "0x111000000000000000000000000000000123"
 	currentBlock = CreateBlock(blockchain, params.TestXDPoSMockChainConfig, currentBlock, blockNum, 1, blockCoinBase, signer, signFn, nil, nil, "")
 	currentBlockHeader := currentBlock.Header()
-	currentBlockHeader.Time = big.NewInt(time.Now().Unix())
+	currentBlockHeader.Time = uint64(time.Now().Unix())
 	err := blockchain.InsertBlock(currentBlock)
 	assert.Nil(t, err)
 	adaptor.Initial(blockchain, currentBlockHeader)
@@ -81,10 +83,11 @@ func TestIsYourTurnConsensusV2(t *testing.T) {
 
 	isYourTurn, _ = adaptor.YourTurn(blockchain, currentBlock.Header(), common.HexToAddress("xdc5F74529C0338546f82389402a01c31fB52c6f434"))
 	assert.False(t, isYourTurn)
-
 }
 
+// TestIsYourTurnConsensusV2CrossConfig tests is your turn consensus v 2 cross config.
 func TestIsYourTurnConsensusV2CrossConfig(t *testing.T) {
+	skipLongInShortMode(t)
 	// we skip test for v1 since it's hard to make a real genesis block
 	blockchain, _, currentBlock, signer, signFn, _ := PrepareXDCTestBlockChainForV2Engine(t, 909, params.TestXDPoSMockChainConfig, nil)
 	firstMinePeriod := blockchain.Config().XDPoS.V2.CurrentConfig.MinePeriod
@@ -94,7 +97,7 @@ func TestIsYourTurnConsensusV2CrossConfig(t *testing.T) {
 	blockCoinBase := "0x111000000000000000000000000000000123"
 	currentBlock = CreateBlock(blockchain, params.TestXDPoSMockChainConfig, currentBlock, blockNum, 10, blockCoinBase, signer, signFn, nil, nil, "")
 	currentBlockHeader := currentBlock.Header()
-	currentBlockHeader.Time = big.NewInt(time.Now().Unix())
+	currentBlockHeader.Time = uint64(time.Now().Unix())
 	err := blockchain.InsertBlock(currentBlock)
 	adaptor.EngineV2.SetNewRoundFaker(blockchain, types.Round(10), false)
 	assert.Nil(t, err)
@@ -109,7 +112,8 @@ func TestIsYourTurnConsensusV2CrossConfig(t *testing.T) {
 	// after new mine period
 	secondMinePeriod := blockchain.Config().XDPoS.V2.CurrentConfig.MinePeriod
 
-	time.Sleep(time.Duration(secondMinePeriod-firstMinePeriod) * time.Second)
+	// YourTurn uses Unix-second granularity; add a small buffer to avoid edge-time flakiness.
+	time.Sleep(time.Duration(secondMinePeriod-firstMinePeriod+1) * time.Second)
 	isYourTurn, err = adaptor.YourTurn(blockchain, currentBlockHeader, common.HexToAddress("xdc703c4b2bD70c169f5717101CaeE543299Fc946C7"))
 	assert.Nil(t, err)
 	assert.True(t, isYourTurn)

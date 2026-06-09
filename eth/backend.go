@@ -18,13 +18,14 @@
 package eth
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
 	"runtime"
-	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/XinFinOrg/XDPoSChain/XDCx"
 	"github.com/XinFinOrg/XDPoSChain/XDCxlending"
@@ -40,6 +41,8 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/core/bloombits"
 	"github.com/XinFinOrg/XDPoSChain/core/rawdb"
 	"github.com/XinFinOrg/XDPoSChain/core/txpool"
+	"github.com/XinFinOrg/XDPoSChain/core/txpool/legacypool"
+	"github.com/XinFinOrg/XDPoSChain/core/txpool/locals"
 	"github.com/XinFinOrg/XDPoSChain/core/types"
 	"github.com/XinFinOrg/XDPoSChain/core/vm"
 	"github.com/XinFinOrg/XDPoSChain/eth/downloader"
@@ -47,9 +50,11 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/eth/filters"
 	"github.com/XinFinOrg/XDPoSChain/eth/gasprice"
 	"github.com/XinFinOrg/XDPoSChain/eth/hooks"
+	"github.com/XinFinOrg/XDPoSChain/eth/tracers"
 	"github.com/XinFinOrg/XDPoSChain/ethdb"
 	"github.com/XinFinOrg/XDPoSChain/event"
 	"github.com/XinFinOrg/XDPoSChain/internal/ethapi"
+	"github.com/XinFinOrg/XDPoSChain/internal/version"
 	"github.com/XinFinOrg/XDPoSChain/log"
 	"github.com/XinFinOrg/XDPoSChain/miner"
 	"github.com/XinFinOrg/XDPoSChain/node"
@@ -57,21 +62,22 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/params"
 	"github.com/XinFinOrg/XDPoSChain/rlp"
 	"github.com/XinFinOrg/XDPoSChain/rpc"
+	ver "github.com/XinFinOrg/XDPoSChain/version"
 )
 
 // Ethereum implements the Ethereum full node service.
 type Ethereum struct {
-	config      *ethconfig.Config
-	chainConfig *params.ChainConfig
+	// core protocol objects
+	config         *ethconfig.Config
+	txPool         *txpool.TxPool
+	localTxTracker *locals.TxTracker
+	blockchain     *core.BlockChain
 
 	// Channel for shutting down the service
 	shutdownChan chan bool // Channel for shutting down the ethereum
 
-	// Handlers
-	txPool          *txpool.TxPool
-	orderPool       *txpool.OrderPool
-	lendingPool     *txpool.LendingPool
-	blockchain      *core.BlockChain
+	orderPool       *legacypool.OrderPool
+	lendingPool     *legacypool.LendingPool
 	protocolManager *ProtocolManager
 
 	// DB interfaces
@@ -84,7 +90,7 @@ type Ethereum struct {
 	bloomRequests chan chan *bloombits.Retrieval // Channel receiving bloom data retrieval requests
 	bloomIndexer  *core.ChainIndexer             // Bloom indexer operating during block imports
 
-	ApiBackend *EthAPIBackend
+	APIBackend *EthAPIBackend
 
 	miner     *miner.Miner
 	gasPrice  *big.Int
@@ -103,46 +109,57 @@ type Ethereum struct {
 // New creates a new Ethereum object (including the
 // initialisation of the common Ethereum object)
 func New(stack *node.Node, config *ethconfig.Config, XDCXServ *XDCx.XDCX, lendingServ *XDCxlending.Lending) (*Ethereum, error) {
+	// Ensure configuration values are compatible and sane
 	if config.SyncMode == downloader.LightSync {
 		return nil, errors.New("can't run eth.Ethereum in light sync mode, light mode has been deprecated")
 	}
 	if !config.SyncMode.IsValid() {
 		return nil, fmt.Errorf("invalid sync mode %d", config.SyncMode)
 	}
+	if config.Miner.GasCeil == 0 {
+		log.Warn("Sanitizing invalid miner gas limit", "provided", config.Miner.GasCeil, "updated", ethconfig.Defaults.Miner.GasCeil)
+		config.Miner.GasCeil = ethconfig.Defaults.Miner.GasCeil
+	}
+	if config.Miner.GasPrice == nil || config.Miner.GasPrice.Cmp(common.Big0) < 0 {
+		log.Warn("Sanitizing invalid miner gas price", "provided", config.Miner.GasPrice, "updated", ethconfig.Defaults.Miner.GasPrice)
+		config.Miner.GasPrice = new(big.Int).Set(ethconfig.Defaults.Miner.GasPrice)
+	}
 
-	// Assemble the Ethereum object
 	chainDb, err := stack.OpenDatabase("chaindata", config.DatabaseCache, config.DatabaseHandles, "eth/db/chaindata/", false)
 	if err != nil {
 		return nil, err
 	}
-	chainConfig, genesisHash, genesisErr := core.SetupGenesisBlock(chainDb, config.Genesis)
-	if _, ok := genesisErr.(*params.ConfigCompatError); genesisErr != nil && !ok {
-		return nil, genesisErr
+	// Resolve the effective chain config before constructing the consensus engine.
+	// NewBlockChainEx reruns SetupGenesisBlock and applies any required rewind.
+	chainConfig, genesisHash, compatErr, err := core.SetupGenesisBlockWithOverride(chainDb, config.Genesis, config.AllowBuiltInCustomRecovery)
+	if err != nil {
+		return nil, err
+	}
+	if chainConfig == nil {
+		return nil, fmt.Errorf("nil chain config returned from SetupGenesisBlock (err=%v)", err)
 	}
 
+	// Set networkID to chainID by default.
 	networkID := config.NetworkId
 	if networkID == 0 {
-		networkID = chainConfig.ChainId.Uint64()
+		networkID = chainConfig.ChainID.Uint64()
 	}
-	common.CopyConstants(networkID)
-
-	log.Info(strings.Repeat("-", 153))
-	for _, line := range strings.Split(chainConfig.Description(), "\n") {
-		log.Info(line)
+	engine, err := CreateConsensusEngine(stack, chainConfig, chainDb)
+	if err != nil {
+		return nil, err
 	}
-	log.Info(strings.Repeat("-", 153))
 
+	// Assemble the Ethereum object.
 	eth := &Ethereum{
 		config:         config,
 		chainDb:        chainDb,
-		chainConfig:    chainConfig,
 		eventMux:       stack.EventMux(),
 		accountManager: stack.AccountManager(),
-		engine:         CreateConsensusEngine(stack, &config.Ethash, chainConfig, chainDb),
+		engine:         engine,
 		shutdownChan:   make(chan bool),
 		networkId:      networkID,
-		gasPrice:       config.GasPrice,
-		etherbase:      config.Etherbase,
+		gasPrice:       config.Miner.GasPrice,
+		etherbase:      config.Miner.Etherbase,
 		bloomRequests:  make(chan chan *bloombits.Retrieval),
 		bloomIndexer:   NewBloomIndexer(chainDb, params.BloomBitsBlocks, params.BloomConfirms),
 		p2pServer:      stack.Server(),
@@ -162,9 +179,10 @@ func New(stack *node.Node, config *ethconfig.Config, XDCXServ *XDCx.XDCX, lendin
 	}
 	log.Info("Initialising Ethereum protocol", "versions", ProtocolVersions, "network", networkID, "dbversion", dbVer)
 
+	// Create BlockChain object.
 	if !config.SkipBcVersionCheck {
 		if bcVersion != nil && *bcVersion > core.BlockChainVersion {
-			return nil, fmt.Errorf("database version is v%d, not supports v%d", *bcVersion, core.BlockChainVersion)
+			return nil, fmt.Errorf("database version is v%d, XDC %s only supports v%d", *bcVersion, version.WithMeta, core.BlockChainVersion)
 		} else if bcVersion == nil || *bcVersion < core.BlockChainVersion {
 			if bcVersion != nil { // only print warning on upgrade, not on init
 				log.Warn("Upgrade blockchain database version", "from", dbVer, "to", core.BlockChainVersion)
@@ -173,18 +191,43 @@ func New(stack *node.Node, config *ethconfig.Config, XDCXServ *XDCx.XDCX, lendin
 		}
 	}
 
+	badBlocks := rawdb.ReadAllBadBlocks(chainDb)
+	log.Info("Bad blocks in db", "count", len(badBlocks))
+	for i, block := range badBlocks {
+		log.Info("Bad block in db", "i", i, "number", block.Number(), "hash", block.Hash().Hex())
+	}
+	if config.DeleteAllBadBlocks {
+		if len(badBlocks) == 0 {
+			log.Warn("No bad blocks in db to delete")
+		} else {
+			rawdb.DeleteBadBlocks(chainDb)
+			log.Info(fmt.Sprintf("Deleted %d bad blocks in db", len(badBlocks)))
+		}
+	}
+
 	var (
 		vmConfig    = vm.Config{EnablePreimageRecording: config.EnablePreimageRecording}
 		cacheConfig = &core.CacheConfig{
-			TrieCleanLimit:      config.TrieCleanCache,
-			TrieCleanNoPrefetch: config.NoPrefetch,
-			TrieDirtyLimit:      config.TrieDirtyCache,
-			TrieDirtyDisabled:   config.NoPruning,
-			TrieTimeLimit:       config.TrieTimeout,
-			Preimages:           config.Preimages,
+			TrieCleanLimit:    config.TrieCleanCache,
+			TrieCleanPrefetch: config.Prefetch,
+			TrieDirtyLimit:    config.TrieDirtyCache,
+			TrieDirtyDisabled: config.NoPruning,
+			TrieTimeLimit:     config.TrieTimeout,
+			Preimages:         config.Preimages,
 		}
 	)
-	if eth.chainConfig.XDPoS != nil {
+	if config.VMTrace != "" {
+		traceConfig := json.RawMessage("{}")
+		if config.VMTraceJsonConfig != "" {
+			traceConfig = json.RawMessage(config.VMTraceJsonConfig)
+		}
+		t, err := tracers.LiveDirectory.New(config.VMTrace, traceConfig)
+		if err != nil {
+			return nil, fmt.Errorf("Failed to create tracer %s: %v", config.VMTrace, err)
+		}
+		vmConfig.Tracer = t
+	}
+	if chainConfig.XDPoS != nil {
 		c := eth.engine.(*XDPoS.XDPoS)
 		c.GetXDCXService = func() utils.TradingService {
 			return eth.XDCX
@@ -193,7 +236,7 @@ func New(stack *node.Node, config *ethconfig.Config, XDCXServ *XDCx.XDCX, lendin
 			return eth.Lending
 		}
 	}
-	eth.blockchain, err = core.NewBlockChainEx(chainDb, XDCXServ.GetLevelDB(), cacheConfig, eth.chainConfig, eth.engine, vmConfig)
+	eth.blockchain, err = core.NewBlockChainExResolved(chainDb, XDCXServ.GetLevelDB(), cacheConfig, config.Genesis, eth.engine, vmConfig, chainConfig, genesisHash, compatErr)
 	if err != nil {
 		return nil, err
 	}
@@ -206,7 +249,7 @@ func New(stack *node.Node, config *ethconfig.Config, XDCXServ *XDCx.XDCX, lendin
 		if currentBlock == nil {
 			return nil, fmt.Errorf("not find current block when rollback to %d", common.RollbackNumber)
 		}
-		currentNumber := currentBlock.NumberU64()
+		currentNumber := currentBlock.Number.Uint64()
 		if target > currentNumber {
 			return nil, fmt.Errorf("can't rollback to %d which is greater than current %d", target, currentNumber)
 		}
@@ -225,47 +268,62 @@ func New(stack *node.Node, config *ethconfig.Config, XDCXServ *XDCx.XDCX, lendin
 		}
 	}
 
-	// Rewind the chain in case of an incompatible config upgrade.
-	if compat, ok := genesisErr.(*params.ConfigCompatError); ok {
-		log.Warn("Rewinding chain to upgrade configuration", "err", compat)
-		eth.blockchain.SetHead(compat.RewindTo)
-		rawdb.WriteChainConfig(chainDb, genesisHash, chainConfig)
-	}
 	eth.bloomIndexer.Start(eth.blockchain)
 
+	// TxPool
 	if config.TxPool.Journal != "" {
 		config.TxPool.Journal = stack.ResolvePath(config.TxPool.Journal)
 	}
-	eth.txPool = txpool.NewTxPool(config.TxPool, eth.chainConfig, eth.blockchain)
-	eth.orderPool = txpool.NewOrderPool(eth.chainConfig, eth.blockchain)
-	eth.lendingPool = txpool.NewLendingPool(eth.chainConfig, eth.blockchain)
+	legacyPool := legacypool.New(config.TxPool, eth.blockchain)
+	eth.orderPool = legacypool.NewOrderPool(eth.blockchain.Config(), eth.blockchain)
+	eth.lendingPool = legacypool.NewLendingPool(eth.blockchain.Config(), eth.blockchain)
 
-	if eth.protocolManager, err = NewProtocolManagerEx(eth.chainConfig, config.SyncMode, networkID, eth.eventMux, eth.txPool, eth.orderPool, eth.lendingPool, eth.engine, eth.blockchain, chainDb); err != nil {
+	eth.txPool, err = txpool.New(config.TxPool.PriceLimit, eth.blockchain, []txpool.SubPool{legacyPool})
+	if err != nil {
 		return nil, err
 	}
-	eth.miner = miner.New(eth, eth.chainConfig, eth.EventMux(), eth.engine, stack.Config().AnnounceTxs)
-	eth.miner.SetExtra(makeExtraData(config.ExtraData))
+
+	if !config.TxPool.NoLocals {
+		rejournal := config.TxPool.Rejournal
+		if rejournal < time.Second {
+			log.Warn("Sanitizing invalid txpool journal time", "provided", rejournal, "updated", time.Second)
+			rejournal = time.Second
+		}
+		eth.localTxTracker = locals.New(config.TxPool.Journal, rejournal, eth.blockchain.Config(), eth.txPool)
+		eth.txPool.SetLocalTracker(eth.localTxTracker)
+		stack.RegisterLifecycle(eth.localTxTracker)
+	}
+
+	if eth.protocolManager, err = NewProtocolManagerEx(eth.blockchain.Config(), config.SyncMode, networkID, eth.eventMux, eth.txPool, eth.orderPool, eth.lendingPool, eth.engine, eth.blockchain, chainDb); err != nil {
+		return nil, err
+	}
+	// Set fast sync pivot block if configured
+	if config.FastSyncPivotNumber != 0 {
+		eth.protocolManager.downloader.SetPivotBlock(config.FastSyncPivotNumber, config.FastSyncPivotHash, config.FastSyncPivotRoot)
+	}
+	eth.miner = miner.New(eth, &config.Miner, eth.blockchain.Config(), eth.EventMux(), eth.engine, stack.Config().AnnounceTxs)
+	eth.miner.SetExtra(makeExtraData(config.Miner.ExtraData))
 
 	var xdPoS *XDPoS.XDPoS = nil
-	if eth.chainConfig.XDPoS != nil {
+	if chainConfig.XDPoS != nil {
 		xdPoS = eth.engine.(*XDPoS.XDPoS)
 	}
-	eth.ApiBackend = &EthAPIBackend{
+	eth.APIBackend = &EthAPIBackend{
 		allowUnprotectedTxs: stack.Config().AllowUnprotectedTxs,
 		eth:                 eth,
 		gpo:                 nil,
 		XDPoS:               xdPoS,
 	}
 
-	if eth.ApiBackend.allowUnprotectedTxs {
+	if eth.APIBackend.allowUnprotectedTxs {
 		log.Info("Unprotected transactions allowed")
 	}
-	eth.ApiBackend.gpo = gasprice.NewOracle(eth.ApiBackend, config.GPO, config.GasPrice)
+	eth.APIBackend.gpo = gasprice.NewOracle(eth.APIBackend, config.GPO, config.Miner.GasPrice)
 
 	// Set global ipc endpoint.
 	eth.blockchain.IPCEndpoint = stack.IPCEndpoint()
 
-	if eth.chainConfig.XDPoS != nil {
+	if chainConfig.XDPoS != nil {
 		c := eth.engine.(*XDPoS.XDPoS)
 		signHook := func(block *types.Block) error {
 			eb, err := eth.Etherbase()
@@ -273,11 +331,11 @@ func New(stack *node.Node, config *ethconfig.Config, XDCXServ *XDCx.XDCX, lendin
 				log.Error("Cannot get etherbase for append m2 header", "err", err)
 				return fmt.Errorf("etherbase missing: %v", err)
 			}
-			ok := eth.txPool.IsSigner != nil && eth.txPool.IsSigner(eb)
+			ok := eth.txPool.IsSigner(eb)
 			if !ok {
 				return nil
 			}
-			if block.NumberU64()%common.MergeSignRange == 0 || !eth.chainConfig.IsTIP2019(block.Number()) {
+			if block.NumberU64()%common.MergeSignRange == 0 || !chainConfig.IsTIP2019(block.Number()) {
 				if err := contracts.CreateTransactionSign(chainConfig, eth.txPool, eth.accountManager, block, chainDb, eb); err != nil {
 					return fmt.Errorf("fail to create tx sign for importing block: %v", err)
 				}
@@ -312,7 +370,7 @@ func New(stack *node.Node, config *ethconfig.Config, XDCXServ *XDCx.XDCX, lendin
 					return block, false, err
 				}
 				header.Validator = sighash
-				return types.NewBlockWithHeader(header).WithBody(block.Transactions(), block.Uncles()), true, nil
+				return types.NewBlockWithHeader(header).WithBody(*block.Body()), true, nil
 			}
 			return block, false, nil
 		}
@@ -326,19 +384,10 @@ func New(stack *node.Node, config *ethconfig.Config, XDCXServ *XDCx.XDCX, lendin
 		hooks.AttachConsensusV1Hooks(c, eth.blockchain, chainConfig)
 		hooks.AttachConsensusV2Hooks(c, eth.blockchain, chainConfig)
 
-		eth.txPool.IsSigner = func(address common.Address) bool {
-			currentHeader := eth.blockchain.CurrentHeader()
-			header := currentHeader
-			// Sometimes, the latest block hasn't been inserted to chain yet
-			// getSnapshot from parent block if it exists
-			parentHeader := eth.blockchain.GetHeader(currentHeader.ParentHash, currentHeader.Number.Uint64()-1)
-			if parentHeader != nil {
-				// not genesis block
-				header = parentHeader
-			}
-			return c.IsAuthorisedAddress(eth.blockchain, header, address)
+		isSigner := func(address common.Address) bool {
+			return c.IsAuthorisedAddress(eth.blockchain, eth.blockchain.CurrentHeader(), address)
 		}
-
+		eth.txPool.SetSigner(isSigner)
 	}
 	// Start the RPC service
 	eth.netRPCService = ethapi.NewNetAPI(eth.p2pServer, eth.NetVersion())
@@ -354,7 +403,7 @@ func makeExtraData(extra []byte) []byte {
 	if len(extra) == 0 {
 		// create default extradata
 		extra, _ = rlp.EncodeToBytes([]interface{}{
-			uint(params.VersionMajor<<16 | params.VersionMinor<<8 | params.VersionPatch),
+			uint(ver.Major<<16 | ver.Minor<<8 | ver.Patch),
 			"XDC",
 			runtime.Version(),
 			runtime.GOOS,
@@ -368,41 +417,19 @@ func makeExtraData(extra []byte) []byte {
 }
 
 // CreateConsensusEngine creates the required type of consensus engine instance for an Ethereum service
-func CreateConsensusEngine(stack *node.Node, config *ethash.Config, chainConfig *params.ChainConfig, db ethdb.Database) consensus.Engine {
+func CreateConsensusEngine(stack *node.Node, chainConfig *params.ChainConfig, db ethdb.Database) (consensus.Engine, error) {
 	// If delegated-proof-of-stake is requested, set it up
 	if chainConfig.XDPoS != nil {
 		return XDPoS.New(chainConfig, db)
 	}
 
-	// Otherwise assume proof-of-work
-	switch config.PowMode {
-	case ethash.ModeFake:
-		log.Warn("Ethash used in fake mode")
-		return ethash.NewFaker()
-	case ethash.ModeTest:
-		log.Warn("Ethash used in test mode")
-		return ethash.NewTester()
-	case ethash.ModeShared:
-		log.Warn("Ethash used in shared mode")
-		return ethash.NewShared()
-	default:
-		engine := ethash.New(ethash.Config{
-			CacheDir:       stack.ResolvePath(config.CacheDir),
-			CachesInMem:    config.CachesInMem,
-			CachesOnDisk:   config.CachesOnDisk,
-			DatasetDir:     config.DatasetDir,
-			DatasetsInMem:  config.DatasetsInMem,
-			DatasetsOnDisk: config.DatasetsOnDisk,
-		})
-		engine.SetThreads(-1) // Disable CPU mining
-		return engine
-	}
+	return ethash.NewFaker(), nil
 }
 
 // APIs return the collection of RPC services the ethereum package offers.
 // NOTE, some of these services probably need to be moved to somewhere else.
 func (e *Ethereum) APIs() []rpc.API {
-	apis := ethapi.GetAPIs(e.ApiBackend, e.BlockChain())
+	apis := ethapi.GetAPIs(e.APIBackend, e.BlockChain())
 
 	// Append any APIs exposed explicitly by the consensus engine
 	apis = append(apis, e.engine.APIs(e.BlockChain())...)
@@ -420,13 +447,13 @@ func (e *Ethereum) APIs() []rpc.API {
 			Service:   downloader.NewDownloaderAPI(e.protocolManager.downloader, e.eventMux),
 		}, {
 			Namespace: "eth",
-			Service:   filters.NewFilterAPI(filters.NewFilterSystem(e.ApiBackend, filters.Config{LogCacheSize: e.config.FilterLogCacheSize}), false),
+			Service:   filters.NewFilterAPI(filters.NewFilterSystem(e.APIBackend, filters.Config{LogCacheSize: e.config.FilterLogCacheSize}), false),
 		}, {
 			Namespace: "admin",
 			Service:   NewAdminAPI(e),
 		}, {
 			Namespace: "debug",
-			Service:   NewDebugAPI(e.chainConfig, e),
+			Service:   NewDebugAPI(e),
 		}, {
 			Namespace: "net",
 			Service:   e.netRPCService,
@@ -476,7 +503,7 @@ func (e *Ethereum) ValidateMasternode() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if e.chainConfig.XDPoS != nil {
+	if e.blockchain.Config().XDPoS != nil {
 		//check if miner's wallet is in set of validators
 		c := e.engine.(*XDPoS.XDPoS)
 
@@ -562,16 +589,37 @@ func (e *Ethereum) Start() error {
 // Stop implements node.Lifecycle, terminating all internal goroutines used by the
 // Ethereum protocol.
 func (e *Ethereum) Stop() error {
+	log.Info("Stopping Ethereum bloomIndexer start")
 	e.bloomIndexer.Close()
+	log.Info("Ethereum bloomIndexer stopped")
+
+	log.Info("Stopping Ethereum blockchain start")
 	e.blockchain.Stop()
+	log.Info("Ethereum blockchain stopped")
+
+	log.Info("Stopping Ethereum protocolManager start")
 	e.protocolManager.Stop()
+	log.Info("Ethereum protocolManager stopped")
 
-	e.txPool.Stop()
-	e.miner.Stop()
-	e.eventMux.Stop()
+	log.Info("Stopping Ethereum txPool start")
+	e.txPool.Close()
+	log.Info("Ethereum txPool stopped")
 
-	e.chainDb.Close()
+	log.Info("Stopping Ethereum shutdownChan start")
 	close(e.shutdownChan)
+	log.Info("Ethereum shutdownChan stopped")
+
+	log.Info("Stopping Ethereum miner start")
+	e.miner.Stop()
+	log.Info("Ethereum miner stopped")
+
+	log.Info("Stopping Ethereum eventMux start")
+	e.eventMux.Stop()
+	log.Info("Ethereum eventMux stopped")
+
+	log.Info("Stopping Ethereum chainDb start")
+	e.chainDb.Close()
+	log.Info("Ethereum chainDb stopped")
 
 	return nil
 }
@@ -584,7 +632,7 @@ func (e *Ethereum) GetXDCX() *XDCx.XDCX {
 	return e.XDCX
 }
 
-func (e *Ethereum) OrderPool() *txpool.OrderPool {
+func (e *Ethereum) OrderPool() *legacypool.OrderPool {
 	return e.orderPool
 }
 
@@ -593,6 +641,6 @@ func (e *Ethereum) GetXDCXLending() *XDCxlending.Lending {
 }
 
 // LendingPool geth eth lending pool
-func (e *Ethereum) LendingPool() *txpool.LendingPool {
+func (e *Ethereum) LendingPool() *legacypool.LendingPool {
 	return e.lendingPool
 }

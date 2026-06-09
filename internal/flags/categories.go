@@ -22,8 +22,7 @@ const (
 	EthCategory        = "ETHEREUM"
 	LightCategory      = "LIGHT CLIENT"
 	DevCategory        = "DEVELOPER CHAIN"
-	EthashCategory     = "ETHASH"
-	TxPoolCategory     = "TRANSACTION POOL"
+	TxPoolCategory     = "TRANSACTION POOL (EVM)"
 	PerfCategory       = "PERFORMANCE TUNING"
 	AccountCategory    = "ACCOUNT"
 	APICategory        = "API AND CONSOLE"
@@ -36,7 +35,6 @@ const (
 	MiscCategory       = "MISC"
 	DeprecatedCategory = "ALIASED (deprecated)"
 	XdcCategory        = "XDC"
-	XdcxCategory       = "XDCx"
 )
 
 func init() {

@@ -8,7 +8,6 @@ import (
 
 	"github.com/XinFinOrg/XDPoSChain/accounts/abi/bind"
 	"github.com/XinFinOrg/XDPoSChain/accounts/abi/bind/backends"
-	"github.com/XinFinOrg/XDPoSChain/common"
 	"github.com/XinFinOrg/XDPoSChain/core/types"
 	"github.com/XinFinOrg/XDPoSChain/crypto"
 	"github.com/XinFinOrg/XDPoSChain/log"
@@ -20,21 +19,27 @@ var (
 	mainAddr   = crypto.PubkeyToAddress(mainKey.PublicKey)
 )
 
+// TestPriceFeed tests price feed.
 func TestPriceFeed(t *testing.T) {
 	glogger := log.NewGlogHandler(log.NewTerminalHandler(os.Stderr, false))
 	glogger.Verbosity(log.LevelTrace)
 	log.SetDefault(log.NewLogger(glogger))
 
-	common.TIPXDCXCancellationFee = big.NewInt(0)
+	testChainConfig := *params.TestXDPoSMockChainConfig
+	testChainConfig.TIPXDCXCancellationFeeBlock = big.NewInt(0)
+
 	// init genesis
 	contractBackend := backends.NewXDCSimulatedBackend(
 		types.GenesisAlloc{
 			mainAddr: {Balance: big.NewInt(0).Mul(big.NewInt(10000000000000), big.NewInt(10000000000000))},
 		},
 		42000000,
-		params.TestXDPoSMockChainConfig,
+		&testChainConfig,
 	)
-	transactOpts := bind.NewKeyedTransactor(mainKey)
+	transactOpts, err := bind.NewKeyedTransactorWithChainID(mainKey, testChainConfig.ChainID)
+	if err != nil {
+		t.Fatal("can't create transactor: ", err)
+	}
 	// deploy payer swap SMC
 	addr, contract, err := DeployMyInherited(transactOpts, contractBackend)
 	if err != nil {
@@ -46,5 +51,4 @@ func TestPriceFeed(t *testing.T) {
 		t.Fatal("can't run function Foo() in  smart contract: ", err)
 	}
 	fmt.Println("tx", tx)
-
 }

@@ -29,7 +29,7 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/crypto/sha3"
+	"github.com/XinFinOrg/XDPoSChain/crypto/keccak"
 )
 
 const (
@@ -39,7 +39,7 @@ const (
 // TestRefHasher tests that the RefHasher computes the expected BMT hash for
 // all data lengths between 0 and 256 bytes
 func TestRefHasher(t *testing.T) {
-	hashFunc := sha3.NewLegacyKeccak256
+	hashFunc := keccak.NewLegacyKeccak256
 
 	sha3 := func(data ...[]byte) []byte {
 		h := hashFunc()
@@ -212,7 +212,7 @@ func testHasher(f func(BaseHasher, []byte, int, int) error) error {
 	tdata := testDataReader(4128)
 	data := make([]byte, 4128)
 	tdata.Read(data)
-	hasher := sha3.NewLegacyKeccak256
+	hasher := keccak.NewLegacyKeccak256
 	size := hasher().Size()
 	counts := []int{1, 2, 3, 4, 5, 8, 16, 32, 64, 128}
 
@@ -239,7 +239,7 @@ func TestHasherReuseWithRelease(t *testing.T) {
 }
 
 func testHasherReuse(i int, t *testing.T) {
-	hasher := sha3.NewLegacyKeccak256
+	hasher := keccak.NewLegacyKeccak256
 	pool := NewTreePool(hasher, 128, i)
 	defer pool.Drain(0)
 	bmt := New(pool)
@@ -258,28 +258,26 @@ func testHasherReuse(i int, t *testing.T) {
 }
 
 func TestHasherConcurrency(t *testing.T) {
-	hasher := sha3.NewLegacyKeccak256
+	hasher := keccak.NewLegacyKeccak256
 	pool := NewTreePool(hasher, 128, maxproccnt)
 	defer pool.Drain(0)
 	wg := sync.WaitGroup{}
 	cycles := 100
-	wg.Add(maxproccnt * cycles)
 	errc := make(chan error)
 
 	for p := 0; p < maxproccnt; p++ {
 		for i := 0; i < cycles; i++ {
-			go func() {
+			wg.Go(func() {
 				bmt := New(pool)
 				n := rand.Intn(4096)
 				tdata := testDataReader(n)
 				data := make([]byte, n)
 				tdata.Read(data)
 				err := testHasherCorrectness(bmt, hasher, data, n, 128)
-				wg.Done()
 				if err != nil {
 					errc <- err
 				}
-			}()
+			})
 		}
 	}
 	go func() {
@@ -379,25 +377,23 @@ func benchmarkBMTBaseline(n int, t *testing.B) {
 	tdata := testDataReader(64)
 	data := make([]byte, 64)
 	tdata.Read(data)
-	hasher := sha3.NewLegacyKeccak256
+	hasher := keccak.NewLegacyKeccak256
 
 	t.ReportAllocs()
 	t.ResetTimer()
 	for i := 0; i < t.N; i++ {
 		count := int32((n-1)/hasher().Size() + 1)
 		wg := sync.WaitGroup{}
-		wg.Add(maxproccnt)
 		var i int32
 		for j := 0; j < maxproccnt; j++ {
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				h := hasher()
 				for atomic.AddInt32(&i, 1) < count {
 					h.Reset()
 					h.Write(data)
 					h.Sum(nil)
 				}
-			}()
+			})
 		}
 		wg.Wait()
 	}
@@ -409,7 +405,7 @@ func benchmarkHasher(n int, t *testing.B) {
 	tdata.Read(data)
 
 	size := 1
-	hasher := sha3.NewLegacyKeccak256
+	hasher := keccak.NewLegacyKeccak256
 	segmentCount := 128
 	pool := NewTreePool(hasher, segmentCount, size)
 	bmt := New(pool)
@@ -428,7 +424,7 @@ func benchmarkHasherReuse(poolsize, n int, t *testing.B) {
 	data := make([]byte, n)
 	tdata.Read(data)
 
-	hasher := sha3.NewLegacyKeccak256
+	hasher := keccak.NewLegacyKeccak256
 	segmentCount := 128
 	pool := NewTreePool(hasher, segmentCount, poolsize)
 	cycles := 200
@@ -437,15 +433,13 @@ func benchmarkHasherReuse(poolsize, n int, t *testing.B) {
 	t.ResetTimer()
 	for i := 0; i < t.N; i++ {
 		wg := sync.WaitGroup{}
-		wg.Add(cycles)
 		for j := 0; j < cycles; j++ {
-			bmt := New(pool)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
+				bmt := New(pool)
 				bmt.Reset()
 				bmt.Write(data)
 				bmt.Sum(nil)
-			}()
+			})
 		}
 		wg.Wait()
 	}
@@ -455,7 +449,7 @@ func benchmarkSHA3(n int, t *testing.B) {
 	data := make([]byte, n)
 	tdata := testDataReader(n)
 	tdata.Read(data)
-	hasher := sha3.NewLegacyKeccak256
+	hasher := keccak.NewLegacyKeccak256
 	h := hasher()
 
 	t.ReportAllocs()
@@ -471,7 +465,7 @@ func benchmarkRefHasher(n int, t *testing.B) {
 	data := make([]byte, n)
 	tdata := testDataReader(n)
 	tdata.Read(data)
-	hasher := sha3.NewLegacyKeccak256
+	hasher := keccak.NewLegacyKeccak256
 	rbmt := NewRefHasher(hasher, 128)
 
 	t.ReportAllocs()

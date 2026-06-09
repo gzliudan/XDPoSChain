@@ -372,7 +372,6 @@ func testClientCancel(transport string, t *testing.T) {
 		ncallers = 10
 	)
 	caller := func(index int) {
-		defer wg.Done()
 		for i := 0; i < nreqs; i++ {
 			var (
 				ctx     context.Context
@@ -404,9 +403,8 @@ func testClientCancel(transport string, t *testing.T) {
 			cancel()
 		}
 	}
-	wg.Add(ncallers)
 	for i := 0; i < ncallers; i++ {
-		go caller(i)
+		wg.Go(func() { caller(i) })
 	}
 	wg.Wait()
 }
@@ -973,7 +971,7 @@ func (l *flakeyListener) Accept() (net.Conn, error) {
 
 	c, err := l.Listener.Accept()
 	if err == nil {
-		timeout := time.Duration(rand.Int63n(int64(l.maxKillTimeout)))
+		timeout := max(time.Millisecond*10, time.Duration(rand.Int63n(int64(l.maxKillTimeout))))
 		time.AfterFunc(timeout, func() {
 			log.Debug(fmt.Sprintf("killing conn %v after %v", c.LocalAddr(), timeout))
 			c.Close()

@@ -23,7 +23,6 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
-	"sort"
 	"time"
 
 	"github.com/XinFinOrg/XDPoSChain/common"
@@ -140,7 +139,6 @@ type ticketStore struct {
 
 	lastBucketFetched timeBucket
 	nextTicketCached  *ticketRef
-	nextTicketReg     mclock.AbsTime
 
 	searchTopicMap        map[Topic]searchTopic
 	nextTopicQueryCleanup mclock.AbsTime
@@ -285,39 +283,6 @@ func (s *ticketStore) ticketsInWindow(topic Topic) []ticketRef {
 	}
 	log.Trace("Retrieved discovery registration tickets", "topic", topic, "from", s.lastBucketFetched, "tickets", len(tickets))
 	return tickets
-}
-
-func (s *ticketStore) removeExcessTickets(t Topic) {
-	tickets := s.ticketsInWindow(t)
-	if len(tickets) <= wantTicketsInWindow {
-		return
-	}
-	sort.Sort(ticketRefByWaitTime(tickets))
-	for _, r := range tickets[wantTicketsInWindow:] {
-		s.removeTicketRef(r)
-	}
-}
-
-type ticketRefByWaitTime []ticketRef
-
-// Len is the number of elements in the collection.
-func (s ticketRefByWaitTime) Len() int {
-	return len(s)
-}
-
-func (r ticketRef) waitTime() mclock.AbsTime {
-	return r.t.regTime[r.idx] - r.t.issueTime
-}
-
-// Less reports whether the element with
-// index i should sort before the element with index j.
-func (s ticketRefByWaitTime) Less(i, j int) bool {
-	return s[i].waitTime() < s[j].waitTime()
-}
-
-// Swap swaps the elements with indexes i and j.
-func (s ticketRefByWaitTime) Swap(i, j int) {
-	s[i], s[j] = s[j], s[i]
 }
 
 func (s *ticketStore) addTicketRef(r ticketRef) {

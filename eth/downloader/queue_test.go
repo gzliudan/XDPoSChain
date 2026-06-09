@@ -29,15 +29,9 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/common"
 	"github.com/XinFinOrg/XDPoSChain/consensus/ethash"
 	"github.com/XinFinOrg/XDPoSChain/core"
-	"github.com/XinFinOrg/XDPoSChain/core/rawdb"
 	"github.com/XinFinOrg/XDPoSChain/core/types"
 	"github.com/XinFinOrg/XDPoSChain/log"
 	"github.com/XinFinOrg/XDPoSChain/params"
-)
-
-var (
-	testdb  = rawdb.NewMemoryDatabase()
-	genesis = core.GenesisBlockForTesting(testdb, testAddress, big.NewInt(1000000000))
 )
 
 // makeChain creates a chain of n blocks starting at and including parent.
@@ -45,12 +39,16 @@ var (
 // contains a transaction and every 5th an uncle to allow testing correct block
 // reassembly.
 func makeChain(n int, seed byte, parent *types.Block, empty bool) ([]*types.Block, []types.Receipts) {
-	blocks, receipts := core.GenerateChain(params.TestChainConfig, parent, ethash.NewFaker(), testdb, n, func(i int, block *core.BlockGen) {
+	blocks, receipts := core.GenerateChain(params.TestChainConfig, parent, ethash.NewFaker(), testDB, n, func(i int, block *core.BlockGen) {
 		block.SetCoinbase(common.Address{seed})
 		// Add one tx to every secondblock
 		if !empty && i%2 == 0 {
 			signer := types.MakeSigner(params.TestChainConfig, block.Number())
-			tx, err := types.SignTx(types.NewTransaction(block.TxNonce(testAddress), common.Address{seed}, big.NewInt(1000), params.TxGas, nil, nil), signer, testKey)
+			fee := block.BaseFee()
+			if fee == nil {
+				fee = big.NewInt(params.InitialBaseFee)
+			}
+			tx, err := types.SignTx(types.NewTransaction(block.TxNonce(testAddress), common.Address{seed}, big.NewInt(1000), params.TxGas, fee, nil), signer, testKey)
 			if err != nil {
 				panic(err)
 			}
@@ -71,10 +69,10 @@ var emptyChain *chainData
 func init() {
 	// Create a chain of blocks to import
 	targetBlocks := 128
-	blocks, _ := makeChain(targetBlocks, 0, genesis, false)
+	blocks, _ := makeChain(targetBlocks, 0, testGenesis, false)
 	chain = &chainData{blocks, 0}
 
-	blocks, _ = makeChain(targetBlocks, 0, genesis, true)
+	blocks, _ = makeChain(targetBlocks, 0, testGenesis, true)
 	emptyChain = &chainData{blocks, 0}
 }
 
@@ -168,7 +166,6 @@ func TestBasics(t *testing.T) {
 		if got, exp := fetchReq.Headers[0].Number.Uint64(), uint64(1); got != exp {
 			t.Fatalf("expected header %d, got %d", exp, got)
 		}
-
 	}
 	//fmt.Printf("blockTaskQueue len: %d\n", q.blockTaskQueue.Size())
 	//fmt.Printf("receiptTaskQueue len: %d\n", q.receiptTaskQueue.Size())
@@ -208,7 +205,6 @@ func TestEmptyBlocks(t *testing.T) {
 		if fetchReq != nil {
 			t.Fatal("there should be no body fetch tasks remaining")
 		}
-
 	}
 	if q.blockTaskQueue.Size() != len(emptyChain.blocks)-10 {
 		t.Errorf("expected block task queue to be 0, got %d", q.blockTaskQueue.Size())
@@ -237,7 +233,7 @@ func TestEmptyBlocks(t *testing.T) {
 // some more advanced scenarios
 func XTestDelivery(t *testing.T) {
 	// the outside network, holding blocks
-	blo, rec := makeChain(128, 0, genesis, false)
+	blo, rec := makeChain(128, 0, testGenesis, false)
 	world := newNetwork()
 	world.receipts = rec
 	world.chain = blo
@@ -248,10 +244,8 @@ func XTestDelivery(t *testing.T) {
 	q := newQueue(10, 10)
 	var wg sync.WaitGroup
 	q.Prepare(1, FastSync)
-	wg.Add(1)
-	go func() {
+	wg.Go(func() {
 		// deliver headers
-		defer wg.Done()
 		c := 1
 		for {
 			//fmt.Printf("getting headers from %d\n", c)
@@ -262,11 +256,9 @@ func XTestDelivery(t *testing.T) {
 			q.Schedule(hdrs, uint64(c))
 			c += l
 		}
-	}()
-	wg.Add(1)
-	go func() {
+	})
+	wg.Go(func() {
 		// collect results
-		defer wg.Done()
 		tot := 0
 		for {
 			res := q.Results(true)
@@ -274,12 +266,9 @@ func XTestDelivery(t *testing.T) {
 			fmt.Printf("got %d results, %d tot\n", len(res), tot)
 			// Now we can forget about these
 			world.forget(res[len(res)-1].Header.Number.Uint64())
-
 		}
-	}()
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	})
+	wg.Go(func() {
 		// reserve body fetch
 		i := 4
 		for {
@@ -304,9 +293,8 @@ func XTestDelivery(t *testing.T) {
 				time.Sleep(200 * time.Millisecond)
 			}
 		}
-	}()
-	go func() {
-		defer wg.Done()
+	})
+	wg.Go(func() {
 		// reserve receiptfetch
 		peer := dummyPeer("peer-3")
 		for {
@@ -325,10 +313,8 @@ func XTestDelivery(t *testing.T) {
 				time.Sleep(200 * time.Millisecond)
 			}
 		}
-	}()
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	})
+	wg.Go(func() {
 		for i := 0; i < 50; i++ {
 			time.Sleep(300 * time.Millisecond)
 			//world.tick()
@@ -337,19 +323,16 @@ func XTestDelivery(t *testing.T) {
 		}
 		for i := 0; i < 50; i++ {
 			time.Sleep(2990 * time.Millisecond)
-
 		}
-	}()
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	})
+	wg.Go(func() {
 		for {
 			time.Sleep(990 * time.Millisecond)
 			fmt.Printf("world block tip is %d\n",
 				world.chain[len(world.chain)-1].Header().Number.Uint64())
 			fmt.Println(q.Stats())
 		}
-	}()
+	})
 	wg.Wait()
 }
 
@@ -388,10 +371,9 @@ func (n *network) forget(blocknum uint64) {
 	n.chain = n.chain[index:]
 	n.receipts = n.receipts[index:]
 	n.offset = int(blocknum)
-
 }
-func (n *network) progress(numBlocks int) {
 
+func (n *network) progress(numBlocks int) {
 	n.lock.Lock()
 	defer n.lock.Unlock()
 	//fmt.Printf("progressing...\n")
@@ -399,7 +381,6 @@ func (n *network) progress(numBlocks int) {
 	n.chain = append(n.chain, newBlocks...)
 	n.receipts = append(n.receipts, newR...)
 	n.cond.Broadcast()
-
 }
 
 func (n *network) headers(from int) []*types.Header {

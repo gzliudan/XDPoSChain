@@ -16,6 +16,7 @@ import (
 )
 
 func TestYourTurnInitialV2(t *testing.T) {
+	skipLongInShortMode(t)
 	config := params.TestXDPoSMockChainConfig
 	blockchain, _, parentBlock, signer, signFn, _ := PrepareXDCTestBlockChainForV2Engine(t, int(config.XDPoS.Epoch)-1, config, nil)
 	minePeriod := config.XDPoS.V2.CurrentConfig.MinePeriod
@@ -61,6 +62,7 @@ func TestYourTurnInitialV2(t *testing.T) {
 }
 
 func TestShouldMineOncePerRound(t *testing.T) {
+	skipLongInShortMode(t)
 	config := params.TestXDPoSMockChainConfig
 	blockchain, _, block910, signer, _, _ := PrepareXDCTestBlockChainForV2Engine(t, 910, config, nil)
 	adaptor := blockchain.Engine().(*XDPoS.XDPoS)
@@ -76,6 +78,7 @@ func TestShouldMineOncePerRound(t *testing.T) {
 }
 
 func TestUpdateMasterNodes(t *testing.T) {
+	skipLongInShortMode(t)
 	config := params.TestXDPoSMockChainConfig
 	blockchain, _, currentBlock, signer, signFn, _ := PrepareXDCTestBlockChainForV2Engine(t, int(config.XDPoS.Epoch+config.XDPoS.Gap)-1, config, nil)
 	adaptor := blockchain.Engine().(*XDPoS.XDPoS)
@@ -145,13 +148,13 @@ func TestPrepareFail(t *testing.T) {
 	blockchain, _, currentBlock, signer, _, _ := PrepareXDCTestBlockChainForV2Engine(t, int(config.XDPoS.Epoch), config, nil)
 	adaptor := blockchain.Engine().(*XDPoS.XDPoS)
 
-	tstamp := time.Now().Unix()
+	tstamp := uint64(time.Now().Unix())
 
 	notReadyToProposeHeader := &types.Header{
 		ParentHash: currentBlock.Hash(),
 		Number:     big.NewInt(int64(901)),
-		GasLimit:   params.TargetGasLimit,
-		Time:       big.NewInt(tstamp),
+		GasLimit:   testGasLimit,
+		Time:       tstamp,
 		Coinbase:   signer,
 	}
 
@@ -161,8 +164,8 @@ func TestPrepareFail(t *testing.T) {
 	notReadyToMine := &types.Header{
 		ParentHash: currentBlock.Hash(),
 		Number:     big.NewInt(int64(901)),
-		GasLimit:   params.TargetGasLimit,
-		Time:       big.NewInt(tstamp),
+		GasLimit:   testGasLimit,
+		Time:       tstamp,
 		Coinbase:   signer,
 	}
 	// trigger initial which will set the highestQC
@@ -175,8 +178,8 @@ func TestPrepareFail(t *testing.T) {
 	header901WithoutCoinbase := &types.Header{
 		ParentHash: currentBlock.Hash(),
 		Number:     big.NewInt(int64(901)),
-		GasLimit:   params.TargetGasLimit,
-		Time:       big.NewInt(tstamp),
+		GasLimit:   testGasLimit,
+		Time:       tstamp,
 	}
 
 	err = adaptor.Prepare(blockchain, header901WithoutCoinbase)
@@ -191,13 +194,13 @@ func TestPrepareHappyPath(t *testing.T) {
 	_, err := adaptor.YourTurn(blockchain, currentBlock.Header(), signer)
 	assert.Nil(t, err)
 
-	tstamp := time.Now().Unix()
+	tstamp := uint64(time.Now().Unix())
 
 	header901 := &types.Header{
 		ParentHash: currentBlock.Hash(),
 		Number:     big.NewInt(int64(901)),
-		GasLimit:   params.TargetGasLimit,
-		Time:       big.NewInt(tstamp),
+		GasLimit:   testGasLimit,
+		Time:       tstamp,
 		Coinbase:   signer,
 	}
 
@@ -224,6 +227,7 @@ func TestPrepareHappyPath(t *testing.T) {
 }
 
 func TestPrepareDifferentMasternode(t *testing.T) {
+	skipLongInShortMode(t)
 	config := params.TestXDPoSMockChainConfig
 	blockchain, _, currentBlock, _, _, _ := PrepareXDCTestBlockChainForV2Engine(t, 1799, config, nil)
 	adaptor := blockchain.Engine().(*XDPoS.XDPoS)
@@ -236,6 +240,7 @@ func TestPrepareDifferentMasternode(t *testing.T) {
 
 // test if we have 128 candidates, then snapshot will store all of them, and when preparing (and verifying) candidates is truncated to MaxMasternodes
 func TestUpdateMultipleMasterNodes(t *testing.T) {
+	skipLongInShortMode(t)
 	config := params.TestXDPoSMockChainConfig
 	blockchain, _, currentBlock, signer, signFn := PrepareXDCTestBlockChainWith128Candidates(t, int(config.XDPoS.Epoch+config.XDPoS.Gap)-1, config)
 	adaptor := blockchain.Engine().(*XDPoS.XDPoS)
@@ -271,13 +276,13 @@ func TestUpdateMultipleMasterNodes(t *testing.T) {
 		}
 	}
 
-	tstamp := time.Now().Unix()
+	tstamp := uint64(time.Now().Unix())
 
 	header1800 := &types.Header{
 		ParentHash: parentBlock.Hash(),
 		Number:     big.NewInt(int64(1800)),
-		GasLimit:   params.TargetGasLimit,
-		Time:       big.NewInt(tstamp),
+		GasLimit:   testGasLimit,
+		Time:       tstamp,
 		Coinbase:   voterAddr,
 	}
 

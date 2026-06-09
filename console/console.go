@@ -17,16 +17,19 @@
 package console
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
+	"sync"
 	"syscall"
 
+	"github.com/XinFinOrg/XDPoSChain/console/prompt"
 	"github.com/XinFinOrg/XDPoSChain/internal/jsre"
 	"github.com/XinFinOrg/XDPoSChain/internal/jsre/deps"
 	"github.com/XinFinOrg/XDPoSChain/internal/web3ext"
@@ -38,7 +41,8 @@ import (
 )
 
 var (
-	passwordRegexp = regexp.MustCompile(`personal.[nus]`)
+	// u: unlock, s: signXX, sendXX, n: newAccount, i: importXX
+	passwordRegexp = regexp.MustCompile(`personal.[nusi]`)
 	onlyWhitespace = regexp.MustCompile(`^\s*$`)
 	exit           = regexp.MustCompile(`^\s*exit\s*;*\s*$`)
 )
@@ -52,26 +56,35 @@ const DefaultPrompt = "> "
 // Config is the collection of configurations to fine tune the behavior of the
 // JavaScript console.
 type Config struct {
-	DataDir  string       // Data directory to store the console history at
-	DocRoot  string       // Filesystem path from where to load JavaScript files from
-	Client   *rpc.Client  // RPC client to execute Ethereum requests through
-	Prompt   string       // Input prompt prefix string (defaults to DefaultPrompt)
-	Prompter UserPrompter // Input prompter to allow interactive user feedback (defaults to TerminalPrompter)
-	Printer  io.Writer    // Output writer to serialize any display strings to (defaults to os.Stdout)
-	Preload  []string     // Absolute paths to JavaScript files to preload
+	DataDir        string              // Data directory to store the console history at
+	DocRoot        string              // Filesystem path from where to load JavaScript files from
+	Client         *rpc.Client         // RPC client to execute Ethereum requests through
+	LocalTransport bool                // Whether the console is attached over an in-process or IPC transport
+	Prompt         string              // Input prompt prefix string (defaults to DefaultPrompt)
+	Prompter       prompt.UserPrompter // Input prompter to allow interactive user feedback (defaults to TerminalPrompter)
+	Printer        io.Writer           // Output writer to serialize any display strings to (defaults to os.Stdout)
+	Preload        []string            // Absolute paths to JavaScript files to preload
 }
 
 // Console is a JavaScript interpreted runtime environment. It is a fully fleged
 // JavaScript console attached to a running node via an external or in-process RPC
 // client.
 type Console struct {
-	client   *rpc.Client  // RPC client to execute Ethereum requests through
-	jsre     *jsre.JSRE   // JavaScript runtime environment running the interpreter
-	prompt   string       // Input prompt prefix string
-	prompter UserPrompter // Input prompter to allow interactive user feedback
-	histPath string       // Absolute path to the console scrollback history
-	history  []string     // Scroll history maintained by the console
-	printer  io.Writer    // Output writer to serialize any display strings to
+	client         *rpc.Client         // RPC client to execute Ethereum requests through
+	jsre           *jsre.JSRE          // JavaScript runtime environment running the interpreter
+	localTransport bool                // Whether the connected transport is in-process or IPC
+	prompt         string              // Input prompt prefix string
+	prompter       prompt.UserPrompter // Input prompter to allow interactive user feedback
+	histPath       string              // Absolute path to the console scrollback history
+	history        []string            // Scroll history maintained by the console
+	printer        io.Writer           // Output writer to serialize any display strings to
+
+	interactiveStopped chan struct{}
+	stopInteractiveCh  chan struct{}
+	signalReceived     chan struct{}
+	stopped            chan struct{}
+	wg                 sync.WaitGroup
+	stopOnce           sync.Once
 }
 
 // New initializes a JavaScript interpreted runtime environment and sets defaults
@@ -79,7 +92,7 @@ type Console struct {
 func New(config Config) (*Console, error) {
 	// Handle unset config values gracefully
 	if config.Prompter == nil {
-		config.Prompter = Stdin
+		config.Prompter = prompt.Stdin
 	}
 	if config.Prompt == "" {
 		config.Prompt = DefaultPrompt
@@ -90,12 +103,17 @@ func New(config Config) (*Console, error) {
 
 	// Initialize the console and return
 	console := &Console{
-		client:   config.Client,
-		jsre:     jsre.New(config.DocRoot, config.Printer),
-		prompt:   config.Prompt,
-		prompter: config.Prompter,
-		printer:  config.Printer,
-		histPath: filepath.Join(config.DataDir, HistoryFile),
+		client:             config.Client,
+		jsre:               jsre.New(config.DocRoot, config.Printer),
+		localTransport:     config.LocalTransport,
+		prompt:             config.Prompt,
+		prompter:           config.Prompter,
+		printer:            config.Printer,
+		histPath:           filepath.Join(config.DataDir, HistoryFile),
+		interactiveStopped: make(chan struct{}),
+		stopInteractiveCh:  make(chan struct{}),
+		signalReceived:     make(chan struct{}, 1),
+		stopped:            make(chan struct{}),
 	}
 	if err := os.MkdirAll(config.DataDir, 0700); err != nil {
 		return nil, err
@@ -103,6 +121,9 @@ func New(config Config) (*Console, error) {
 	if err := console.init(config.Preload); err != nil {
 		return nil, err
 	}
+
+	console.wg.Go(console.interruptHandler)
+
 	return console, nil
 }
 
@@ -123,7 +144,6 @@ func (c *Console) init(preload []string) error {
 	// Add bridge overrides for web3.js functionality.
 	c.jsre.Do(func(vm *goja.Runtime) {
 		c.initAdmin(vm, bridge)
-		c.initPersonal(vm, bridge)
 	})
 
 	// Preload JavaScript files.
@@ -180,13 +200,22 @@ func (c *Console) initWeb3(bridge *bridge) error {
 	return err
 }
 
+var defaultAPIs = map[string]string{"eth": "1.0", "net": "1.0", "debug": "1.0"}
+
 // initExtensions loads and registers web3.js extensions.
 func (c *Console) initExtensions() error {
-	// Compute aliases from server-provided modules.
+	const methodNotFound = -32601
 	apis, err := c.client.SupportedModules()
 	if err != nil {
-		return fmt.Errorf("api modules: %v", err)
+		if rpcErr, ok := err.(rpc.Error); ok && rpcErr.ErrorCode() == methodNotFound {
+			log.Warn("Server does not support method rpc_modules, using default API list.")
+			apis = defaultAPIs
+		} else {
+			return err
+		}
 	}
+
+	// Compute aliases from server-provided modules.
 	aliases := map[string]struct{}{"eth": {}}
 	for api := range apis {
 		if api == "web3" {
@@ -209,7 +238,39 @@ func (c *Console) initExtensions() error {
 			}
 		}
 	})
+	if !c.localTransport {
+		c.hideUnavailableDebugMethods()
+	}
 	return nil
+}
+
+func (c *Console) hideUnavailableDebugMethods() {
+	c.jsre.Do(func(vm *goja.Runtime) {
+		if _, err := vm.RunString(`
+			(function() {
+				function hideMethod(target, name) {
+					if (!target) {
+						return;
+					}
+					Object.defineProperty(target, name, {
+						value: undefined,
+						writable: true,
+						configurable: true,
+						enumerable: false
+					});
+				}
+
+				if (typeof debug !== "undefined") {
+					hideMethod(debug, "setHead");
+				}
+				if (typeof web3 !== "undefined" && web3 && web3.debug) {
+					hideMethod(web3.debug, "setHead");
+				}
+			})();
+		`); err != nil {
+			panic(err)
+		}
+	})
 }
 
 // initAdmin creates additional admin APIs implemented by the bridge.
@@ -219,30 +280,6 @@ func (c *Console) initAdmin(vm *goja.Runtime, bridge *bridge) {
 		admin.Set("sleep", jsre.MakeCallback(vm, bridge.Sleep))
 		admin.Set("clearHistory", c.clearHistory)
 	}
-}
-
-// initPersonal redirects account-related API methods through the bridge.
-//
-// If the console is in interactive mode and the 'personal' API is available, override
-// the openWallet, unlockAccount, newAccount and sign methods since these require user
-// interaction. The original web3 callbacks are stored in 'jeth'. These will be called
-// by the bridge after the prompt and send the original web3 request to the backend.
-func (c *Console) initPersonal(vm *goja.Runtime, bridge *bridge) {
-	personal := getObject(vm, "personal")
-	if personal == nil || c.prompter == nil {
-		return
-	}
-	log.Warn("Enabling deprecated personal namespace")
-	jeth := vm.NewObject()
-	vm.Set("jeth", jeth)
-	jeth.Set("openWallet", personal.Get("openWallet"))
-	jeth.Set("unlockAccount", personal.Get("unlockAccount"))
-	jeth.Set("newAccount", personal.Get("newAccount"))
-	jeth.Set("sign", personal.Get("sign"))
-	personal.Set("openWallet", jsre.MakeCallback(vm, bridge.OpenWallet))
-	personal.Set("unlockAccount", jsre.MakeCallback(vm, bridge.UnlockAccount))
-	personal.Set("newAccount", jsre.MakeCallback(vm, bridge.NewAccount))
-	personal.Set("sign", jsre.MakeCallback(vm, bridge.Sign))
 }
 
 func (c *Console) clearHistory() {
@@ -258,7 +295,7 @@ func (c *Console) clearHistory() {
 // consoleOutput is an override for the console.log and console.error methods to
 // stream the output into the configured output stream instead of stdout.
 func (c *Console) consoleOutput(call goja.FunctionCall) goja.Value {
-	var output []string
+	output := make([]string, 0, len(call.Arguments))
 	for _, argument := range call.Arguments {
 		output = append(output, fmt.Sprintf("%v", argument))
 	}
@@ -286,7 +323,23 @@ func (c *Console) AutoCompleteInput(line string, pos int) (string, []string, str
 		start++
 		break
 	}
-	return line[:start], c.jsre.CompleteKeywords(line[start:pos]), line[pos:]
+	return line[:start], c.filterCompletions(c.jsre.CompleteKeywords(line[start:pos])), line[pos:]
+}
+
+func (c *Console) filterCompletions(completions []string) []string {
+	if c.localTransport {
+		return completions
+	}
+	filtered := completions[:0]
+	for _, completion := range completions {
+		switch completion {
+		case "debug.setHead", "debug.setHead(", "debug.setHead.", "web3.debug.setHead", "web3.debug.setHead(", "web3.debug.setHead.":
+			continue
+		default:
+			filtered = append(filtered, completion)
+		}
+	}
+	return filtered
 }
 
 // Welcome show summary of current Geth instance and some metadata about the
@@ -314,9 +367,10 @@ func (c *Console) Welcome() {
 		for api, version := range apis {
 			modules = append(modules, fmt.Sprintf("%s:%s", api, version))
 		}
-		sort.Strings(modules)
+		slices.Sort(modules)
 		message += " modules: " + strings.Join(modules, " ") + "\n"
 	}
+	message += "\nTo exit, press ctrl-d or type exit"
 	fmt.Fprintln(c.printer, message)
 }
 
@@ -329,68 +383,122 @@ func (c *Console) Evaluate(statement string) {
 		}
 	}()
 	c.jsre.Evaluate(statement, c.printer)
+
+	// Avoid exiting Interactive when jsre was interrupted by SIGINT.
+	c.clearSignalReceived()
 }
 
-// Interactive starts an interactive user session, where input is propted from
+// interruptHandler runs in its own goroutine and waits for signals.
+// When a signal is received, it interrupts the JS interpreter.
+func (c *Console) interruptHandler() {
+	// During Interactive, liner inhibits the signal while it is prompting for
+	// input. However, the signal will be received while evaluating JS.
+	//
+	// On unsupported terminals, SIGINT can also happen while prompting.
+	// Unfortunately, it is not possible to abort the prompt in this case and
+	// the c.readLines goroutine leaks.
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT)
+	defer signal.Stop(sig)
+
+	for {
+		select {
+		case <-sig:
+			c.setSignalReceived()
+			c.jsre.Interrupt(errors.New("interrupted"))
+		case <-c.stopInteractiveCh:
+			close(c.interactiveStopped)
+			c.jsre.Interrupt(errors.New("interrupted"))
+		case <-c.stopped:
+			return
+		}
+	}
+}
+
+func (c *Console) setSignalReceived() {
+	select {
+	case c.signalReceived <- struct{}{}:
+	default:
+	}
+}
+
+func (c *Console) clearSignalReceived() {
+	select {
+	case <-c.signalReceived:
+	default:
+	}
+}
+
+// StopInteractive causes Interactive to return as soon as possible.
+func (c *Console) StopInteractive() {
+	select {
+	case c.stopInteractiveCh <- struct{}{}:
+	case <-c.stopped:
+	}
+}
+
+// Interactive starts an interactive user session, where input is prompted from
 // the configured user prompter.
 func (c *Console) Interactive() {
 	var (
-		prompt    = c.prompt          // Current prompt line (used for multi-line inputs)
-		indents   = 0                 // Current number of input indents (used for multi-line inputs)
-		input     = ""                // Current user input
-		scheduler = make(chan string) // Channel to send the next prompt on and receive the input
+		prompt      = c.prompt             // the current prompt line (used for multi-line inputs)
+		indents     = 0                    // the current number of input indents (used for multi-line inputs)
+		input       = ""                   // the current user input
+		inputLine   = make(chan string, 1) // receives user input
+		inputErr    = make(chan error, 1)  // receives liner errors
+		requestLine = make(chan string)    // requests a line of input
 	)
-	// Start a goroutine to listen for promt requests and send back inputs
-	go func() {
-		for {
-			// Read the next user input
-			line, err := c.prompter.PromptInput(<-scheduler)
-			if err != nil {
-				// In case of an error, either clear the prompt or fail
-				if err == liner.ErrPromptAborted { // ctrl-C
-					prompt, indents, input = c.prompt, 0, ""
-					scheduler <- ""
-					continue
-				}
-				close(scheduler)
-				return
-			}
-			// User input retrieved, send for interpretation and loop
-			scheduler <- line
-		}
-	}()
-	// Monitor Ctrl-C too in case the input is empty and we need to bail
-	abort := make(chan os.Signal, 1)
-	signal.Notify(abort, syscall.SIGINT, syscall.SIGTERM)
 
-	// Start sending prompts to the user and reading back inputs
+	defer func() {
+		c.writeHistory()
+	}()
+
+	// The line reader runs in a separate goroutine.
+	go c.readLines(inputLine, inputErr, requestLine)
+	defer close(requestLine)
+
 	for {
-		// Send the next prompt, triggering an input read and process the result
-		scheduler <- prompt
+		// Send the next prompt, triggering an input read.
+		requestLine <- prompt
+
 		select {
-		case <-abort:
-			// User forcefully quite the console
+		case <-c.interactiveStopped:
+			fmt.Fprintln(c.printer, "node is down, exiting console")
+			return
+
+		case <-c.signalReceived:
+			// SIGINT received while prompting for input -> unsupported terminal.
+			// I'm not sure if the best choice would be to leave the console running here.
+			// Bash keeps running in this case. node.js does not.
 			fmt.Fprintln(c.printer, "caught interrupt, exiting")
 			return
 
-		case line, ok := <-scheduler:
-			// User input was returned by the prompter, handle special cases
-			if !ok || (indents <= 0 && exit.MatchString(line)) {
+		case err := <-inputErr:
+			if err == liner.ErrPromptAborted {
+				// When prompting for multi-line input, the first Ctrl-C resets
+				// the multi-line state.
+				prompt, indents, input = c.prompt, 0, ""
+				continue
+			}
+			return
+
+		case line := <-inputLine:
+			// User input was returned by the prompter, handle special cases.
+			if indents <= 0 && exit.MatchString(line) {
 				return
 			}
 			if onlyWhitespace.MatchString(line) {
 				continue
 			}
-			// Append the line to the input and check for multi-line interpretation
+			// Append the line to the input and check for multi-line interpretation.
 			input += line + "\n"
-
 			indents = countIndents(input)
 			if indents <= 0 {
 				prompt = c.prompt
 			} else {
 				prompt = strings.Repeat(".", indents*3) + " "
 			}
-			// If all the needed lines are present, save the command and run
+			// If all the needed lines are present, save the command and run it.
 			if indents <= 0 {
 				if len(input) > 0 && input[0] != ' ' && !passwordRegexp.MatchString(input) {
 					if command := strings.TrimSpace(input); len(c.history) == 0 || command != c.history[len(c.history)-1] {
@@ -407,7 +515,19 @@ func (c *Console) Interactive() {
 	}
 }
 
-// countIndents returns the number of identations for the given input.
+// readLines runs in its own goroutine, prompting for input.
+func (c *Console) readLines(input chan<- string, errc chan<- error, prompt <-chan string) {
+	for p := range prompt {
+		line, err := c.prompter.PromptInput(p)
+		if err != nil {
+			errc <- err
+		} else {
+			input <- line
+		}
+	}
+}
+
+// countIndents returns the number of indentations for the given input.
 // In case of invalid input such as var a = } the result can be negative.
 func countIndents(input string) int {
 	var (
@@ -450,19 +570,21 @@ func countIndents(input string) int {
 	return indents
 }
 
-// Execute runs the JavaScript file specified as the argument.
-func (c *Console) Execute(path string) error {
-	return c.jsre.Exec(path)
-}
-
 // Stop cleans up the console and terminates the runtime environment.
 func (c *Console) Stop(graceful bool) error {
+	c.stopOnce.Do(func() {
+		// Stop the interrupt handler.
+		close(c.stopped)
+		c.wg.Wait()
+	})
+
+	c.jsre.Stop(graceful)
+	return nil
+}
+
+func (c *Console) writeHistory() error {
 	if err := os.WriteFile(c.histPath, []byte(strings.Join(c.history, "\n")), 0600); err != nil {
 		return err
 	}
-	if err := os.Chmod(c.histPath, 0600); err != nil { // Force 0600, even if it was different previously
-		return err
-	}
-	c.jsre.Stop(graceful)
-	return nil
+	return os.Chmod(c.histPath, 0600) // Force 0600, even if it was different previously
 }

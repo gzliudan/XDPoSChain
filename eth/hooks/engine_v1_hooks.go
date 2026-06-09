@@ -8,7 +8,7 @@ import (
 
 	"github.com/XinFinOrg/XDPoSChain/accounts/abi/bind"
 	"github.com/XinFinOrg/XDPoSChain/common"
-	"github.com/XinFinOrg/XDPoSChain/common/sort"
+	xdc_sort "github.com/XinFinOrg/XDPoSChain/common/sort"
 	"github.com/XinFinOrg/XDPoSChain/consensus"
 	"github.com/XinFinOrg/XDPoSChain/consensus/XDPoS"
 	"github.com/XinFinOrg/XDPoSChain/consensus/XDPoS/utils"
@@ -16,7 +16,9 @@ import (
 	contractValidator "github.com/XinFinOrg/XDPoSChain/contracts/validator/contract"
 	"github.com/XinFinOrg/XDPoSChain/core"
 	"github.com/XinFinOrg/XDPoSChain/core/state"
+	"github.com/XinFinOrg/XDPoSChain/core/tracing"
 	"github.com/XinFinOrg/XDPoSChain/core/types"
+	"github.com/XinFinOrg/XDPoSChain/core/vm"
 	"github.com/XinFinOrg/XDPoSChain/eth/util"
 	"github.com/XinFinOrg/XDPoSChain/log"
 	"github.com/XinFinOrg/XDPoSChain/params"
@@ -65,7 +67,6 @@ func AttachConsensusV1Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 		}
 		log.Debug("Time Calculated HookPenalty ", "block", blockNumberEpoc, "time", common.PrettyDuration(time.Since(start)))
 		return penSigners, nil
-
 	}
 
 	// Hook scans for bad masternodes and decide to penalty them
@@ -178,7 +179,7 @@ func AttachConsensusV1Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 	// Hook prepares validators M2 for the current epoch at checkpoint block
 	adaptor.EngineV1.HookValidator = func(header *types.Header, signers []common.Address) ([]byte, error) {
 		start := time.Now()
-		validators, err := getValidators(bc, signers)
+		validators, err := getValidatorsAtNumber(bc, signers, parentBlockNumber(header))
 		if err != nil {
 			return []byte{}, err
 		}
@@ -192,7 +193,7 @@ func AttachConsensusV1Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 		number := header.Number.Int64()
 		if number > 0 && number%common.EpocBlockRandomize == 0 {
 			start := time.Now()
-			validators, err := getValidators(bc, signers)
+			validators, err := getValidatorsAtNumber(bc, signers, parentBlockNumber(header))
 			log.Debug("Time Calculated HookVerifyMNs ", "block", header.Number.Uint64(), "time", common.PrettyDuration(time.Since(start)))
 			if err != nil {
 				return err
@@ -232,7 +233,7 @@ func AttachConsensusV1Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 			return nil, errors.New("nil stateDB in HookGetSignersFromContract")
 		}
 
-		candidateAddresses = state.GetCandidates(stateDB)
+		candidateAddresses = stateDB.GetCandidates()
 		for _, address := range candidateAddresses {
 			v, err := validator.GetCandidateCap(opts, address)
 			if err != nil {
@@ -241,7 +242,7 @@ func AttachConsensusV1Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 			candidates = append(candidates, utils.Masternode{Address: address, Stake: v})
 		}
 		// sort candidates by stake descending
-		sort.Slice(candidates, func(i, j int) bool {
+		xdc_sort.Slice(candidates, func(i, j int) bool {
 			return candidates[i].Stake.Cmp(candidates[j].Stake) >= 0
 		})
 		if len(candidates) > 150 {
@@ -255,10 +256,10 @@ func AttachConsensusV1Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 	}
 
 	// Hook calculates reward for masternodes
-	adaptor.EngineV1.HookReward = func(chain consensus.ChainReader, stateBlock *state.StateDB, parentState *state.StateDB, header *types.Header) (map[string]interface{}, error) {
+	adaptor.EngineV1.HookReward = func(chain consensus.ChainReader, stateBlock vm.StateDB, parentState *state.StateDB, header *types.Header) (map[string]interface{}, error) {
 		number := header.Number.Uint64()
 		rCheckpoint := chain.Config().XDPoS.RewardCheckpoint
-		foundationWalletAddr := chain.Config().XDPoS.FoudationWalletAddr
+		foundationWalletAddr := chain.Config().XDPoS.FoundationWalletAddr
 		if foundationWalletAddr == (common.Address{}) {
 			log.Error("Foundation Wallet Address is empty", "error", foundationWalletAddr)
 			return nil, errors.New("foundation Wallet Address is empty")
@@ -287,13 +288,13 @@ func AttachConsensusV1Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 			voterResults := make(map[common.Address]interface{})
 			if len(signers) > 0 {
 				for signer, calcReward := range rewardSigners {
-					rewards, err := contracts.CalculateRewardForHolders(foundationWalletAddr, parentState, signer, calcReward, number)
+					rewards, err := contracts.CalculateRewardForHolders(chain.Config(), foundationWalletAddr, parentState, signer, calcReward, header.Number)
 					if err != nil {
 						log.Crit("Fail to calculate reward for holders.", "error", err)
 					}
 					if len(rewards) > 0 {
 						for holder, reward := range rewards {
-							stateBlock.AddBalance(holder, reward)
+							stateBlock.AddBalance(holder, reward, tracing.BalanceIncreaseRewardMineBlock)
 						}
 					}
 					voterResults[signer] = rewards
@@ -306,7 +307,7 @@ func AttachConsensusV1Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 	}
 }
 
-func getValidators(bc *core.BlockChain, masternodes []common.Address) ([]byte, error) {
+func getValidatorsAtNumber(bc *core.BlockChain, masternodes []common.Address, blockNumber *big.Int) ([]byte, error) {
 	if bc.Config().XDPoS == nil {
 		return nil, core.ErrNotXDPoS
 	}
@@ -321,7 +322,7 @@ func getValidators(bc *core.BlockChain, masternodes []common.Address) ([]byte, e
 	lenSigners := int64(len(masternodes))
 	if lenSigners > 0 {
 		for _, addr := range masternodes {
-			random, err := contracts.GetRandomizeFromContract(client, addr)
+			random, err := contracts.GetRandomizeFromContractAtNumber(client, addr, blockNumber)
 			if err != nil {
 				return nil, err
 			}
@@ -335,4 +336,11 @@ func getValidators(bc *core.BlockChain, masternodes []common.Address) ([]byte, e
 		return contracts.BuildValidatorFromM2(m2), nil
 	}
 	return nil, core.ErrNotFoundM1
+}
+
+func parentBlockNumber(header *types.Header) *big.Int {
+	if header == nil || header.Number == nil || header.Number.Sign() == 0 {
+		return nil
+	}
+	return new(big.Int).Sub(header.Number, common.Big1)
 }

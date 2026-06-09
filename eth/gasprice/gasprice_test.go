@@ -25,7 +25,6 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/common"
 	"github.com/XinFinOrg/XDPoSChain/consensus/ethash"
 	"github.com/XinFinOrg/XDPoSChain/core"
-	"github.com/XinFinOrg/XDPoSChain/core/rawdb"
 	"github.com/XinFinOrg/XDPoSChain/core/types"
 	"github.com/XinFinOrg/XDPoSChain/core/vm"
 	"github.com/XinFinOrg/XDPoSChain/crypto"
@@ -48,8 +47,8 @@ func (b *testBackend) HeaderByNumber(ctx context.Context, number rpc.BlockNumber
 	if number == rpc.EarliestBlockNumber {
 		number = 0
 	}
-	if number == rpc.CommittedBlockNumber {
-		return b.chain.CurrentBlock().Header(), nil
+	if number == rpc.FinalizedBlockNumber {
+		return b.chain.CurrentBlock(), nil
 	}
 	if number == rpc.LatestBlockNumber {
 		number = testHead
@@ -71,8 +70,8 @@ func (b *testBackend) BlockByNumber(ctx context.Context, number rpc.BlockNumber)
 	if number == rpc.EarliestBlockNumber {
 		number = 0
 	}
-	if number == rpc.CommittedBlockNumber {
-		return b.chain.CurrentBlock(), nil
+	if number == rpc.FinalizedBlockNumber {
+		number = rpc.BlockNumber(b.chain.CurrentBlock().Number.Uint64())
 	}
 	if number == rpc.LatestBlockNumber {
 		number = testHead
@@ -109,7 +108,17 @@ func (b *testBackend) SubscribeChainHeadEvent(ch chan<- core.ChainHeadEvent) eve
 
 func newTestBackend(t *testing.T, eip1559Block *big.Int, pending bool) *testBackend {
 	config := *params.TestChainConfig // needs copy because it is modified below
-	config.Eip1559Block = eip1559Block
+	if eip1559Block == nil {
+		eip1559Block = big.NewInt(1_000_000_000)
+	}
+	config.EIP1559Block = eip1559Block
+	config.CancunBlock = common.CloneBigInt(eip1559Block)
+	config.PragueBlock = common.CloneBigInt(eip1559Block)
+	config.OsakaBlock = common.CloneBigInt(eip1559Block)
+	config.DynamicGasLimitBlock = common.CloneBigInt(eip1559Block)
+	config.TIPUpgradeRewardBlock = common.CloneBigInt(eip1559Block)
+	config.TIPUpgradePenaltyBlock = common.CloneBigInt(eip1559Block)
+	config.TIPEpochHalvingBlock = common.CloneBigInt(eip1559Block)
 
 	var (
 		key, _ = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
@@ -121,17 +130,15 @@ func newTestBackend(t *testing.T, eip1559Block *big.Int, pending bool) *testBack
 		signer = types.LatestSigner(gspec.Config)
 	)
 	engine := ethash.NewFaker()
-	db := rawdb.NewMemoryDatabase()
-	genesis, _ := gspec.Commit(db)
 
 	// Generate testing blocks
-	blocks, _ := core.GenerateChain(gspec.Config, genesis, engine, db, testHead+1, func(i int, b *core.BlockGen) {
+	db, blocks, _ := core.GenerateChainWithGenesis(gspec, engine, testHead+1, func(i int, b *core.BlockGen) {
 		b.SetCoinbase(common.Address{1})
 
 		var txdata types.TxData
-		if eip1559Block != nil && b.Number().Cmp(eip1559Block) >= 0 {
+		if b.Number().Cmp(config.EIP1559Block) >= 0 {
 			txdata = &types.DynamicFeeTx{
-				ChainID:   gspec.Config.ChainId,
+				ChainID:   gspec.Config.ChainID,
 				Nonce:     b.TxNonce(addr),
 				To:        &common.Address{},
 				Gas:       30000,
@@ -152,13 +159,13 @@ func newTestBackend(t *testing.T, eip1559Block *big.Int, pending bool) *testBack
 		b.AddTx(types.MustSignNewTx(key, signer, txdata))
 	})
 	// Construct testing chain
-	diskdb := rawdb.NewMemoryDatabase()
-	gspec.Commit(diskdb)
-	chain, err := core.NewBlockChain(diskdb, nil, gspec.Config, engine, vm.Config{})
+	chain, err := core.NewBlockChain(db, nil, gspec, engine, vm.Config{})
 	if err != nil {
 		t.Fatalf("Failed to create local chain, %v", err)
 	}
-	chain.InsertChain(blocks)
+	if _, err := chain.InsertChain(blocks); err != nil {
+		t.Fatalf("Failed to insert generated chain, %v", err)
+	}
 	return &testBackend{chain: chain, pending: pending}
 }
 
@@ -170,13 +177,14 @@ func (b *testBackend) GetBlockByNumber(number uint64) *types.Block {
 	return b.chain.GetBlockByNumber(number)
 }
 
+// TestSuggestTipCap tests suggest tip cap.
 func TestSuggestTipCap(t *testing.T) {
 	config := Config{
 		Blocks:     3,
 		Percentile: 60,
 	}
 	var cases = []struct {
-		fork   *big.Int // Eip1559 fork number
+		fork   *big.Int // EIP1559 fork number
 		expect *big.Int // Expected gasprice suggestion
 	}{
 		{nil, big.NewInt(params.GWei * int64(30))},

@@ -27,13 +27,18 @@ import (
 
 	"github.com/XinFinOrg/XDPoSChain"
 	"github.com/XinFinOrg/XDPoSChain/common"
+	xdc_sort "github.com/XinFinOrg/XDPoSChain/common/sort"
+	"github.com/XinFinOrg/XDPoSChain/consensus/XDPoS/engines/engine_v2"
+	"github.com/XinFinOrg/XDPoSChain/consensus/XDPoS/utils"
 	"github.com/XinFinOrg/XDPoSChain/core/rawdb"
+	"github.com/XinFinOrg/XDPoSChain/core/state"
 	"github.com/XinFinOrg/XDPoSChain/core/types"
 	"github.com/XinFinOrg/XDPoSChain/ethdb"
 	"github.com/XinFinOrg/XDPoSChain/event"
 	"github.com/XinFinOrg/XDPoSChain/log"
 	"github.com/XinFinOrg/XDPoSChain/metrics"
 	"github.com/XinFinOrg/XDPoSChain/params"
+	"github.com/XinFinOrg/XDPoSChain/trie"
 )
 
 // proposeBlockHandlerFn is a callback type to handle a block by the consensus
@@ -66,9 +71,9 @@ var (
 	reorgProtThreshold   = 48 // Threshold number of recent blocks to disable mini reorg protection
 	reorgProtHeaderDelay = 2  // Number of headers to delay delivering to cover mini reorgs
 
-	fsHeaderCheckFrequency = 100             // Verification frequency of the downloaded headers during fast sync
+	// Fast sync choose not to verify headers before the pivot, hence fsHeaderCheckFrequency = 0. Notice that blocks are full verified after pivot.
+	fsHeaderCheckFrequency = 0               // Verification frequency of the downloaded headers during fast sync
 	fsHeaderSafetyNet      = 2048            // Number of headers to discard in case a chain violation is detected
-	fsHeaderForceVerify    = 24              // Number of headers to verify before and after the pivot to accept it
 	fsHeaderContCheck      = 3 * time.Second // Time interval to check for header continuations during state download
 	fsMinFullBlocks        = 64              // Number of blocks to retrieve fully even in fast sync
 )
@@ -123,6 +128,15 @@ type Downloader struct {
 	synchronising   int32
 	notified        int32
 	committed       int32
+
+	// Pivot block configuration (set before sync starts)
+	pivotNumber uint64      // Fixed pivot block number (0 = use default calculation)
+	pivotHash   common.Hash // Expected pivot block hash for verification
+	pivotRoot   common.Hash // State root of pivot block for state sync
+
+	// Gap pivots (calculated from primary pivot at Epoch-block intervals)
+	pivotGapNumbers []uint64     // List of gap pivot numbers to sync before primary
+	pivotGapLock    sync.RWMutex // Protects pivotGapNumbers
 
 	// Channels
 	headerCh      chan dataPack        // [eth/62] Channel receiving inbound block headers
@@ -188,11 +202,11 @@ type BlockChain interface {
 	// GetBlockByHash retrieves a block from the local chain.
 	GetBlockByHash(common.Hash) *types.Block
 
-	// CurrentBlock retrieves the head block from the local chain.
-	CurrentBlock() *types.Block
+	// CurrentBlock retrieves the header of the head block from the local chain.
+	CurrentBlock() *types.Header
 
-	// CurrentFastBlock retrieves the head fast block from the local chain.
-	CurrentFastBlock() *types.Block
+	// CurrentSnapBlock retrieves the header of the head snap block from the local chain.
+	CurrentSnapBlock() *types.Header
 
 	// FastSyncCommitHead directly commits the head block to a certain entity.
 	FastSyncCommitHead(common.Hash) error
@@ -200,8 +214,15 @@ type BlockChain interface {
 	// InsertChain inserts a batch of blocks into the local chain.
 	InsertChain(types.Blocks) (int, error)
 
+	// InterruptInsert disables or enables chain insertion.
+	InterruptInsert(on bool)
+
 	// InsertReceiptChain inserts a batch of receipts into the local chain.
 	InsertReceiptChain(types.Blocks, []types.Receipts) (int, error)
+
+	// TrieDB retrieves the low level trie database used for interacting
+	// with trie nodes.
+	TrieDB() *trie.Database
 }
 
 // New creates a new downloader to fetch hashes and blocks from remote peers.
@@ -240,6 +261,44 @@ func New(stateDb ethdb.Database, mux *event.TypeMux, chain BlockChain, lightchai
 	return dl
 }
 
+// SetPivotBlock sets the fixed pivot block number, hash and state root for fast sync.
+// If set, the downloader will use this pivot instead of calculating one,
+// and will verify the pivot block's hash after state sync completes.
+// It also calculates gap pivots at some intervals that need state sync.
+func (d *Downloader) SetPivotBlock(number uint64, hash common.Hash, root common.Hash) {
+	// Gap pivots are an XDPoS concept; skip the calculation when XDPoS is not configured.
+	if d.blockchain.Config().XDPoS == nil {
+		return
+	}
+	d.pivotNumber = number
+	d.pivotHash = hash
+	d.pivotRoot = root
+
+	// Calculate all gap pivot numbers: N - N%Epoch - Gap  where x < N
+	epoch := d.blockchain.Config().XDPoS.Epoch
+	gap := d.blockchain.Config().XDPoS.Gap
+	epochBase := number - number%epoch
+	var baseGap uint64
+	if epochBase < gap {
+		baseGap = epoch - gap
+	} else {
+		baseGap = epochBase - gap
+	}
+	d.pivotGapLock.Lock()
+	d.pivotGapNumbers = nil
+	for i := uint64(0); ; i++ {
+		gapNumber := baseGap + epoch*i
+		if gapNumber >= number {
+			break
+		}
+		d.pivotGapNumbers = append(d.pivotGapNumbers, gapNumber)
+	}
+	if len(d.pivotGapNumbers) > 0 {
+		log.Info("SetPivotBlock calculated gap pivots", "primary", number, "gapCount", len(d.pivotGapNumbers), "gaps", d.pivotGapNumbers)
+	}
+	d.pivotGapLock.Unlock()
+}
+
 // Progress retrieves the synchronisation boundaries, specifically the origin
 // block where synchronisation started at (may have failed/suspended); the block
 // or header sync is currently at; and the latest known block which the sync targets.
@@ -256,9 +315,9 @@ func (d *Downloader) Progress() XDPoSChain.SyncProgress {
 	mode := d.getMode()
 	switch {
 	case d.blockchain != nil && mode == FullSync:
-		current = d.blockchain.CurrentBlock().NumberU64()
+		current = d.blockchain.CurrentBlock().Number.Uint64()
 	case d.blockchain != nil && mode == FastSync:
-		current = d.blockchain.CurrentFastBlock().NumberU64()
+		current = d.blockchain.CurrentSnapBlock().Number.Uint64()
 	case d.lightchain != nil:
 		current = d.lightchain.CurrentHeader().Number.Uint64()
 	default:
@@ -450,7 +509,11 @@ func (d *Downloader) syncWithPeer(p *peerConnection, hash common.Hash, td *big.I
 	// Ensure our origin point is below any fast sync pivot point
 	pivot := uint64(0)
 	if mode == FastSync {
-		if height <= uint64(fsMinFullBlocks) {
+		if d.pivotNumber != 0 {
+			// Use configured pivot block
+			log.Info("Using configured pivot block", "number", d.pivotNumber, "origin", origin)
+			pivot = d.pivotNumber
+		} else if height <= uint64(fsMinFullBlocks) {
 			origin = 0
 		} else {
 			pivot = height - uint64(fsMinFullBlocks)
@@ -462,6 +525,9 @@ func (d *Downloader) syncWithPeer(p *peerConnection, hash common.Hash, td *big.I
 	d.committed = 1
 	if mode == FastSync && pivot != 0 {
 		d.committed = 0
+	}
+	if mode == FastSync && d.pivotNumber != 0 && pivot <= origin {
+		d.committed = 1
 	}
 	// Initiate the sync using a concurrent header and content retrieval algorithm
 	d.queue.Prepare(origin+1, mode)
@@ -532,8 +598,10 @@ func (d *Downloader) cancel() {
 // Cancel aborts all of the operations and waits for all download goroutines to
 // finish before returning.
 func (d *Downloader) Cancel() {
+	d.blockchain.InterruptInsert(true)
 	d.cancel()
 	d.cancelWg.Wait()
+	d.blockchain.InterruptInsert(false)
 }
 
 // Terminate interrupts the downloader, canceling all pending operations.
@@ -555,7 +623,6 @@ func (d *Downloader) Terminate() {
 // fetchHeight retrieves the head header of the remote peer to aid in estimating
 // the total time a pending synchronisation would take.
 func (d *Downloader) fetchHeight(p *peerConnection, hash common.Hash) (*types.Header, error) {
-
 	// Request the advertised remote head block and wait for the response
 	go p.peer.RequestHeadersByHash(hash, 1, 0, false)
 
@@ -662,9 +729,9 @@ func (d *Downloader) findAncestor(p *peerConnection, remoteHeader *types.Header)
 	mode := d.getMode()
 	switch mode {
 	case FullSync:
-		localHeight = d.blockchain.CurrentBlock().NumberU64()
+		localHeight = d.blockchain.CurrentBlock().Number.Uint64()
 	case FastSync:
-		localHeight = d.blockchain.CurrentFastBlock().NumberU64()
+		localHeight = d.blockchain.CurrentSnapBlock().Number.Uint64()
 	default:
 		localHeight = d.lightchain.CurrentHeader().Number.Uint64()
 	}
@@ -934,18 +1001,22 @@ func (d *Downloader) fetchHeaders(p *peerConnection, from uint64, pivot uint64) 
 					if mode == LightSync {
 						head = d.lightchain.CurrentHeader().Number.Uint64()
 					} else {
-						head = d.blockchain.CurrentFastBlock().NumberU64()
-						if full := d.blockchain.CurrentBlock().NumberU64(); head < full {
+						head = d.blockchain.CurrentSnapBlock().Number.Uint64()
+						if full := d.blockchain.CurrentBlock().Number.Uint64(); head < full {
 							head = full
 						}
 					}
 					// If the head is way older than this batch, delay the last few headers
 					if head+uint64(reorgProtThreshold) < headers[n-1].Number.Uint64() {
 						delay := reorgProtHeaderDelay
-						if delay > n {
-							delay = n
+						// Only apply the delay if there are headers remaining after cutting,
+						// to avoid looping forever without making progress.
+						if n > delay {
+							p.log.Debug("[fetchHeaders] reorg protection delaying headers", "localHead", head, "lastHeaderNum", headers[n-1].Number.Uint64(), "threshold", reorgProtThreshold, "totalReceived", n, "delaying", delay, "remaining", n-delay)
+							headers = headers[:n-delay]
+						} else {
+							p.log.Debug("[fetchHeaders] reorg protection skipped: would remove all headers", "localHead", head, "lastHeaderNum", headers[n-1].Number.Uint64(), "threshold", reorgProtThreshold, "totalReceived", n)
 						}
-						headers = headers[:n-delay]
 					}
 				}
 			}
@@ -1116,7 +1187,6 @@ func (d *Downloader) fetchParts(deliveryCh chan dataPack, deliver func(dataPack)
 	expire func() map[string]int, pending func() int, inFlight func() bool, reserve func(*peerConnection, int) (*fetchRequest, bool, bool),
 	fetchHook func([]*types.Header), fetch func(*peerConnection, *fetchRequest) error, cancel func(*fetchRequest), capacity func(*peerConnection) int,
 	idle func() ([]*peerConnection, int), setIdle func(*peerConnection, int, time.Time), kind string) error {
-
 	// Create a ticker to detect expired retrieval tasks
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
@@ -1303,14 +1373,14 @@ func (d *Downloader) processHeaders(origin uint64, pivot uint64, td *big.Int) er
 			}
 			lastHeader, lastFastBlock, lastBlock := d.lightchain.CurrentHeader().Number, common.Big0, common.Big0
 			if mode != LightSync {
-				lastFastBlock = d.blockchain.CurrentFastBlock().Number()
-				lastBlock = d.blockchain.CurrentBlock().Number()
+				lastFastBlock = d.blockchain.CurrentSnapBlock().Number
+				lastBlock = d.blockchain.CurrentBlock().Number
 			}
 			d.lightchain.Rollback(hashes)
 			curFastBlock, curBlock := common.Big0, common.Big0
 			if mode != LightSync {
-				curFastBlock = d.blockchain.CurrentFastBlock().Number()
-				curBlock = d.blockchain.CurrentBlock().Number()
+				curFastBlock = d.blockchain.CurrentSnapBlock().Number
+				curBlock = d.blockchain.CurrentBlock().Number
 			}
 			log.Warn("Rolled back headers", "count", len(hashes),
 				"header", fmt.Sprintf("%d->%d", lastHeader, d.lightchain.CurrentHeader().Number),
@@ -1352,7 +1422,7 @@ func (d *Downloader) processHeaders(origin uint64, pivot uint64, td *big.Int) er
 				// R: Nothing to give
 				if mode != LightSync {
 					head := d.blockchain.CurrentBlock()
-					if !gotHeaders && td.Cmp(d.blockchain.GetTd(head.Hash(), head.NumberU64())) > 0 {
+					if !gotHeaders && td.Cmp(d.blockchain.GetTd(head.Hash(), head.Number.Uint64())) > 0 {
 						return errStallingPeer
 					}
 				}
@@ -1398,11 +1468,9 @@ func (d *Downloader) processHeaders(origin uint64, pivot uint64, td *big.Int) er
 							unknown = append(unknown, header)
 						}
 					}
-					// If we're importing pure headers, verify based on their recentness
+					// If we're importing pure headers, verify with frequency=0.
+					// It's okay since in InsertChain, headers are verified again (full verify)
 					frequency := fsHeaderCheckFrequency
-					if chunk[len(chunk)-1].Number.Uint64()+uint64(fsHeaderForceVerify) > pivot {
-						frequency = 1
-					}
 					if n, err := d.lightchain.InsertHeaderChain(chunk, frequency); err != nil {
 						rollbackErr = err
 						// If some headers were inserted, add them too to the rollback list
@@ -1526,7 +1594,7 @@ func (d *Downloader) importBlockResults(results []*fetchResult) error {
 	)
 	blocks := make([]*types.Block, len(results))
 	for i, result := range results {
-		blocks[i] = types.NewBlockWithHeader(result.Header).WithBody(result.Transactions, result.Uncles)
+		blocks[i] = types.NewBlockWithHeader(result.Header).WithBody(result.body())
 	}
 	if index, err := d.blockchain.InsertChain(blocks); err != nil {
 		if index < len(results) {
@@ -1553,9 +1621,26 @@ func (d *Downloader) importBlockResults(results []*fetchResult) error {
 // processFastSyncContent takes fetch results from the queue and writes them to the
 // database. It also controls the synchronisation of state nodes of the pivot block.
 func (d *Downloader) processFastSyncContent(latest *types.Header) error {
+	// Gap pivot tracking - only used when gap pivots are configured
+	var (
+		syncedGaps       = make(map[uint64]bool)        // Track which gap pivots are synced
+		pendingGapRoots  = make(map[uint64]common.Hash) // Gap pivot roots found but not yet synced
+		pendingGapHashes = make(map[uint64]common.Hash) // Gap pivot block hashes found but not yet synced
+	)
+	d.pivotGapLock.RLock()
+	if len(d.pivotGapNumbers) > 0 {
+		log.Info("Configured gap pivot state syncs", "count", len(d.pivotGapNumbers), "gaps", d.pivotGapNumbers)
+	}
+	d.pivotGapLock.RUnlock()
+
 	// Start syncing state of the reported head block. This should get us most of
 	// the state of the pivot block.
-	sync := d.syncState(latest.Root)
+	root := latest.Root
+	if (d.pivotRoot != common.Hash{}) {
+		root = d.pivotRoot
+	}
+	log.Info("syncState", "number", d.pivotNumber, "root", root)
+	sync := d.syncState(root)
 	defer func() {
 		// The `sync` object is replaced every time the pivot moves. We need to
 		// defer close the very last active one, hence the lazy evaluation vs.
@@ -1571,9 +1656,12 @@ func (d *Downloader) processFastSyncContent(latest *types.Header) error {
 	go closeOnErr(sync)
 	// Figure out the ideal pivot block. Note, that this goalpost may move if the
 	// sync takes long enough for the chain head to move significantly.
-	pivot := uint64(0)
+	var pivot uint64
 	if height := latest.Number.Uint64(); height > uint64(fsMinFullBlocks) {
 		pivot = height - uint64(fsMinFullBlocks)
+	}
+	if d.pivotNumber != 0 {
+		pivot = d.pivotNumber
 	}
 	// To cater for moving pivot points, track the pivot block and subsequently
 	// accumulated download results separatey.
@@ -1601,15 +1689,35 @@ func (d *Downloader) processFastSyncContent(latest *types.Header) error {
 		if d.chainInsertHook != nil {
 			d.chainInsertHook(results)
 		}
+
+		// Collect gap pivot roots as blocks arrive
+		d.pivotGapLock.RLock()
+		if len(d.pivotGapNumbers) > 0 {
+			for _, result := range results {
+				num := result.Header.Number.Uint64()
+				for _, gapNum := range d.pivotGapNumbers {
+					if num == gapNum && !syncedGaps[gapNum] {
+						pendingGapRoots[gapNum] = result.Header.Root
+						pendingGapHashes[gapNum] = result.Header.Hash()
+						break
+					}
+				}
+			}
+		}
+		d.pivotGapLock.RUnlock()
+
 		if oldPivot != nil {
 			results = append(append([]*fetchResult{oldPivot}, oldTail...), results...)
 		}
 		// Split around the pivot block and process the two sides via fast/full sync
 		if atomic.LoadInt32(&d.committed) == 0 {
 			latest = results[len(results)-1].Header
-			if height := latest.Number.Uint64(); height > pivot+2*uint64(fsMinFullBlocks) {
-				log.Warn("Pivot became stale, moving", "old", pivot, "new", height-uint64(fsMinFullBlocks))
-				pivot = height - uint64(fsMinFullBlocks)
+			// Only allow pivot movement if not configured with fixed pivot
+			if d.pivotNumber == 0 {
+				if height := latest.Number.Uint64(); height > pivot+2*uint64(fsMinFullBlocks) {
+					log.Warn("Pivot became stale, moving", "old", pivot, "new", height-uint64(fsMinFullBlocks))
+					pivot = height - uint64(fsMinFullBlocks)
+				}
 			}
 		}
 		P, beforeP, afterP := splitAroundPivot(pivot, results)
@@ -1620,6 +1728,7 @@ func (d *Downloader) processFastSyncContent(latest *types.Header) error {
 			// If new pivot block found, cancel old state retrieval and restart
 			if oldPivot != P {
 				sync.Cancel()
+				log.Info("restart syncState", "number", P.Header.Number, "root", P.Header.Root)
 				sync = d.syncState(P.Header.Root)
 
 				go closeOnErr(sync)
@@ -1630,6 +1739,58 @@ func (d *Downloader) processFastSyncContent(latest *types.Header) error {
 			case <-sync.done:
 				if sync.err != nil {
 					return sync.err
+				}
+				// If pivot hash is configured, verify the downloaded pivot block
+				if d.pivotHash != (common.Hash{}) {
+					if P.Header.Hash() != d.pivotHash {
+						return fmt.Errorf("pivot block hash mismatch: have %x, want %x", P.Header.Hash(), d.pivotHash)
+					}
+					log.Info("Pivot block hash verified", "number", P.Header.Number, "hash", P.Header.Hash())
+				}
+				// Log state root for configured pivot
+				if d.pivotNumber != 0 {
+					log.Info("Pivot block state sync complete", "number", P.Header.Number, "hash", P.Header.Hash(), "root", P.Header.Root)
+					// Sync gap pivots after primary pivot state sync completes
+					d.pivotGapLock.RLock()
+					gapNumbers := make([]uint64, len(d.pivotGapNumbers))
+					copy(gapNumbers, d.pivotGapNumbers)
+					d.pivotGapLock.RUnlock()
+					if len(gapNumbers) > 0 {
+						for _, gapNum := range gapNumbers {
+							root, ok := pendingGapRoots[gapNum]
+							if !ok {
+								return fmt.Errorf("gap pivot block %d not found in downloaded results", gapNum)
+							}
+							if syncedGaps[gapNum] {
+								continue
+							}
+							log.Info("syncState for gap pivot", "number", gapNum, "root", root)
+							gapSync := d.syncState(root)
+							if err := gapSync.Wait(); err != nil {
+								return err
+							}
+							log.Info("Gap pivot state sync complete", "number", gapNum, "root", root)
+							// Generate snapshot for this gap pivot
+							gapHash, ok := pendingGapHashes[gapNum]
+							if !ok {
+								return fmt.Errorf("gap pivot block hash %d not found", gapNum)
+							}
+							statedb, err := state.New(root, state.NewDatabase(d.stateDB))
+							if err != nil {
+								log.Error("Failed to create state for gap pivot snapshot", "number", gapNum, "root", root, "err", err)
+								return err
+							}
+							if err := d.generateSnapshot(statedb, gapNum, gapHash); err != nil {
+								log.Error("Failed to generate snapshot for gap pivot", "number", gapNum, "hash", gapHash, "err", err)
+								return err
+							}
+							syncedGaps[gapNum] = true
+						}
+						log.Info("All gap pivot state syncs complete", "count", len(gapNumbers))
+						d.pivotGapLock.Lock()
+						d.pivotGapNumbers = nil // Clear to avoid reprocessing
+						d.pivotGapLock.Unlock()
+					}
 				}
 				if err := d.commitPivotBlock(P); err != nil {
 					return err
@@ -1694,7 +1855,7 @@ func (d *Downloader) commitFastSyncData(results []*fetchResult, stateSync *state
 	blocks := make([]*types.Block, len(results))
 	receipts := make([]types.Receipts, len(results))
 	for i, result := range results {
-		blocks[i] = types.NewBlockWithHeader(result.Header).WithBody(result.Transactions, result.Uncles)
+		blocks[i] = types.NewBlockWithHeader(result.Header).WithBody(result.body())
 		receipts[i] = result.Receipts
 	}
 	if index, err := d.blockchain.InsertReceiptChain(blocks, receipts); err != nil {
@@ -1705,7 +1866,7 @@ func (d *Downloader) commitFastSyncData(results []*fetchResult, stateSync *state
 }
 
 func (d *Downloader) commitPivotBlock(result *fetchResult) error {
-	block := types.NewBlockWithHeader(result.Header).WithBody(result.Transactions, result.Uncles)
+	block := types.NewBlockWithHeader(result.Header).WithBody(result.body())
 	log.Debug("Committing fast sync pivot as new head", "number", block.Number(), "hash", block.Hash())
 	if _, err := d.blockchain.InsertReceiptChain([]*types.Block{block}, []types.Receipts{result.Receipts}); err != nil {
 		return err
@@ -1835,4 +1996,38 @@ func (d *Downloader) requestTTL() time.Duration {
 		ttl = ttlLimit
 	}
 	return ttl
+}
+
+// generateSnapshot creates and stores a snapshot from the given state and block hash.
+// It retrieves candidates from state, sorts them by stake in descending order,
+// and stores the snapshot for future use.
+func (d *Downloader) generateSnapshot(statedb *state.StateDB, number uint64, hash common.Hash) error {
+	candidates := statedb.GetCandidates()
+	var ms []utils.Masternode
+	for _, candidate := range candidates {
+		v := statedb.GetCandidateCap(candidate)
+		// Skip zero address candidates
+		if !candidate.IsZero() {
+			ms = append(ms, utils.Masternode{Address: candidate, Stake: v})
+		}
+	}
+	xdc_sort.Slice(ms, func(i, j int) bool {
+		return ms[i].Stake.Cmp(ms[j].Stake) >= 0
+	})
+
+	masterNodes := []common.Address{}
+	for _, m := range ms {
+		masterNodes = append(masterNodes, m.Address)
+	}
+
+	snap := engine_v2.NewSnapshot(number, hash, masterNodes)
+	log.Info("[generateSnapshot] created snapshot", "number", number, "hash", hash.Hex(), "candidates", len(masterNodes))
+
+	err := engine_v2.StoreSnapshot(snap, d.stateDB)
+	if err != nil {
+		log.Error("[generateSnapshot] error while storing snapshot", "hash", hash, "error", err)
+		return err
+	}
+
+	return nil
 }

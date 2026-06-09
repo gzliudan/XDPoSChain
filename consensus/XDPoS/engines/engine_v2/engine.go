@@ -1,12 +1,16 @@
 package engine_v2
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"sync"
 	"time"
 
@@ -17,12 +21,15 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/consensus"
 	"github.com/XinFinOrg/XDPoSChain/consensus/XDPoS/utils"
 	"github.com/XinFinOrg/XDPoSChain/consensus/clique"
+	"github.com/XinFinOrg/XDPoSChain/consensus/misc"
 	"github.com/XinFinOrg/XDPoSChain/core/state"
 	"github.com/XinFinOrg/XDPoSChain/core/types"
+	"github.com/XinFinOrg/XDPoSChain/core/vm"
 	"github.com/XinFinOrg/XDPoSChain/ethdb"
 	"github.com/XinFinOrg/XDPoSChain/log"
 	"github.com/XinFinOrg/XDPoSChain/params"
 	"github.com/XinFinOrg/XDPoSChain/trie"
+	"golang.org/x/sync/errgroup"
 )
 
 type XDPoS_v2 struct {
@@ -65,7 +72,10 @@ type XDPoS_v2 struct {
 	highestTimeoutCert *types.TimeoutCert
 	highestCommitBlock *types.BlockInfo
 
-	HookReward  func(chain consensus.ChainReader, state *state.StateDB, parentState *state.StateDB, header *types.Header) (map[string]interface{}, error)
+	latestReward         map[string]interface{}
+	latestRewardBlocknum uint64
+
+	HookReward  func(chain consensus.ChainReader, state vm.StateDB, parentState *state.StateDB, header *types.Header) (map[string]interface{}, error)
 	HookPenalty func(chain consensus.ChainReader, number *big.Int, parentHash common.Hash, candidates []common.Address) ([]common.Address, error)
 
 	ForensicsProcessor *Forensics
@@ -73,8 +83,17 @@ type XDPoS_v2 struct {
 	votePoolCollectionTime time.Time
 }
 
-func New(chainConfig *params.ChainConfig, db ethdb.Database, minePeriodCh chan int, newRoundCh chan types.Round) *XDPoS_v2 {
+func New(chainConfig *params.ChainConfig, db ethdb.Database, minePeriodCh chan int, newRoundCh chan types.Round) (*XDPoS_v2, error) {
+	if chainConfig == nil {
+		return nil, errors.New("engine_v2.New requires startup-validated XDPoS V2 config")
+	}
 	config := chainConfig.XDPoS
+	// Startup paths validate external chain config before constructing engine_v2.
+	// Keep this guard for direct internal callers so invalid state fails fast
+	// instead of nil-dereferencing deeper in constructor setup.
+	if config == nil || config.V2 == nil || config.V2.SwitchBlock == nil || config.V2.CurrentConfig == nil || len(config.V2.AllConfigs) == 0 {
+		return nil, errors.New("engine_v2.New requires startup-validated XDPoS V2 config")
+	}
 	// Setup timeoutTimer
 	duration := time.Duration(config.V2.CurrentConfig.TimeoutPeriod) * time.Second
 	timeoutTimer, err := countdown.NewExpCountDown(duration, config.V2.CurrentConfig.ExpTimeoutConfig.Base, config.V2.CurrentConfig.ExpTimeoutConfig.MaxExponent)
@@ -91,17 +110,17 @@ func New(chainConfig *params.ChainConfig, db ethdb.Database, minePeriodCh chan i
 		db:           db,
 		isInitilised: false,
 
-		signatures: lru.NewCache[common.Hash, common.Address](utils.InmemorySnapshots),
+		signatures: lru.NewCache[common.Hash, common.Address](utils.InMemorySnapshots),
 
-		verifiedHeaders: lru.NewCache[common.Hash, struct{}](utils.InmemorySnapshots),
-		snapshots:       lru.NewCache[common.Hash, *SnapshotV2](utils.InmemorySnapshots),
-		epochSwitches:   lru.NewCache[common.Hash, *types.EpochSwitchInfo](int(utils.InmemoryEpochs)),
+		verifiedHeaders: lru.NewCache[common.Hash, struct{}](utils.InMemorySnapshots),
+		snapshots:       lru.NewCache[common.Hash, *SnapshotV2](utils.InMemorySnapshots),
+		epochSwitches:   lru.NewCache[common.Hash, *types.EpochSwitchInfo](int(utils.InMemoryEpochs)),
 		timeoutWorker:   timeoutTimer,
 		BroadcastCh:     make(chan interface{}),
 		minePeriodCh:    minePeriodCh,
 		newRoundCh:      newRoundCh,
 
-		round2epochBlockInfo: lru.NewCache[types.Round, *types.BlockInfo](utils.InmemoryRound2Epochs),
+		round2epochBlockInfo: lru.NewCache[types.Round, *types.BlockInfo](utils.InMemoryRound2Epochs),
 
 		timeoutPool: timeoutPool,
 		votePool:    votePool,
@@ -131,7 +150,7 @@ func New(chainConfig *params.ChainConfig, db ethdb.Database, minePeriodCh chan i
 	engine.periodicJob()
 	config.V2.BuildConfigIndex()
 
-	return engine
+	return engine, nil
 }
 
 func (x *XDPoS_v2) UpdateParams(header *types.Header) {
@@ -142,14 +161,15 @@ func (x *XDPoS_v2) UpdateParams(header *types.Header) {
 	x.config.V2.UpdateConfig(uint64(round))
 
 	// Setup timeoutTimer
-	duration := time.Duration(x.config.V2.CurrentConfig.TimeoutPeriod) * time.Second
-	err = x.timeoutWorker.SetParams(duration, x.config.V2.CurrentConfig.ExpTimeoutConfig.Base, x.config.V2.CurrentConfig.ExpTimeoutConfig.MaxExponent)
+	currentConfig := x.config.V2.GetCurrentConfig()
+	duration := time.Duration(currentConfig.TimeoutPeriod) * time.Second
+	err = x.timeoutWorker.SetParams(duration, currentConfig.ExpTimeoutConfig.Base, currentConfig.ExpTimeoutConfig.MaxExponent)
 	if err != nil {
 		log.Error("[UpdateParams] set params failed", "err", err)
 	}
 	// avoid deadlock
 	go func() {
-		x.minePeriodCh <- x.config.V2.CurrentConfig.MinePeriod
+		x.minePeriodCh <- currentConfig.MinePeriod
 	}()
 }
 
@@ -170,6 +190,9 @@ func (x *XDPoS_v2) SignHash(header *types.Header) (hash common.Hash) {
 
 // Initial V2 related parameters
 func (x *XDPoS_v2) Initial(chain consensus.ChainReader, header *types.Header) error {
+	x.lock.Lock()
+	defer x.lock.Unlock()
+
 	return x.initial(chain, header)
 }
 
@@ -185,7 +208,7 @@ func (x *XDPoS_v2) initial(chain consensus.ChainReader, header *types.Header) er
 	var quorumCert *types.QuorumCert
 	var err error
 
-	if header.Number.Int64() == x.config.V2.SwitchBlock.Int64() {
+	if header.Number.Cmp(x.config.V2.SwitchBlock) == 0 {
 		log.Info("[initial] highest QC for consensus v2 first block")
 		blockInfo := &types.BlockInfo{
 			Hash:   header.Hash(),
@@ -204,7 +227,6 @@ func (x *XDPoS_v2) initial(chain consensus.ChainReader, header *types.Header) er
 		// can not call processQC because round is equal to default
 		x.currentRound = 1
 		x.highestQuorumCert = quorumCert
-
 	} else {
 		log.Info("[initial] highest QC from current header")
 		quorumCert, _, _, err = x.getExtraFields(header)
@@ -218,10 +240,9 @@ func (x *XDPoS_v2) initial(chain consensus.ChainReader, header *types.Header) er
 	}
 
 	// Initial first v2 snapshot
-	lastGapNum := x.config.V2.SwitchBlock.Uint64() - x.config.Gap
-	// prevent overflow
-	if x.config.V2.SwitchBlock.Uint64() < x.config.Gap {
-		lastGapNum = 0
+	lastGapNum := uint64(0)
+	if x.config.V2.SwitchBlock.Uint64() > x.config.Gap {
+		lastGapNum = x.config.V2.SwitchBlock.Uint64() - x.config.Gap
 	}
 	lastGapHeader := chain.GetHeaderByNumber(lastGapNum)
 
@@ -242,9 +263,9 @@ func (x *XDPoS_v2) initial(chain consensus.ChainReader, header *types.Header) er
 			return fmt.Errorf("masternodes are empty v2 switch number: %d", x.config.V2.SwitchBlock.Uint64())
 		}
 
-		snap := newSnapshot(lastGapNum, lastGapHeader.Hash(), masternodes)
+		snap := NewSnapshot(lastGapNum, lastGapHeader.Hash(), masternodes)
 		x.snapshots.Add(snap.Hash, snap)
-		err = storeSnapshot(snap, x.db)
+		err = StoreSnapshot(snap, x.db)
 		if err != nil {
 			log.Error("[initial] Error while store snapshot", "error", err)
 			return err
@@ -252,14 +273,19 @@ func (x *XDPoS_v2) initial(chain consensus.ChainReader, header *types.Header) er
 	}
 
 	// Initial timeout
-	log.Warn("[initial] miner wait period", "period", x.config.V2.CurrentConfig.MinePeriod)
+	currentConfig := x.config.V2.GetCurrentConfig()
+	log.Warn("[initial] miner wait period", "period", currentConfig.MinePeriod)
 	// avoid deadlock
 	go func() {
-		x.minePeriodCh <- x.config.V2.CurrentConfig.MinePeriod
+		x.minePeriodCh <- currentConfig.MinePeriod
 	}()
 
 	// Kick-off the countdown timer
-	x.timeoutWorker.Reset(chain, 0, 0)
+	// Only kick-off if it is V2 switch block
+	// Otherwise it is a lagging node, already kick-off in `processQC`
+	if header.Number.Cmp(x.config.V2.SwitchBlock) == 0 {
+		x.timeoutWorker.Reset(chain, 0, 0)
+	}
 	x.isInitilised = true
 
 	log.Warn("[initial] finish initialisation")
@@ -280,7 +306,7 @@ func (x *XDPoS_v2) YourTurn(chain consensus.ChainReader, parent *types.Header, s
 		}
 	}
 
-	waitedTime := time.Now().Unix() - parent.Time.Int64()
+	waitedTime := time.Now().Unix() - int64(parent.Time)
 	minePeriod := x.config.V2.Config(uint64(x.currentRound)).MinePeriod
 	if waitedTime < int64(minePeriod) {
 		log.Trace("[YourTurn] wait after mine period", "minePeriod", minePeriod, "waitedTime", waitedTime)
@@ -299,7 +325,6 @@ func (x *XDPoS_v2) YourTurn(chain consensus.ChainReader, parent *types.Header, s
 // Prepare implements consensus.Engine, preparing all the consensus fields of the
 // header for running the transactions on top.
 func (x *XDPoS_v2) Prepare(chain consensus.ChainReader, header *types.Header) error {
-
 	x.lock.RLock()
 	currentRound := x.currentRound
 	highestQC := x.highestQuorumCert
@@ -326,11 +351,21 @@ func (x *XDPoS_v2) Prepare(chain consensus.ChainReader, header *types.Header) er
 	number := header.Number.Uint64()
 	parent := chain.GetHeader(header.ParentHash, number-1)
 
-	log.Info("Preparing new block!", "Number", number, "Parent Hash", parent.Hash())
 	if parent == nil {
 		return consensus.ErrUnknownAncestor
 	}
 
+	// Ensure gas settings are bounded
+	err = misc.VerifyGaslimit(parent.GasLimit, header.GasLimit)
+	if err != nil && parent.Number.Sign() != 0 { // skip genesis block
+		return err
+	}
+
+	if header.GasUsed > header.GasLimit {
+		return fmt.Errorf("gas used exceeded gaslimit, gas used: %d, gas limit: %d", header.GasUsed, header.GasLimit)
+	}
+
+	log.Info("Preparing new block!", "Number", number, "Parent Hash", parent.Hash())
 	x.signLock.RLock()
 	signer := x.signer
 	x.signLock.RUnlock()
@@ -371,9 +406,9 @@ func (x *XDPoS_v2) Prepare(chain consensus.ChainReader, header *types.Header) er
 	// Ensure the timestamp has the correct delay
 	// TODO: Proper deal with time
 	// TODO: if timestamp > current time, how to deal with future timestamp
-	header.Time = new(big.Int).Add(parent.Time, new(big.Int).SetUint64(x.config.Period))
-	if header.Time.Int64() < time.Now().Unix() {
-		header.Time = big.NewInt(time.Now().Unix())
+	header.Time = parent.Time + x.config.Period
+	if timeNow := uint64(time.Now().Unix()); header.Time < timeNow {
+		header.Time = timeNow
 	}
 
 	if header.Coinbase != signer {
@@ -386,7 +421,7 @@ func (x *XDPoS_v2) Prepare(chain consensus.ChainReader, header *types.Header) er
 
 // Finalize implements consensus.Engine, ensuring no uncles are set, nor block
 // rewards given, and returns the final block.
-func (x *XDPoS_v2) Finalize(chain consensus.ChainReader, header *types.Header, state *state.StateDB, parentState *state.StateDB, txs []*types.Transaction, uncles []*types.Header, receipts []*types.Receipt) (*types.Block, error) {
+func (x *XDPoS_v2) Finalize(chain consensus.ChainReader, header *types.Header, state vm.StateDB, parentState *state.StateDB, txs []*types.Transaction, uncles []*types.Header, receipts []*types.Receipt) (*types.Block, error) {
 	// set block reward
 
 	isEpochSwitch, _, err := x.IsEpochSwitch(header)
@@ -399,15 +434,49 @@ func (x *XDPoS_v2) Finalize(chain consensus.ChainReader, header *types.Header, s
 		if err != nil {
 			return nil, err
 		}
-		if len(common.StoreRewardFolder) > 0 {
-			data, err := json.Marshal(rewards)
-			if err == nil {
-				err = os.WriteFile(filepath.Join(common.StoreRewardFolder, header.Number.String()+"."+header.Hash().Hex()), data, 0644)
-			}
-			if err != nil {
-				log.Error("Error when save reward info ", "number", header.Number, "hash", header.Hash().Hex(), "err", err)
-			}
+
+		x.signLock.RLock()
+		signer := x.signer
+		x.signLock.RUnlock()
+		x.lock.Lock()
+		x.latestRewardBlocknum = header.Number.Uint64()
+		x.latestReward, err = deepCloneJSON(rewards)
+		x.lock.Unlock()
+		if err != nil {
+			log.Error("[Finalize] Error deep cloning latest reward", "err", err, "rewards", rewards)
+			return nil, err
 		}
+
+		var decodedExtraField types.ExtraFields_v2
+		err = utils.DecodeBytesExtraFields(header.Extra, &decodedExtraField)
+		if err != nil {
+			log.Error("[Finalize] Error when decode extra field to get the round number", "Hash", header.Hash().Hex(), "Number", header.Number.Uint64(), "Error", err)
+		}
+
+		parentHeader := chain.GetHeaderByHash(header.ParentHash)
+		isMyTurn, err := x.yourturn(chain, decodedExtraField.Round, parentHeader, signer)
+		if err != nil {
+			log.Error("[Finalize] Error checking myturn", "err", err, "round", decodedExtraField.Round, "signer", signer, "parentHeader", parentHeader)
+			return nil, err
+		}
+
+		if !isMyTurn { // if myturn use Seal to save file
+			x.saveRewardToFile(header.Hash(), header.Number.Uint64())
+		}
+	}
+	parentHeader := chain.GetHeader(header.ParentHash, header.Number.Uint64()-1)
+	if parentHeader == nil {
+		return nil, consensus.ErrUnknownAncestor
+	}
+
+	// Ensure gas settings are bounded
+	err = misc.VerifyGaslimit(parentHeader.GasLimit, header.GasLimit)
+	if err != nil && parentHeader.Number.Sign() != 0 { // skip genesis block
+		return nil, err
+	}
+
+	if header.GasUsed > header.GasLimit {
+		return nil, fmt.Errorf("gas used exceeded gaslimit, gas used: %d, gas limit: %d", header.GasUsed, header.GasLimit)
 	}
 
 	// the state remains as is and uncles are dropped
@@ -415,7 +484,7 @@ func (x *XDPoS_v2) Finalize(chain consensus.ChainReader, header *types.Header, s
 	header.UncleHash = types.CalcUncleHash(nil)
 
 	// Assemble and return the final block for sealing
-	return types.NewBlock(header, txs, nil, receipts, trie.NewStackTrie(nil)), nil
+	return types.NewBlock(header, &types.Body{Transactions: txs}, receipts, trie.NewStackTrie(nil)), nil
 }
 
 // Authorize injects a private key into the consensus engine to mint new blocks with.
@@ -467,6 +536,24 @@ func (x *XDPoS_v2) Seal(chain consensus.ChainReader, block *types.Block, stop <-
 		log.Error("[Seal] Error when decode extra field to get the round number from v2 block during sealing", "Hash", header.Hash().Hex(), "Number", header.Number.Uint64(), "Error", err)
 		return nil, err
 	}
+
+	isEpochSwitch, _, err := x.IsEpochSwitch(header)
+	if err != nil {
+		log.Error("[Seal] IsEpochSwitch bug!", "err", err)
+		return nil, err
+	}
+	if isEpochSwitch {
+		parentHeader := chain.GetHeaderByHash(header.ParentHash)
+		isMyTurn, err := x.yourturn(chain, decodedExtraField.Round, parentHeader, signer)
+
+		if err != nil {
+			log.Error("[Seal] Error checking myturn", "err", err, "round", decodedExtraField.Round, "signer", signer, "parentHeader", parentHeader)
+			return nil, err
+		}
+		if isMyTurn { // if not myturn use Finalize to save file
+			x.saveRewardToFile(header.Hash(), header.Number.Uint64())
+		}
+	}
 	x.highestSelfMinedRound = decodedExtraField.Round
 
 	return block.WithSeal(header), nil
@@ -505,7 +592,10 @@ func (x *XDPoS_v2) GetSnapshot(chain consensus.ChainReader, header *types.Header
 
 func (x *XDPoS_v2) UpdateMasternodes(chain consensus.ChainReader, header *types.Header, ms []utils.Masternode) error {
 	number := header.Number.Uint64()
-	log.Trace("[UpdateMasternodes]")
+	log.Trace("[UpdateMasternodes]", "number", number, "hash", header.Hash())
+	if number%x.config.Epoch != x.config.Epoch-x.config.Gap {
+		return fmt.Errorf("[UpdateMasternodes] not gap block, number: %d, epoch: %d,gap: %d", number, x.config.Epoch, x.config.Gap)
+	}
 
 	masterNodes := []common.Address{}
 	for _, m := range ms {
@@ -513,11 +603,11 @@ func (x *XDPoS_v2) UpdateMasternodes(chain consensus.ChainReader, header *types.
 	}
 
 	x.lock.RLock()
-	snap := newSnapshot(number, header.Hash(), masterNodes)
+	snap := NewSnapshot(number, header.Hash(), masterNodes)
 	log.Info("[UpdateMasternodes] take snapshot", "number", number, "hash", header.Hash())
 	x.lock.RUnlock()
 
-	err := storeSnapshot(snap, x.db)
+	err := StoreSnapshot(snap, x.db)
 	if err != nil {
 		log.Error("[UpdateMasternodes] Error while store snapshot", "hash", header.Hash(), "currentRound", x.currentRound, "error", err)
 		return err
@@ -526,7 +616,7 @@ func (x *XDPoS_v2) UpdateMasternodes(chain consensus.ChainReader, header *types.
 
 	log.Info("[UpdateMasternodes] New set of masternodes has been updated to snapshot", "number", snap.Number, "hash", snap.Hash)
 	for i, n := range ms {
-		log.Info("masternode", "index", i, "address", n.Address.String())
+		log.Info("masternode", "index", i, "address", n.Address)
 	}
 
 	return nil
@@ -800,19 +890,34 @@ func (x *XDPoS_v2) VerifyBlockInfo(blockChainReader consensus.ChainReader, block
 	return nil
 }
 
-func (x *XDPoS_v2) verifyQC(blockChainReader consensus.ChainReader, quorumCert *types.QuorumCert, parentHeader *types.Header) error {
+func (x *XDPoS_v2) verifyQC(blockChainReader consensus.ChainReader, quorumCert *types.QuorumCert, parents []*types.Header) error {
 	if quorumCert == nil {
 		log.Warn("[verifyQC] QC is Nil")
 		return utils.ErrInvalidQC
 	}
 
-	epochInfo, err := x.getEpochSwitchInfo(blockChainReader, parentHeader, quorumCert.ProposedBlockInfo.Hash)
+	// Find the parent header from the parents slice if available
+	var parentHeader *types.Header
+	if len(parents) != 0 {
+		parentHeader = parents[len(parents)-1]
+	}
+	epochInfo, err := x.getEpochSwitchInfo(blockChainReader, parents, quorumCert.ProposedBlockInfo.Hash)
 	if err != nil {
 		log.Error("[verifyQC] Error when getting epoch switch Info to verify QC", "Error", err)
 		return errors.New("fail to verify QC due to failure in getting epoch switch info")
 	}
 
-	signatures, duplicates := UniqueSignatures(quorumCert.Signatures)
+	signedVoteObj := types.VoteSigHash(&types.VoteForSign{
+		ProposedBlockInfo: quorumCert.ProposedBlockInfo,
+		GapNumber:         quorumCert.GapNumber,
+	})
+
+	signatures, duplicates, err := RecoverUniqueSigners(signedVoteObj, quorumCert.Signatures)
+	if err != nil {
+		log.Error("[verifyQC] Error while getting unique signatures from QC", "qcBlockNum", quorumCert.ProposedBlockInfo.Number, "qcRound", quorumCert.ProposedBlockInfo.Round, "qcBlockHash", quorumCert.ProposedBlockInfo.Hash, "qcSignLen", len(quorumCert.Signatures), "error", err)
+		return err
+	}
+
 	if len(duplicates) != 0 {
 		for _, d := range duplicates {
 			log.Warn("[verifyQC] duplicated signature in QC", "duplicate", common.Bytes2Hex(d))
@@ -828,39 +933,42 @@ func (x *XDPoS_v2) verifyQC(blockChainReader consensus.ChainReader, quorumCert *
 	}
 	start := time.Now()
 
-	var wg sync.WaitGroup
-	wg.Add(len(signatures))
-	var haveError error
-
-	for _, signature := range signatures {
-		go func(sig types.Signature) {
-			defer wg.Done()
-			verified, _, err := x.verifyMsgSignature(types.VoteSigHash(&types.VoteForSign{
-				ProposedBlockInfo: quorumCert.ProposedBlockInfo,
-				GapNumber:         quorumCert.GapNumber,
-			}), sig, epochInfo.Masternodes)
-			if err != nil {
-				log.Error("[verifyQC] Error while verfying QC message signatures", "Error", err)
-				haveError = errors.New("error while verfying QC message signatures")
-				return
+	eg, ctx := errgroup.WithContext(context.Background())
+	eg.SetLimit(runtime.NumCPU())
+	for _, sig := range signatures {
+		eg.Go(func() error {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+				verified, _, err := x.verifyMsgSignature(types.VoteSigHash(&types.VoteForSign{
+					ProposedBlockInfo: quorumCert.ProposedBlockInfo,
+					GapNumber:         quorumCert.GapNumber,
+				}), sig, epochInfo.Masternodes)
+				if err != nil {
+					log.Error("[verifyQC] Error while verfying QC message signatures", "Error", err)
+					return errors.New("error while verfying QC message signatures")
+				}
+				if !verified {
+					log.Warn("[verifyQC] Signature not verified doing QC verification", "QC", quorumCert)
+					return errors.New("fail to verify QC due to signature mis-match")
+				}
+				return nil
 			}
-			if !verified {
-				log.Warn("[verifyQC] Signature not verified doing QC verification", "QC", quorumCert)
-				haveError = errors.New("fail to verify QC due to signature mis-match")
-				return
-			}
-		}(signature)
+		})
 	}
-	wg.Wait()
+	err = eg.Wait()
+
 	elapsed := time.Since(start)
 	log.Debug("[verifyQC] time verify message signatures of qc", "elapsed", elapsed)
-	if haveError != nil {
-		return haveError
+	if err != nil {
+		return err
 	}
 	epochSwitchNumber := epochInfo.EpochSwitchBlockInfo.Number.Uint64()
-	gapNumber := epochSwitchNumber - epochSwitchNumber%x.config.Epoch - x.config.Gap
-	// prevent overflow
-	if epochSwitchNumber-epochSwitchNumber%x.config.Epoch < x.config.Gap {
+	gapNumber := epochSwitchNumber - epochSwitchNumber%x.config.Epoch
+	if gapNumber > x.config.Gap {
+		gapNumber -= x.config.Gap
+	} else {
 		gapNumber = 0
 	}
 	if gapNumber != quorumCert.GapNumber {
@@ -954,10 +1062,14 @@ func (x *XDPoS_v2) commitBlocks(blockChainReader consensus.ChainReader, proposed
 	}
 	// Find the last two parent block and check their rounds are the continuous
 	parentBlock := blockChainReader.GetHeaderByHash(proposedBlockHeader.ParentHash)
+	if parentBlock == nil {
+		log.Error("[commitBlocks] Fail to get header by parent hash", "hash", proposedBlockHeader.ParentHash)
+		return false, fmt.Errorf("commitBlocks fail to get header by parent hash: %v", proposedBlockHeader.ParentHash)
+	}
 
 	_, round, _, err := x.getExtraFields(parentBlock)
 	if err != nil {
-		log.Error("Fail to execute first DecodeBytesExtraFields for commiting block", "ProposedBlockHash", proposedBlockHeader.Hash())
+		log.Error("Fail to execute first DecodeBytesExtraFields for committing block", "ProposedBlockHash", proposedBlockHeader.Hash())
 		return false, err
 	}
 	if *proposedBlockRound-1 != round {
@@ -967,9 +1079,13 @@ func (x *XDPoS_v2) commitBlocks(blockChainReader consensus.ChainReader, proposed
 
 	// If parent round is continuous, we check grandparent
 	grandParentBlock := blockChainReader.GetHeaderByHash(parentBlock.ParentHash)
+	if grandParentBlock == nil {
+		log.Error("[commitBlocks] Fail to get header by grandparent hash", "hash", parentBlock.ParentHash)
+		return false, fmt.Errorf("commitBlocks fail to get header by grandparent hash: %v", parentBlock.ParentHash)
+	}
 	_, round, _, err = x.getExtraFields(grandParentBlock)
 	if err != nil {
-		log.Error("Fail to execute second DecodeBytesExtraFields for commiting block", "parentBlockHash", parentBlock.Hash())
+		log.Error("Fail to execute second DecodeBytesExtraFields for committing block", "parentBlockHash", parentBlock.Hash())
 		return false, err
 	}
 	if *proposedBlockRound-2 != round {
@@ -1010,7 +1126,7 @@ func (x *XDPoS_v2) GetMasternodesFromEpochSwitchHeader(epochSwitchHeader *types.
 
 // Given header, get master node from the epoch switch block of that epoch
 func (x *XDPoS_v2) GetMasternodes(chain consensus.ChainReader, header *types.Header) []common.Address {
-	epochSwitchInfo, err := x.getEpochSwitchInfo(chain, header, header.Hash())
+	epochSwitchInfo, err := x.getEpochSwitchInfo(chain, []*types.Header{header}, header.Hash())
 	if err != nil {
 		log.Error("[GetMasternodes] Adaptor v2 getEpochSwitchInfo has error", "err", err)
 		return []common.Address{}
@@ -1020,7 +1136,7 @@ func (x *XDPoS_v2) GetMasternodes(chain consensus.ChainReader, header *types.Hea
 
 // Given header, get master node from the epoch switch block of that epoch
 func (x *XDPoS_v2) GetPenalties(chain consensus.ChainReader, header *types.Header) []common.Address {
-	epochSwitchInfo, err := x.getEpochSwitchInfo(chain, header, header.Hash())
+	epochSwitchInfo, err := x.getEpochSwitchInfo(chain, []*types.Header{header}, header.Hash())
 	if err != nil {
 		log.Error("[GetPenalties] Adaptor v2 getEpochSwitchInfo has error", "err", err)
 		return []common.Address{}
@@ -1029,7 +1145,7 @@ func (x *XDPoS_v2) GetPenalties(chain consensus.ChainReader, header *types.Heade
 }
 
 func (x *XDPoS_v2) GetStandbynodes(chain consensus.ChainReader, header *types.Header) []common.Address {
-	epochSwitchInfo, err := x.getEpochSwitchInfo(chain, header, header.Hash())
+	epochSwitchInfo, err := x.getEpochSwitchInfo(chain, []*types.Header{header}, header.Hash())
 	if err != nil {
 		log.Error("[GetStandbynodes] Adaptor v2 getEpochSwitchInfo has error", "err", err)
 		return []common.Address{}
@@ -1048,7 +1164,7 @@ func (x *XDPoS_v2) calcMasternodes(chain consensus.ChainReader, blockNum *big.In
 	}
 	candidates := snap.NextEpochCandidates
 
-	if blockNum.Uint64() == x.config.V2.SwitchBlock.Uint64()+1 {
+	if blockNum.Cmp(new(big.Int).Add(x.config.V2.SwitchBlock, big.NewInt(1))) == 0 {
 		log.Info("[calcMasternodes] examing first v2 block")
 		if len(candidates) > maxMasternodes {
 			candidates = candidates[:maxMasternodes]
@@ -1154,4 +1270,61 @@ func (x *XDPoS_v2) periodicJob() {
 
 func (x *XDPoS_v2) GetLatestCommittedBlockInfo() *types.BlockInfo {
 	return x.highestCommitBlock
+}
+
+func (x *XDPoS_v2) saveRewardToFile(blockHash common.Hash, blockNumber uint64) {
+	if len(common.StoreRewardFolder) == 0 {
+		log.Info("[saveRewardToFile] Skip saving reward to file", "len(common.StoreRewardFolder)", len(common.StoreRewardFolder))
+		return
+	}
+
+	x.lock.RLock()
+	rewardsBlocknum := x.latestRewardBlocknum
+	rewards, err := deepCloneJSON(x.latestReward)
+	x.lock.RUnlock()
+	if err != nil {
+		log.Error("[saveRewardToFile] Error deep cloning latest reward", "err", err)
+		return
+	}
+
+	if rewardsBlocknum != blockNumber {
+		log.Error("[saveRewardToFile] Error blocknumber mismatch with latest reward state, this should not happen!!", "rewardsBlocknum", rewardsBlocknum, "blockNumber", blockNumber)
+		return
+	}
+
+	data, err := json.MarshalIndent(rewards, "", "  ")
+	if err != nil {
+		log.Error("[saveRewardToFile] Error Marshalling rewards", "err", err, "rewards", rewards)
+		return
+	}
+
+	filename := strconv.FormatUint(blockNumber, 10) + "." + blockHash.Hex()
+	err = os.WriteFile(filepath.Join(common.StoreRewardFolder, filename), data, 0644)
+	if err != nil {
+		log.Error("[saveRewardToFile] Error when writing reward info", "filename", filename, "rewards", string(data), "err", err)
+		return
+	}
+
+	log.Debug("[saveRewardToFile] Saved rewards", "filename", filename)
+	log.Debug("[saveRewardToFile] Saved rewards", "rewards", string(data))
+}
+
+func deepCloneJSON(original map[string]interface{}) (map[string]interface{}, error) {
+	data, err := json.Marshal(original)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal: %w", err)
+	}
+
+	var cloned map[string]interface{}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err = dec.Decode(&cloned); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal: %w", err)
+	}
+
+	return cloned, nil
+}
+
+func (x *XDPoS_v2) Config(r uint64) *params.V2Config {
+	return x.config.V2.Config(r)
 }

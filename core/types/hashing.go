@@ -23,12 +23,11 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/common"
 	"github.com/XinFinOrg/XDPoSChain/crypto"
 	"github.com/XinFinOrg/XDPoSChain/rlp"
-	"golang.org/x/crypto/sha3"
 )
 
 // hasherPool holds LegacyKeccak256 hashers for rlpHash.
 var hasherPool = sync.Pool{
-	New: func() interface{} { return sha3.NewLegacyKeccak256() },
+	New: func() interface{} { return crypto.NewKeccakState() },
 }
 
 // encodeBufferPool holds temporary encoder buffers for DeriveSha and TX encoding.
@@ -62,7 +61,7 @@ func prefixedRlpHash(prefix byte, x interface{}) (h common.Hash) {
 // This is internal, do not use.
 type TrieHasher interface {
 	Reset()
-	Update([]byte, []byte)
+	Update([]byte, []byte) error
 	Hash() common.Hash
 }
 
@@ -93,7 +92,10 @@ func DeriveSha(list DerivableList, hasher TrieHasher) common.Hash {
 	// StackTrie requires values to be inserted in increasing hash order, which is not the
 	// order that `list` provides hashes in. This insertion sequence ensures that the
 	// order is correct.
-	var indexBuf []byte
+	//
+	// The error returned by hasher is omitted because hasher will produce an incorrect
+	// hash in case any error occurs.
+	indexBuf := make([]byte, 0, list.Len())
 	for i := 1; i < list.Len() && i <= 0x7f; i++ {
 		indexBuf = rlp.AppendUint64(indexBuf[:0], uint64(i))
 		value := encodeForDerive(list, i, valueBuf)

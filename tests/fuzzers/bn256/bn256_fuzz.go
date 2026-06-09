@@ -14,9 +14,6 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
 
-//go:build gofuzz
-// +build gofuzz
-
 package bn256
 
 import (
@@ -164,6 +161,60 @@ func fuzzPair(data []byte) int {
 	return 1
 }
 
+func fuzzUnmarshalG1(input []byte) int {
+	rc := new(cloudflare.G1)
+	_, errC := rc.Unmarshal(input)
+
+	rg := new(google.G1)
+	_, errG := rg.Unmarshal(input)
+
+	rs := new(gnark.G1)
+	_, errS := rs.Unmarshal(input)
+
+	if errC != nil && errG != nil && errS != nil {
+		return 0 // bad input
+	}
+	if errC == nil && errG == nil && errS == nil {
+		//make sure we unmarshalled the same points:
+		if !bytes.Equal(rc.Marshal(), rg.Marshal()) {
+			panic("marshaling mismatch: cloudflare/google")
+		}
+		if !bytes.Equal(rc.Marshal(), rs.Marshal()) {
+			panic("marshaling mismatch: cloudflare/gnark")
+		}
+		return 1
+	} else {
+		panic(fmt.Sprintf("error missmatch: cf: %v g: %v gn: %v", errC, errG, errS))
+	}
+}
+
+func fuzzUnmarshalG2(input []byte) int {
+	rc := new(cloudflare.G2)
+	_, errC := rc.Unmarshal(input)
+
+	rg := new(google.G2)
+	_, errG := rg.Unmarshal(input)
+
+	rs := new(gnark.G2)
+	_, errS := rs.Unmarshal(input)
+
+	if errC != nil && errG != nil && errS != nil {
+		return 0 // bad input
+	}
+	if errC == nil && errG == nil && errS == nil {
+		//make sure we unmarshalled the same points:
+		if !bytes.Equal(rc.Marshal(), rg.Marshal()) {
+			panic("marshaling mismatch: cloudflare/google")
+		}
+		if !bytes.Equal(rc.Marshal(), rs.Marshal()) {
+			panic("marshaling mismatch: cloudflare/gnark")
+		}
+		return 1
+	} else {
+		panic(fmt.Sprintf("error missmatch: cf: %v g: %v gn: %v", errC, errG, errS))
+	}
+}
+
 // normalizeGTToGnark scales a Cloudflare/Google GT element by `s`
 // so that it can be compared with a gnark GT point.
 //
@@ -176,7 +227,7 @@ func normalizeGTToGnark(cloudflareOrGoogleGT []byte) *gnark.GT {
 	u_3 := new(big.Int).Mul(big.NewInt(3), u)           // 3*u
 	inner := u_6_exp2.Add(u_6_exp2, u_3)                // 6*u^2 + 3*u
 	inner.Add(inner, big.NewInt(1))                     // 6*u^2 + 3*u + 1
-	u_2 := new(big.Int).Mul(big.NewInt(2), u)           // 2*u
+	u_2 := new(big.Int).Lsh(u, 1)                       // 2*u
 	s := u_2.Mul(u_2, inner)                            // 2*u(6*u^2 + 3*u + 1)
 
 	// Scale the Cloudflare/Google GT element by `s`

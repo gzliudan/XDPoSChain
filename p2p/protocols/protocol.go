@@ -18,22 +18,25 @@
 Package protocols is an extension to p2p. It offers a user friendly simple way to define
 devp2p subprotocols by abstracting away code standardly shared by protocols.
 
-* automate assigments of code indexes to messages
+* automate assignments of code indexes to messages
 * automate RLP decoding/encoding based on reflecting
 * provide the forever loop to read incoming messages
 * standardise error handling related to communication
 * standardised	handshake negotiation
 * TODO: automatic generation of wire protocol specification for peers
-
 */
 package protocols
 
 import (
 	"context"
 	"fmt"
+	"io"
 	"reflect"
 	"sync"
+	"time"
 
+	"github.com/XinFinOrg/XDPoSChain/log"
+	"github.com/XinFinOrg/XDPoSChain/metrics"
 	"github.com/XinFinOrg/XDPoSChain/p2p"
 )
 
@@ -65,11 +68,11 @@ var errorToString = map[int]string{
 Error implements the standard go error interface.
 Use:
 
-  errorf(code, format, params ...interface{})
+	errorf(code, format, params ...interface{})
 
 Prints as:
 
- <description>: <details>
+	<description>: <details>
 
 where description is given by code in errorToString
 and details is fmt.Sprintf(format, params...)
@@ -200,6 +203,11 @@ func NewPeer(p *p2p.Peer, rw p2p.MsgReadWriter, spec *Spec) *Peer {
 func (p *Peer) Run(handler func(msg interface{}) error) error {
 	for {
 		if err := p.handleIncoming(handler); err != nil {
+			if err != io.EOF {
+				metrics.GetOrRegisterCounter("peer.handleincoming.error", nil).Inc(1)
+				log.Error("peer.handleIncoming", "err", err)
+			}
+
 			return err
 		}
 	}
@@ -217,6 +225,8 @@ func (p *Peer) Drop(err error) {
 // this low level call will be wrapped by libraries providing routed or broadcast sends
 // but often just used to forward and push messages to directly connected peers
 func (p *Peer) Send(msg interface{}) error {
+	defer metrics.GetOrRegisterResettingTimer("peer.send_t", nil).UpdateSince(time.Now())
+	metrics.GetOrRegisterCounter("peer.send", nil).Inc(1)
 	code, found := p.spec.GetCode(msg)
 	if !found {
 		return errorf(ErrInvalidMsgType, "%v", code)
@@ -265,17 +275,20 @@ func (p *Peer) handleIncoming(handle func(msg interface{}) error) error {
 
 // Handshake negotiates a handshake on the peer connection
 // * arguments
-//   * context
-//   * the local handshake to be sent to the remote peer
-//   * funcion to be called on the remote handshake (can be nil)
+//   - context
+//   - the local handshake to be sent to the remote peer
+//   - funcion to be called on the remote handshake (can be nil)
+//
 // * expects a remote handshake back of the same type
 // * the dialing peer needs to send the handshake first and then waits for remote
 // * the listening peer waits for the remote handshake and then sends it
 // returns the remote handshake and an error
-func (p *Peer) Handshake(ctx context.Context, hs interface{}, verify func(interface{}) error) (rhs interface{}, err error) {
+func (p *Peer) Handshake(ctx context.Context, hs interface{}, verify func(interface{}) error) (interface{}, error) {
 	if _, ok := p.spec.GetCode(hs); !ok {
 		return nil, errorf(ErrHandshake, "unknown handshake message type: %T", hs)
 	}
+
+	var rhs interface{}
 	errc := make(chan error, 2)
 	handle := func(msg interface{}) error {
 		rhs = msg
@@ -298,6 +311,7 @@ func (p *Peer) Handshake(ctx context.Context, hs interface{}, verify func(interf
 	}()
 
 	for i := 0; i < 2; i++ {
+		var err error
 		select {
 		case err = <-errc:
 		case <-ctx.Done():

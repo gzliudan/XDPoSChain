@@ -17,16 +17,17 @@
 package tests
 
 import (
-	"github.com/XinFinOrg/XDPoSChain/common"
 	"math/big"
 	"testing"
 
 	"github.com/XinFinOrg/XDPoSChain/core/vm"
+	"github.com/XinFinOrg/XDPoSChain/params"
 )
 
+// TestVM tests vm.
 func TestVM(t *testing.T) {
-	common.TIPXDCXCancellationFee = big.NewInt(100000000)
-	t.Parallel()
+	chainConfig := *params.MainnetChainConfig
+	chainConfig.TIPXDCXCancellationFeeBlock = big.NewInt(100000000)
 	vmt := new(testMatcher)
 	vmt.fails("^vmSystemOperationsTest.json/createNameRegistrator$", "fails without parallel execution")
 
@@ -36,6 +37,7 @@ func TestVM(t *testing.T) {
 	vmt.skipShortMode("^vmInputLimits(Light)?.json")
 
 	vmt.walk(t, vmTestDir, func(t *testing.T, name string, test *VMTest) {
+		test.chainConfig = &chainConfig
 		withTrace(t, test.json.Exec.GasLimit, func(vmconfig vm.Config) error {
 			return vmt.checkFailure(t, name, test.Run(vmconfig))
 		})

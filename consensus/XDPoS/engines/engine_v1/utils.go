@@ -7,9 +7,9 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/consensus/XDPoS/utils"
 	"github.com/XinFinOrg/XDPoSChain/core/types"
 	"github.com/XinFinOrg/XDPoSChain/crypto"
+	"github.com/XinFinOrg/XDPoSChain/crypto/keccak"
 	"github.com/XinFinOrg/XDPoSChain/params"
 	"github.com/XinFinOrg/XDPoSChain/rlp"
-	"golang.org/x/crypto/sha3"
 )
 
 // Get masternodes address from checkpoint Header.
@@ -28,7 +28,10 @@ func getM1M2FromCheckpointHeader(checkpointHeader *types.Header, currentHeader *
 	}
 	// Get signers from this block.
 	masternodes := decodeMasternodesFromHeaderExtra(checkpointHeader)
-	validators := utils.ExtractValidatorsFromBytes(checkpointHeader.Validators)
+	validators, err := utils.ExtractValidatorsFromBytes(checkpointHeader.Validators)
+	if err != nil {
+		return map[common.Address]common.Address{}, err
+	}
 	m1m2, _, err := getM1M2(masternodes, validators, currentHeader, config)
 	if err != nil {
 		return map[common.Address]common.Address{}, err
@@ -58,7 +61,7 @@ func getM1M2(masternodes []common.Address, validators []int64, currentHeader *ty
 }
 
 func sigHash(header *types.Header) (hash common.Hash) {
-	hasher := sha3.NewLegacyKeccak256()
+	hasher := keccak.NewLegacyKeccak256()
 
 	enc := []interface{}{
 		header.ParentHash,
@@ -80,7 +83,9 @@ func sigHash(header *types.Header) (hash common.Hash) {
 	if header.BaseFee != nil {
 		enc = append(enc, header.BaseFee)
 	}
-	rlp.Encode(hasher, enc)
+	if err := rlp.Encode(hasher, enc); err != nil {
+		panic("rlp.Encode fail: " + err.Error())
+	}
 	hasher.Sum(hash[:0])
 	return hash
 }

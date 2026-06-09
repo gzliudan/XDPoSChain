@@ -18,7 +18,6 @@ package rawdb
 
 import (
 	"bytes"
-	"fmt"
 	"os"
 	"time"
 
@@ -29,28 +28,6 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/log"
 	"github.com/olekukonko/tablewriter"
 )
-
-// freezerdb is a database wrapper that enabled freezer data retrievals.
-type freezerdb struct {
-	ethdb.KeyValueStore
-	ethdb.AncientStore
-}
-
-// Close implements io.Closer, closing both the fast key-value store as well as
-// the slow ancient tables.
-func (frdb *freezerdb) Close() error {
-	var errs []error
-	if err := frdb.AncientStore.Close(); err != nil {
-		errs = append(errs, err)
-	}
-	if err := frdb.KeyValueStore.Close(); err != nil {
-		errs = append(errs, err)
-	}
-	if len(errs) != 0 {
-		return fmt.Errorf("%v", errs)
-	}
-	return nil
-}
 
 // nofreezedb is a database wrapper that disables freezer data retrievals.
 type nofreezedb struct {
@@ -186,7 +163,7 @@ func InspectDatabase(db ethdb.Database, keyPrefix, keyStart []byte) error {
 			receiptSize += size
 		case bytes.HasPrefix(key, txLookupPrefix) && len(key) == (len(txLookupPrefix)+common.HashLength):
 			txlookupSize += size
-		case bytes.HasPrefix(key, preimagePrefix) && len(key) == (len(preimagePrefix)+common.HashLength):
+		case bytes.HasPrefix(key, PreimagePrefix) && len(key) == (len(PreimagePrefix)+common.HashLength):
 			preimageSize += size
 		case bytes.HasPrefix(key, bloomBitsPrefix) && len(key) == (len(bloomBitsPrefix)+10+common.HashLength):
 			bloomBitsSize += size
@@ -202,7 +179,7 @@ func InspectDatabase(db ethdb.Database, keyPrefix, keyStart []byte) error {
 			trieSize += size
 		default:
 			var accounted bool
-			for _, meta := range [][]byte{databaseVersionKey, headHeaderKey, headBlockKey, headFastBlockKey, fastTrieProgressKey} {
+			for _, meta := range [][]byte{databaseVersionKey, headHeaderKey, headBlockKey, headFastBlockKey, fastTrieProgressKey, uncleanShutdownKey, badBlockKey} {
 				if bytes.Equal(key, meta) {
 					metadata += size
 					accounted = true

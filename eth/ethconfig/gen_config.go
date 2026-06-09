@@ -3,56 +3,65 @@
 package ethconfig
 
 import (
-	"math/big"
 	"time"
 
 	"github.com/XinFinOrg/XDPoSChain/common"
-	"github.com/XinFinOrg/XDPoSChain/common/hexutil"
-	"github.com/XinFinOrg/XDPoSChain/consensus/ethash"
 	"github.com/XinFinOrg/XDPoSChain/core"
-	"github.com/XinFinOrg/XDPoSChain/core/txpool"
+	"github.com/XinFinOrg/XDPoSChain/core/txpool/legacypool"
 	"github.com/XinFinOrg/XDPoSChain/eth/downloader"
 	"github.com/XinFinOrg/XDPoSChain/eth/gasprice"
+	"github.com/XinFinOrg/XDPoSChain/miner"
 )
-
-var _ = (*configMarshaling)(nil)
 
 // MarshalTOML marshals as TOML.
 func (c Config) MarshalTOML() (interface{}, error) {
 	type Config struct {
-		Genesis                 *core.Genesis `toml:",omitempty"`
-		NetworkId               uint64
-		SyncMode                downloader.SyncMode
-		NoPruning               bool
-		LightServ               int  `toml:",omitempty"`
-		LightPeers              int  `toml:",omitempty"`
-		SkipBcVersionCheck      bool `toml:"-"`
-		DatabaseHandles         int  `toml:"-"`
-		DatabaseCache           int
-		TrieCleanCache          int
-		TrieDirtyCache          int
-		TrieTimeout             time.Duration
-		Preimages               bool
-		FilterLogCacheSize      int
-		Etherbase               common.Address `toml:",omitempty"`
-		MinerThreads            int            `toml:",omitempty"`
-		ExtraData               hexutil.Bytes  `toml:",omitempty"`
-		GasPrice                *big.Int
-		Ethash                  ethash.Config
-		TxPool                  txpool.Config
-		GPO                     gasprice.Config
-		EnablePreimageRecording bool
-		RPCGasCap               uint64
-		RPCTxFeeCap             float64
+		Genesis                    *core.Genesis `toml:",omitempty"`
+		AllowBuiltInCustomRecovery bool          `toml:",omitempty"`
+		NetworkId                  uint64
+		SyncMode                   downloader.SyncMode
+		FastSyncPivotNumber        uint64
+		FastSyncPivotHash          common.Hash
+		FastSyncPivotRoot          common.Hash
+		NoPruning                  bool
+		Prefetch                   bool
+		LightServ                  int  `toml:",omitempty"`
+		LightPeers                 int  `toml:",omitempty"`
+		SkipBcVersionCheck         bool `toml:"-"`
+		DeleteAllBadBlocks         bool `toml:"-"`
+		DatabaseHandles            int  `toml:"-"`
+		DatabaseCache              int
+		TrieCleanCache             int
+		TrieDirtyCache             int
+		TrieTimeout                time.Duration
+		Preimages                  bool
+		FilterLogCacheSize         int
+		Miner                      miner.Config
+		LogQueryLimit              int
+		TxPool                     legacypool.Config
+		GPO                        gasprice.Config
+		EnablePreimageRecording    bool
+		VMTrace                    string
+		VMTraceJsonConfig          string
+		RPCGasCap                  uint64
+		RPCEVMTimeout              time.Duration
+		RPCTxFeeCap                float64
+		RangeLimit                 uint64 `toml:",omitempty"`
 	}
 	var enc Config
 	enc.Genesis = c.Genesis
+	enc.AllowBuiltInCustomRecovery = c.AllowBuiltInCustomRecovery
 	enc.NetworkId = c.NetworkId
 	enc.SyncMode = c.SyncMode
+	enc.FastSyncPivotNumber = c.FastSyncPivotNumber
+	enc.FastSyncPivotHash = c.FastSyncPivotHash
+	enc.FastSyncPivotRoot = c.FastSyncPivotRoot
 	enc.NoPruning = c.NoPruning
+	enc.Prefetch = c.Prefetch
 	enc.LightServ = c.LightServ
 	enc.LightPeers = c.LightPeers
 	enc.SkipBcVersionCheck = c.SkipBcVersionCheck
+	enc.DeleteAllBadBlocks = c.DeleteAllBadBlocks
 	enc.DatabaseHandles = c.DatabaseHandles
 	enc.DatabaseCache = c.DatabaseCache
 	enc.TrieCleanCache = c.TrieCleanCache
@@ -60,46 +69,54 @@ func (c Config) MarshalTOML() (interface{}, error) {
 	enc.TrieTimeout = c.TrieTimeout
 	enc.Preimages = c.Preimages
 	enc.FilterLogCacheSize = c.FilterLogCacheSize
-	enc.Etherbase = c.Etherbase
-	enc.MinerThreads = c.MinerThreads
-	enc.ExtraData = c.ExtraData
-	enc.GasPrice = c.GasPrice
-	enc.Ethash = c.Ethash
+	enc.Miner = c.Miner
+	enc.LogQueryLimit = c.LogQueryLimit
 	enc.TxPool = c.TxPool
 	enc.GPO = c.GPO
 	enc.EnablePreimageRecording = c.EnablePreimageRecording
+	enc.VMTrace = c.VMTrace
+	enc.VMTraceJsonConfig = c.VMTraceJsonConfig
 	enc.RPCGasCap = c.RPCGasCap
+	enc.RPCEVMTimeout = c.RPCEVMTimeout
 	enc.RPCTxFeeCap = c.RPCTxFeeCap
+	enc.RangeLimit = c.RangeLimit
 	return &enc, nil
 }
 
 // UnmarshalTOML unmarshals from TOML.
 func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 	type Config struct {
-		Genesis                 *core.Genesis `toml:",omitempty"`
-		NetworkId               *uint64
-		SyncMode                *downloader.SyncMode
-		NoPruning               *bool
-		LightServ               *int  `toml:",omitempty"`
-		LightPeers              *int  `toml:",omitempty"`
-		SkipBcVersionCheck      *bool `toml:"-"`
-		DatabaseHandles         *int  `toml:"-"`
-		DatabaseCache           *int
-		TrieCleanCache          *int
-		TrieDirtyCache          *int
-		TrieTimeout             *time.Duration
-		Preimages               *bool
-		FilterLogCacheSize      *int
-		Etherbase               *common.Address `toml:",omitempty"`
-		MinerThreads            *int            `toml:",omitempty"`
-		ExtraData               *hexutil.Bytes  `toml:",omitempty"`
-		GasPrice                *big.Int
-		Ethash                  *ethash.Config
-		TxPool                  *txpool.Config
-		GPO                     *gasprice.Config
-		EnablePreimageRecording *bool
-		RPCGasCap               *uint64
-		RPCTxFeeCap             *float64
+		Genesis                    *core.Genesis `toml:",omitempty"`
+		AllowBuiltInCustomRecovery *bool         `toml:",omitempty"`
+		NetworkId                  *uint64
+		SyncMode                   *downloader.SyncMode
+		FastSyncPivotNumber        *uint64
+		FastSyncPivotHash          *common.Hash
+		FastSyncPivotRoot          *common.Hash
+		NoPruning                  *bool
+		Prefetch                   *bool
+		LightServ                  *int  `toml:",omitempty"`
+		LightPeers                 *int  `toml:",omitempty"`
+		SkipBcVersionCheck         *bool `toml:"-"`
+		DeleteAllBadBlocks         *bool `toml:"-"`
+		DatabaseHandles            *int  `toml:"-"`
+		DatabaseCache              *int
+		TrieCleanCache             *int
+		TrieDirtyCache             *int
+		TrieTimeout                *time.Duration
+		Preimages                  *bool
+		FilterLogCacheSize         *int
+		Miner                      *miner.Config
+		LogQueryLimit              *int
+		TxPool                     *legacypool.Config
+		GPO                        *gasprice.Config
+		EnablePreimageRecording    *bool
+		VMTrace                    *string
+		VMTraceJsonConfig          *string
+		RPCGasCap                  *uint64
+		RPCEVMTimeout              *time.Duration
+		RPCTxFeeCap                *float64
+		RangeLimit                 *uint64 `toml:",omitempty"`
 	}
 	var dec Config
 	if err := unmarshal(&dec); err != nil {
@@ -108,14 +125,29 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 	if dec.Genesis != nil {
 		c.Genesis = dec.Genesis
 	}
+	if dec.AllowBuiltInCustomRecovery != nil {
+		c.AllowBuiltInCustomRecovery = *dec.AllowBuiltInCustomRecovery
+	}
 	if dec.NetworkId != nil {
 		c.NetworkId = *dec.NetworkId
 	}
 	if dec.SyncMode != nil {
 		c.SyncMode = *dec.SyncMode
 	}
+	if dec.FastSyncPivotNumber != nil {
+		c.FastSyncPivotNumber = *dec.FastSyncPivotNumber
+	}
+	if dec.FastSyncPivotHash != nil {
+		c.FastSyncPivotHash = *dec.FastSyncPivotHash
+	}
+	if dec.FastSyncPivotRoot != nil {
+		c.FastSyncPivotRoot = *dec.FastSyncPivotRoot
+	}
 	if dec.NoPruning != nil {
 		c.NoPruning = *dec.NoPruning
+	}
+	if dec.Prefetch != nil {
+		c.Prefetch = *dec.Prefetch
 	}
 	if dec.LightServ != nil {
 		c.LightServ = *dec.LightServ
@@ -125,6 +157,9 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 	}
 	if dec.SkipBcVersionCheck != nil {
 		c.SkipBcVersionCheck = *dec.SkipBcVersionCheck
+	}
+	if dec.DeleteAllBadBlocks != nil {
+		c.DeleteAllBadBlocks = *dec.DeleteAllBadBlocks
 	}
 	if dec.DatabaseHandles != nil {
 		c.DatabaseHandles = *dec.DatabaseHandles
@@ -147,20 +182,11 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 	if dec.FilterLogCacheSize != nil {
 		c.FilterLogCacheSize = *dec.FilterLogCacheSize
 	}
-	if dec.Etherbase != nil {
-		c.Etherbase = *dec.Etherbase
+	if dec.Miner != nil {
+		c.Miner = *dec.Miner
 	}
-	if dec.MinerThreads != nil {
-		c.MinerThreads = *dec.MinerThreads
-	}
-	if dec.ExtraData != nil {
-		c.ExtraData = *dec.ExtraData
-	}
-	if dec.GasPrice != nil {
-		c.GasPrice = dec.GasPrice
-	}
-	if dec.Ethash != nil {
-		c.Ethash = *dec.Ethash
+	if dec.LogQueryLimit != nil {
+		c.LogQueryLimit = *dec.LogQueryLimit
 	}
 	if dec.TxPool != nil {
 		c.TxPool = *dec.TxPool
@@ -171,11 +197,23 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 	if dec.EnablePreimageRecording != nil {
 		c.EnablePreimageRecording = *dec.EnablePreimageRecording
 	}
+	if dec.VMTrace != nil {
+		c.VMTrace = *dec.VMTrace
+	}
+	if dec.VMTraceJsonConfig != nil {
+		c.VMTraceJsonConfig = *dec.VMTraceJsonConfig
+	}
 	if dec.RPCGasCap != nil {
 		c.RPCGasCap = *dec.RPCGasCap
 	}
+	if dec.RPCEVMTimeout != nil {
+		c.RPCEVMTimeout = *dec.RPCEVMTimeout
+	}
 	if dec.RPCTxFeeCap != nil {
 		c.RPCTxFeeCap = *dec.RPCTxFeeCap
+	}
+	if dec.RangeLimit != nil {
+		c.RangeLimit = *dec.RangeLimit
 	}
 	return nil
 }

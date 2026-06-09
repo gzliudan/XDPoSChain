@@ -60,7 +60,7 @@ func (s *Server) WebsocketHandler(allowedOrigins []string) http.Handler {
 			log.Debug("WebSocket upgrade failed", "err", err)
 			return
 		}
-		codec := newWebsocketCodec(conn, r.Host, r.Header, wsDefaultReadLimit)
+		codec := newWebsocketCodec(conn, r.Host, r.Header, s.wsReadLimit)
 		s.ServeCodec(codec, 0)
 	})
 }
@@ -97,7 +97,7 @@ func wsHandshakeValidator(allowedOrigins []string) func(*http.Request) bool {
 		if _, ok := req.Header["Origin"]; !ok {
 			return true
 		}
-		// Verify origin against allow list.
+		// Verify origin against allowlist.
 		origin := strings.ToLower(req.Header.Get("Origin"))
 		if allowAllOrigins || originIsAllowed(origins, origin) {
 			return true
@@ -318,8 +318,7 @@ func newWebsocketCodec(conn *websocket.Conn, host string, req http.Header, readL
 		}
 		return nil
 	})
-	wc.wg.Add(1)
-	go wc.pingLoop()
+	wc.wg.Go(wc.pingLoop)
 	return wc
 }
 
@@ -347,7 +346,6 @@ func (wc *websocketCodec) writeJSON(ctx context.Context, v interface{}, isError 
 // pingLoop sends periodic ping frames when the connection is idle.
 func (wc *websocketCodec) pingLoop() {
 	var pingTimer = time.NewTimer(wsPingInterval)
-	defer wc.wg.Done()
 	defer pingTimer.Stop()
 
 	for {

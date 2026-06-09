@@ -80,7 +80,6 @@ type Hasher struct {
 	depth       int         // index of last level
 	result      chan []byte // result channel
 	hash        []byte      // to record the result
-	max         int32       // max segments for SegmentWriter interface
 	blockLength []byte      // The block length that needes to be added in Sum
 }
 
@@ -218,7 +217,7 @@ func (t *Tree) Draw(hash []byte, d int) string {
 	hashes = append(hashes, []string{"", fmt.Sprintf("%v", hashstr(hash)), ""})
 	total := 60
 	del := "                             "
-	var rows []string
+	rows := make([]string, 0, len(hashes)+2)
 	for i := len(hashes) - 1; i >= 0; i-- {
 		var textlen int
 		hash := hashes[i]
@@ -234,8 +233,8 @@ func (t *Tree) Draw(hash []byte, d int) string {
 		}
 		row := fmt.Sprintf("%v: %v", len(hashes)-i-1, strings.Join(hash, del[:delsize]))
 		rows = append(rows, row)
-
 	}
+
 	rows = append(rows, strings.Join(left, "  "))
 	rows = append(rows, strings.Join(right, "  "))
 	return strings.Join(rows, "\n") + "\n"
@@ -413,7 +412,6 @@ func (ha *Hasher) Reset() {
 func (ha *Hasher) ResetWithLength(l []byte) {
 	ha.Reset()
 	ha.blockLength = l
-
 }
 
 // Release gives back the Tree to the pool whereby it unlocks
@@ -429,7 +427,6 @@ func (ha *Hasher) releaseTree() {
 		}
 		ha.pool.Release(ha.bmt)
 		ha.bmt = nil
-
 	}
 	ha.cur = 0
 	ha.segment = nil
@@ -472,7 +469,6 @@ func (ha *Hasher) run(n *Node, h hash.Hash, d int, i int, s []byte) {
 			h.Write(n.left)
 			h.Write(n.right)
 			s = h.Sum(nil)
-
 		} else {
 			s = append(n.left, n.right...)
 		}

@@ -18,6 +18,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
@@ -28,11 +29,17 @@ import (
 
 	"github.com/XinFinOrg/XDPoSChain/cmd/utils"
 	"github.com/XinFinOrg/XDPoSChain/common"
+	"github.com/XinFinOrg/XDPoSChain/common/hexutil"
 	"github.com/XinFinOrg/XDPoSChain/core"
+	"github.com/XinFinOrg/XDPoSChain/core/rawdb"
 	"github.com/XinFinOrg/XDPoSChain/core/state"
 	"github.com/XinFinOrg/XDPoSChain/core/types"
+	"github.com/XinFinOrg/XDPoSChain/crypto"
+	"github.com/XinFinOrg/XDPoSChain/ethdb"
 	xdc_genesis "github.com/XinFinOrg/XDPoSChain/genesis"
 	"github.com/XinFinOrg/XDPoSChain/log"
+	"github.com/XinFinOrg/XDPoSChain/node"
+	"github.com/XinFinOrg/XDPoSChain/trie"
 	"github.com/urfave/cli/v2"
 )
 
@@ -42,7 +49,10 @@ var (
 		Name:      "init",
 		Usage:     "Bootstrap and initialize a new genesis block",
 		ArgsUsage: "<genesisPath>",
-		Flags:     slices.Concat(utils.NetworkFlags, utils.DatabaseFlags),
+		Flags: slices.Concat(
+			[]cli.Flag{utils.CachePreimagesFlag},
+			utils.NetworkFlags,
+			utils.DatabaseFlags),
 		Description: `
 The init command initializes a new genesis block and definition for the network.
 This is a destructive action and changes the network in which you will be
@@ -70,9 +80,12 @@ It expects the genesis file or the network name [ mainnet | testnet | devnet ] a
 			utils.MetricsInfluxDBUsernameFlag,
 			utils.MetricsInfluxDBPasswordFlag,
 			utils.MetricsInfluxDBTagsFlag,
+			utils.MetricsInfluxDBIntervalFlag,
 			utils.MetricsInfluxDBTokenFlag,
 			utils.MetricsInfluxDBBucketFlag,
 			utils.MetricsInfluxDBOrganizationFlag,
+			utils.VMTraceFlag,
+			utils.VMTraceJsonConfigFlag,
 		}, utils.DatabaseFlags),
 		Description: `
 The import command imports blocks from an RLP-encoded form. The form can be one file
@@ -125,15 +138,20 @@ The export-preimages command export hash preimages to an RLP encoded stream`,
 		Action:    dump,
 		Name:      "dump",
 		Usage:     "Dump a specific block from storage",
-		ArgsUsage: "[<blockHash> | <blockNum>]...",
+		ArgsUsage: "[? <blockHash> | <blockNum>]",
 		Flags: slices.Concat([]cli.Flag{
 			utils.CacheFlag,
-			utils.SyncModeFlag,
+			utils.IterativeOutputFlag,
+			utils.ExcludeCodeFlag,
+			utils.ExcludeStorageFlag,
+			utils.IncludeIncompletesFlag,
+			utils.StartKeyFlag,
+			utils.DumpLimitFlag,
 		}, utils.DatabaseFlags),
 		Category: "BLOCKCHAIN COMMANDS",
 		Description: `
-The arguments are interpreted as block numbers or hashes.
-Use "ethereum dump 0" to dump the genesis block.`,
+This command dumps out the state for a given block (or latest, if none provided).
+`,
 	}
 )
 
@@ -147,13 +165,14 @@ func initGenesis(ctx *cli.Context) error {
 	var err error
 	genesis := new(core.Genesis)
 	genesisPath := ctx.Args().First()
-	if genesisPath == "mainnet" || genesisPath == "xinfin" {
+	switch genesisPath {
+	case "mainnet", "xinfin":
 		err = json.Unmarshal(xdc_genesis.MainnetGenesis, genesis)
-	} else if genesisPath == "testnet" || genesisPath == "apothem" {
+	case "testnet", "apothem":
 		err = json.Unmarshal(xdc_genesis.TestnetGenesis, genesis)
-	} else if genesisPath == "devnet" {
+	case "devnet":
 		err = json.Unmarshal(xdc_genesis.DevnetGenesis, genesis)
-	} else {
+	default:
 		if len(genesisPath) == 0 {
 			utils.Fatalf("invalid path to genesis file")
 		}
@@ -169,11 +188,7 @@ func initGenesis(ctx *cli.Context) error {
 		utils.Fatalf("invalid genesis json: %v", err)
 	}
 
-	if genesis.Config.ChainId != nil {
-		common.CopyConstants(genesis.Config.ChainId.Uint64())
-	}
-
-	// Open an initialise both full and light databases
+	// Open and initialise both full and light databases
 	stack, _ := makeConfigNode(ctx)
 	defer stack.Close()
 
@@ -182,12 +197,15 @@ func initGenesis(ctx *cli.Context) error {
 	if err != nil {
 		utils.Fatalf("Failed to open database: %v", err)
 	}
-	_, hash, err := core.SetupGenesisBlock(chaindb, genesis)
+	_, hash, compatErr, err := core.SetupGenesisBlockWithOverride(chaindb, genesis, ctx.Bool(utils.AllowBuiltInConfigOverrideFlag.Name))
 	if err != nil {
-		utils.Fatalf("Failed to write genesis block: %v", err)
+		utils.Fatalf("Failed to write genesis block: %s", utils.FormatChainConfigError(err))
+	}
+	if compatErr != nil {
+		utils.Fatalf("Failed to write chain config: %v", compatErr)
 	}
 	chaindb.Close()
-	log.Info("Successfully wrote genesis state", "database", name, "hash", hash.String())
+	log.Info("Successfully wrote genesis state", "database", name, "hash", hash)
 	return nil
 }
 
@@ -273,7 +291,7 @@ func exportChain(ctx *cli.Context) error {
 		utils.Fatalf("This command requires an argument.")
 	}
 
-	stack, _, _ := makeFullNode(ctx)
+	stack, _ := makeConfigNode(ctx)
 	defer stack.Close()
 
 	chain, db := utils.MakeChain(ctx, stack, true)
@@ -310,7 +328,7 @@ func importPreimages(ctx *cli.Context) error {
 		utils.Fatalf("This command requires an argument.")
 	}
 
-	stack, _, _ := makeFullNode(ctx)
+	stack, _ := makeConfigNode(ctx)
 	defer stack.Close()
 
 	db := utils.MakeChainDatabase(ctx, stack, false)
@@ -329,7 +347,8 @@ func exportPreimages(ctx *cli.Context) error {
 	if ctx.Args().Len() < 1 {
 		utils.Fatalf("This command requires an argument.")
 	}
-	stack, _, _ := makeFullNode(ctx)
+
+	stack, _ := makeConfigNode(ctx)
 	defer stack.Close()
 
 	db := utils.MakeChainDatabase(ctx, stack, true)
@@ -343,31 +362,88 @@ func exportPreimages(ctx *cli.Context) error {
 	return nil
 }
 
+func parseDumpConfig(ctx *cli.Context, stack *node.Node) (*state.DumpConfig, ethdb.Database, common.Hash, error) {
+	db := utils.MakeChainDatabase(ctx, stack, true)
+	var header *types.Header
+	if ctx.NArg() > 1 {
+		return nil, nil, common.Hash{}, fmt.Errorf("expected 1 argument (number or hash), got %d", ctx.NArg())
+	}
+	if ctx.NArg() == 1 {
+		arg := ctx.Args().First()
+		if hashish(arg) {
+			hash := common.HexToHash(arg)
+			if number := rawdb.ReadHeaderNumber(db, hash); number != nil {
+				header = rawdb.ReadHeader(db, hash, *number)
+			} else {
+				return nil, nil, common.Hash{}, fmt.Errorf("block %x not found", hash)
+			}
+		} else {
+			number, err := strconv.Atoi(arg)
+			if err != nil {
+				return nil, nil, common.Hash{}, err
+			}
+			if hash := rawdb.ReadCanonicalHash(db, uint64(number)); hash != (common.Hash{}) {
+				header = rawdb.ReadHeader(db, hash, uint64(number))
+			} else {
+				return nil, nil, common.Hash{}, fmt.Errorf("header for block %d not found", number)
+			}
+		}
+	} else {
+		// Use latest
+		header = rawdb.ReadHeadHeader(db)
+	}
+	if header == nil {
+		return nil, nil, common.Hash{}, errors.New("no head block found")
+	}
+	startArg := common.FromHex(ctx.String(utils.StartKeyFlag.Name))
+	var start common.Hash
+	switch len(startArg) {
+	case 0: // common.Hash
+	case 32:
+		start = common.BytesToHash(startArg)
+	case 20:
+		start = crypto.Keccak256Hash(startArg)
+		log.Info("Converting start-address to hash", "address", common.BytesToAddress(startArg), "hash", start.Hex())
+	default:
+		return nil, nil, common.Hash{}, fmt.Errorf("invalid start argument: %x. 20 or 32 hex-encoded bytes required", startArg)
+	}
+	var conf = &state.DumpConfig{
+		SkipCode:          ctx.Bool(utils.ExcludeCodeFlag.Name),
+		SkipStorage:       ctx.Bool(utils.ExcludeStorageFlag.Name),
+		OnlyWithAddresses: !ctx.Bool(utils.IncludeIncompletesFlag.Name),
+		Start:             start.Bytes(),
+		Max:               ctx.Uint64(utils.DumpLimitFlag.Name),
+	}
+	log.Info("State dump configured", "block", header.Number, "hash", header.Hash().Hex(),
+		"skipcode", conf.SkipCode, "skipstorage", conf.SkipStorage,
+		"start", hexutil.Encode(conf.Start), "limit", conf.Max)
+	return conf, db, header.Root, nil
+}
+
 func dump(ctx *cli.Context) error {
-	stack, _, _ := makeFullNode(ctx)
+	stack, _ := makeConfigNode(ctx)
 	defer stack.Close()
 
-	chain, chainDb := utils.MakeChain(ctx, stack, true)
-	defer chainDb.Close()
-
-	for _, arg := range ctx.Args().Slice() {
-		var block *types.Block
-		if hashish(arg) {
-			block = chain.GetBlockByHash(common.HexToHash(arg))
-		} else {
-			num, _ := strconv.Atoi(arg)
-			block = chain.GetBlockByNumber(uint64(num))
+	conf, db, root, err := parseDumpConfig(ctx, stack)
+	if err != nil {
+		return err
+	}
+	config := &trie.Config{
+		Preimages: true, // always enable preimage lookup
+	}
+	state, err := state.New(root, state.NewDatabaseWithConfig(db, config))
+	if err != nil {
+		return err
+	}
+	if ctx.Bool(utils.IterativeOutputFlag.Name) {
+		state.IterativeDump(conf, json.NewEncoder(os.Stdout))
+	} else {
+		if conf.OnlyWithAddresses {
+			fmt.Fprintf(os.Stderr, "If you want to include accounts with missing preimages, you need iterative output, since"+
+				" otherwise the accounts will overwrite each other in the resulting mapping.")
+			return errors.New("incompatible options")
 		}
-		if block == nil {
-			fmt.Println("{}")
-			utils.Fatalf("block not found")
-		} else {
-			state, err := state.New(block.Root(), state.NewDatabase(chainDb))
-			if err != nil {
-				utils.Fatalf("could not create new state: %v", err)
-			}
-			fmt.Printf("%s\n", state.Dump())
-		}
+		fmt.Println(string(state.Dump(conf)))
 	}
 	return nil
 }

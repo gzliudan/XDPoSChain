@@ -42,7 +42,7 @@ func newTester() *bfterTester {
 	testConsensus := &XDPoS.XDPoS{EngineV2: &engine_v2.XDPoS_v2{}}
 	broadcasts := BroadcastFns{}
 	blockChain := &core.BlockChain{}
-	blockChain.SetConfig(params.TestXDPoSMockChainConfig)
+	blockChain.SetChainConfig(params.TestXDPoSMockChainConfig)
 	chainHeight := func() uint64 {
 		return 1351
 	}
@@ -94,7 +94,7 @@ func TestSequentialVotes(t *testing.T) {
 	}
 }
 
-// Test that avoid boardcast if there is bad vote
+// Test that avoid broadcast if there is bad vote
 func TestNotBoardcastInvalidVote(t *testing.T) {
 	tester := newTester()
 	handlerCounter := uint32(0)

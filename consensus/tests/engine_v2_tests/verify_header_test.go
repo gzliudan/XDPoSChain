@@ -2,6 +2,7 @@ package engine_v2_tests
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
 	"testing"
@@ -17,6 +18,20 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+type maskingChainReader struct {
+	consensus.ChainReader
+	maskedHash   common.Hash
+	maskedNumber uint64
+}
+
+func (m *maskingChainReader) GetHeader(hash common.Hash, number uint64) *types.Header {
+	if hash == m.maskedHash && number == m.maskedNumber {
+		return nil
+	}
+	return m.ChainReader.GetHeader(hash, number)
+}
+
+// TestShouldVerifyBlock tests should verify block.
 func TestShouldVerifyBlock(t *testing.T) {
 	b, err := json.Marshal(params.TestXDPoSMockChainConfig)
 	assert.Nil(t, err)
@@ -25,8 +40,6 @@ func TestShouldVerifyBlock(t *testing.T) {
 	var config params.ChainConfig
 	err = json.Unmarshal([]byte(configString), &config)
 	assert.Nil(t, err)
-	// Enable verify
-	config.XDPoS.V2.SkipV2Validation = false
 	// Block 901 is the first v2 block with round of 1
 	blockchain, _, _, signer, signFn, _ := PrepareXDCTestBlockChainForV2Engine(t, 910, &config, nil)
 	adaptor := blockchain.Engine().(*XDPoS.XDPoS)
@@ -53,7 +66,7 @@ func TestShouldVerifyBlock(t *testing.T) {
 	assert.Equal(t, consensus.ErrNoValidatorSignatureV2, err)
 
 	blockFromFuture := blockchain.GetBlockByNumber(902).Header()
-	blockFromFuture.Time = big.NewInt(time.Now().Unix() + 10000)
+	blockFromFuture.Time = uint64(time.Now().Unix() + 10000)
 	err = adaptor.VerifyHeader(blockchain, blockFromFuture, true)
 	assert.Equal(t, consensus.ErrFutureBlock, err)
 
@@ -97,7 +110,7 @@ func TestShouldVerifyBlock(t *testing.T) {
 
 	block901 := blockchain.GetBlockByNumber(901).Header()
 	tooFastMinedBlock := blockchain.GetBlockByNumber(902).Header()
-	tooFastMinedBlock.Time = big.NewInt(block901.Time.Int64() - 10)
+	tooFastMinedBlock.Time = block901.Time - 10
 	err = adaptor.VerifyHeader(blockchain, tooFastMinedBlock, true)
 	assert.Equal(t, utils.ErrInvalidTimestamp, err)
 
@@ -168,6 +181,7 @@ func TestShouldVerifyBlock(t *testing.T) {
 	assert.Equal(t, utils.ErrPenaltiesNotLegit, err)
 }
 
+// TestConfigSwitchOnDifferentCertThreshold tests config switch on different cert threshold.
 func TestConfigSwitchOnDifferentCertThreshold(t *testing.T) {
 	b, err := json.Marshal(params.TestXDPoSMockChainConfig)
 	assert.Nil(t, err)
@@ -176,8 +190,6 @@ func TestConfigSwitchOnDifferentCertThreshold(t *testing.T) {
 	var config params.ChainConfig
 	err = json.Unmarshal([]byte(configString), &config)
 	assert.Nil(t, err)
-	// Enable verify
-	config.XDPoS.V2.SkipV2Validation = false
 	// Block 901 is the first v2 block with round of 1
 	blockchain, _, _, _, _, _ := PrepareXDCTestBlockChainForV2Engine(t, 915, &config, nil)
 
@@ -266,7 +278,9 @@ func TestConfigSwitchOnDifferentCertThreshold(t *testing.T) {
  3. verify this header while node is on round 899,
     This is to simulate node is syncing from remote during config switch
 */
+// TestConfigSwitchOnDifferentMasternodeCount tests config switch on different masternode count.
 func TestConfigSwitchOnDifferentMasternodeCount(t *testing.T) {
+	skipLongInShortMode(t)
 	b, err := json.Marshal(params.TestXDPoSMockChainConfig)
 	assert.Nil(t, err)
 	configString := string(b)
@@ -274,8 +288,6 @@ func TestConfigSwitchOnDifferentMasternodeCount(t *testing.T) {
 	var config params.ChainConfig
 	err = json.Unmarshal([]byte(configString), &config)
 	assert.Nil(t, err)
-	// Enable verify
-	config.XDPoS.V2.SkipV2Validation = false
 	// Block 901 is the first v2 block with round of 1
 	blockchain, _, currentBlock, _, _, _ := PrepareXDCTestBlockChainForV2Engine(t, int(config.XDPoS.Epoch)*2, &config, nil)
 	adaptor := blockchain.Engine().(*XDPoS.XDPoS)
@@ -304,6 +316,7 @@ func TestConfigSwitchOnDifferentMasternodeCount(t *testing.T) {
 	assert.Equal(t, utils.ErrValidatorNotWithinMasternodes, err)
 }
 
+// TestConfigSwitchOnDifferentMindPeriod tests config switch on different mind period.
 func TestConfigSwitchOnDifferentMindPeriod(t *testing.T) {
 	b, err := json.Marshal(params.TestXDPoSMockChainConfig)
 	assert.Nil(t, err)
@@ -312,8 +325,6 @@ func TestConfigSwitchOnDifferentMindPeriod(t *testing.T) {
 	var config params.ChainConfig
 	err = json.Unmarshal([]byte(configString), &config)
 	assert.Nil(t, err)
-	// Enable verify
-	config.XDPoS.V2.SkipV2Validation = false
 	// Block 901 is the first v2 block with round of 1
 	blockchain, _, _, _, _, _ := PrepareXDCTestBlockChainForV2Engine(t, 915, &config, nil)
 
@@ -351,12 +362,13 @@ func TestConfigSwitchOnDifferentMindPeriod(t *testing.T) {
 	// after 910 require 5 signs, but we only give 3 signs
 	block911 := blockchain.GetBlockByNumber(911).Header()
 	block911.Extra = extraInBytes
-	block911.Time = big.NewInt(blockchain.GetBlockByNumber(910).Time().Int64() + 2) //2 is previous config, should get the right config from round
+	block911.Time = blockchain.GetBlockByNumber(910).Time() + 2 // 2 is previous config, should get the right config from round
 	err = adaptor.VerifyHeader(blockchain, block911, true)
 
 	assert.Equal(t, utils.ErrInvalidTimestamp, err)
 }
 
+// TestShouldFailIfNotEnoughQCSignatures tests should fail if not enough qc signatures.
 func TestShouldFailIfNotEnoughQCSignatures(t *testing.T) {
 	b, err := json.Marshal(params.TestXDPoSMockChainConfig)
 	assert.Nil(t, err)
@@ -365,8 +377,6 @@ func TestShouldFailIfNotEnoughQCSignatures(t *testing.T) {
 	var config params.ChainConfig
 	err = json.Unmarshal([]byte(configString), &config)
 	assert.Nil(t, err)
-	// Enable verify
-	config.XDPoS.V2.SkipV2Validation = false
 	// Block 901 is the first v2 block with round of 1
 	blockchain, _, currentBlock, signer, signFn, _ := PrepareXDCTestBlockChainForV2Engine(t, 902, &config, nil)
 	adaptor := blockchain.Engine().(*XDPoS.XDPoS)
@@ -405,10 +415,11 @@ func TestShouldFailIfNotEnoughQCSignatures(t *testing.T) {
 	// Happy path
 	err = adaptor.VerifyHeader(blockchain, headerWithDuplicatedSignatures, true)
 	assert.Equal(t, utils.ErrInvalidQCSignatures, err)
-
 }
 
+// TestShouldVerifyHeaders tests should verify headers.
 func TestShouldVerifyHeaders(t *testing.T) {
+	skipLongInShortMode(t)
 	b, err := json.Marshal(params.TestXDPoSMockChainConfig)
 	assert.Nil(t, err)
 	configString := string(b)
@@ -416,8 +427,6 @@ func TestShouldVerifyHeaders(t *testing.T) {
 	var config params.ChainConfig
 	err = json.Unmarshal([]byte(configString), &config)
 	assert.Nil(t, err)
-	// Enable verify
-	config.XDPoS.V2.SkipV2Validation = false
 	// Block 901 is the first v2 block with round of 1
 	blockchain, _, _, _, _, _ := PrepareXDCTestBlockChainForV2Engine(t, 910, &config, nil)
 	adaptor := blockchain.Engine().(*XDPoS.XDPoS)
@@ -447,7 +456,9 @@ func TestShouldVerifyHeaders(t *testing.T) {
 	}
 }
 
+// TestShouldVerifyHeadersEvenIfParentsNotYetWrittenIntoDB tests should verify headers even if parents not yet written into db.
 func TestShouldVerifyHeadersEvenIfParentsNotYetWrittenIntoDB(t *testing.T) {
+	skipLongInShortMode(t)
 	b, err := json.Marshal(params.TestXDPoSMockChainConfig)
 	assert.Nil(t, err)
 	configString := string(b)
@@ -455,8 +466,6 @@ func TestShouldVerifyHeadersEvenIfParentsNotYetWrittenIntoDB(t *testing.T) {
 	var config params.ChainConfig
 	err = json.Unmarshal([]byte(configString), &config)
 	assert.Nil(t, err)
-	// Enable verify
-	config.XDPoS.V2.SkipV2Validation = false
 	// Block 901 is the first v2 block with round of 1
 	blockchain, _, block910, signer, signFn, _ := PrepareXDCTestBlockChainForV2Engine(t, 910, &config, nil)
 	adaptor := blockchain.Engine().(*XDPoS.XDPoS)
@@ -466,12 +475,12 @@ func TestShouldVerifyHeadersEvenIfParentsNotYetWrittenIntoDB(t *testing.T) {
 	// Create block 911 but don't write into DB
 	blockNumber := 911
 	roundNumber := int64(blockNumber) - config.XDPoS.V2.SwitchBlock.Int64()
-	block911 := CreateBlock(blockchain, &config, block910, blockNumber, roundNumber, signer.Hex(), signer, signFn, nil, nil, "")
+	block911 := CreateBlock(blockchain, blockchain.Config(), block910, blockNumber, roundNumber, signer.Hex(), signer, signFn, nil, nil, "")
 
 	// Create block 912 and not write into DB as well
 	blockNumber = 912
 	roundNumber = int64(blockNumber) - config.XDPoS.V2.SwitchBlock.Int64()
-	block912 := CreateBlock(blockchain, &config, block911, blockNumber, roundNumber, signer.Hex(), signer, signFn, nil, nil, "")
+	block912 := CreateBlock(blockchain, blockchain.Config(), block911, blockNumber, roundNumber, signer.Hex(), signer, signFn, nil, nil, "")
 
 	headersTobeVerified = append(headersTobeVerified, block910.Header(), block911.Header(), block912.Header())
 	// Randomly set full verify
@@ -493,6 +502,188 @@ func TestShouldVerifyHeadersEvenIfParentsNotYetWrittenIntoDB(t *testing.T) {
 			} else {
 				panic("Suppose to have verified 3 block headers")
 			}
+		}
+	}
+}
+
+// TestShouldVerifyMixedHeadersWhenParentLookupByHashIsMasked tests should verify mixed headers when parent lookup by hash is masked.
+func TestShouldVerifyMixedHeadersWhenParentLookupByHashIsMasked(t *testing.T) {
+	skipLongInShortMode(t)
+	b, err := json.Marshal(params.TestXDPoSMockChainConfig)
+	assert.Nil(t, err)
+
+	var config params.ChainConfig
+	err = json.Unmarshal(b, &config)
+	assert.Nil(t, err)
+
+	blockchain, _, _, _, _, _ := PrepareXDCTestBlockChainForV2Engine(t, 910, &config, nil)
+	adaptor := blockchain.Engine().(*XDPoS.XDPoS)
+
+	// Build a mixed v1/v2 input where the first v2 header (901) depends on v1 parent (900).
+	headers := []*types.Header{
+		blockchain.GetBlockByNumber(900).Header(),
+		blockchain.GetBlockByNumber(901).Header(),
+	}
+	fullVerifies := []bool{true, true}
+
+	maskedChain := &maskingChainReader{
+		ChainReader:  blockchain,
+		maskedHash:   headers[0].Hash(),
+		maskedNumber: headers[0].Number.Uint64(),
+	}
+
+	_, results := adaptor.VerifyHeaders(maskedChain, headers, fullVerifies)
+	for i := 0; i < len(headers); i++ {
+		select {
+		case result := <-results:
+			assert.Nil(t, result)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for verify result %d", i)
+		}
+	}
+}
+
+// TestShouldVerifyPureV2EpochSwitchHeadersEvenIfParentNotYetWrittenIntoDB tests should verify pure v 2 epoch switch headers even if parent not yet written into db.
+func TestShouldVerifyPureV2EpochSwitchHeadersEvenIfParentNotYetWrittenIntoDB(t *testing.T) {
+	skipLongInShortMode(t)
+	b, err := json.Marshal(params.TestXDPoSMockChainConfig)
+	assert.Nil(t, err)
+
+	var config params.ChainConfig
+	err = json.Unmarshal(b, &config)
+	assert.Nil(t, err)
+
+	// Build chain to 1798, then construct 1799->1800 in-memory only.
+	// 1800 is a v2 epoch-switch block and triggers HookPenalty via calcMasternodes.
+	blockchain, _, block1798, signer, signFn, _ := PrepareXDCTestBlockChainForV2Engine(t, 1798, &config, nil)
+	adaptor := blockchain.Engine().(*XDPoS.XDPoS)
+
+	// Probe HookPenalty parent lookup behavior deterministically.
+	adaptor.EngineV2.HookPenalty = func(chain consensus.ChainReader, number *big.Int, parentHash common.Hash, candidates []common.Address) ([]common.Address, error) {
+		parentNumber := number.Uint64() - 1
+		if parent := chain.GetHeader(parentHash, parentNumber); parent == nil {
+			return nil, consensus.ErrUnknownAncestor
+		}
+		return []common.Address{}, nil
+	}
+
+	block1799 := CreateBlock(
+		blockchain,
+		blockchain.Config(),
+		block1798,
+		1799,
+		int64(1799)-config.XDPoS.V2.SwitchBlock.Int64(),
+		signer.Hex(),
+		signer,
+		signFn,
+		nil,
+		nil,
+		"",
+	)
+	block1800 := CreateBlock(
+		blockchain,
+		blockchain.Config(),
+		block1799,
+		1800,
+		int64(1800)-config.XDPoS.V2.SwitchBlock.Int64(),
+		signer.Hex(),
+		signer,
+		signFn,
+		nil,
+		nil,
+		"",
+	)
+
+	headers := []*types.Header{block1799.Header(), block1800.Header()}
+	fullVerifies := []bool{true, true}
+
+	_, results := adaptor.VerifyHeaders(blockchain, headers, fullVerifies)
+	for i := 0; i < len(headers); i++ {
+		select {
+		case result := <-results:
+			if i == 0 {
+				assert.Nil(t, result)
+				continue
+			}
+			assert.Error(t, result)
+			assert.NotEqual(t, consensus.ErrUnknownAncestor, result)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for verify result %d", i)
+		}
+	}
+}
+
+// TestVerifyHeadersDoesNotFabricateBatchBlocksForHookPenalty tests verify headers does not fabricate batch blocks for hook penalty.
+func TestVerifyHeadersDoesNotFabricateBatchBlocksForHookPenalty(t *testing.T) {
+	skipLongInShortMode(t)
+	b, err := json.Marshal(params.TestXDPoSMockChainConfig)
+	assert.Nil(t, err)
+
+	var config params.ChainConfig
+	err = json.Unmarshal(b, &config)
+	assert.Nil(t, err)
+
+	blockchain, _, block1798, signer, signFn, _ := PrepareXDCTestBlockChainForV2Engine(t, 1798, &config, nil)
+	adaptor := blockchain.Engine().(*XDPoS.XDPoS)
+
+	originalHookPenalty := adaptor.EngineV2.HookPenalty
+	t.Cleanup(func() {
+		adaptor.EngineV2.HookPenalty = originalHookPenalty
+	})
+	expectedErr := errors.New("batch block body must not be fabricated")
+	adaptor.EngineV2.HookPenalty = func(chain consensus.ChainReader, number *big.Int, parentHash common.Hash, candidates []common.Address) ([]common.Address, error) {
+		parentNumber := number.Uint64() - 1
+		parentBlock := chain.GetBlock(parentHash, parentNumber)
+		if parentBlock != nil {
+			return nil, expectedErr
+		}
+		if originalHookPenalty == nil {
+			return []common.Address{}, nil
+		}
+		return originalHookPenalty(chain, number, parentHash, candidates)
+	}
+
+	block1799 := CreateBlock(
+		blockchain,
+		blockchain.Config(),
+		block1798,
+		1799,
+		int64(1799)-config.XDPoS.V2.SwitchBlock.Int64(),
+		signer.Hex(),
+		signer,
+		signFn,
+		nil,
+		nil,
+		"",
+	)
+	block1800 := CreateBlock(
+		blockchain,
+		blockchain.Config(),
+		block1799,
+		1800,
+		int64(1800)-config.XDPoS.V2.SwitchBlock.Int64(),
+		signer.Hex(),
+		signer,
+		signFn,
+		nil,
+		nil,
+		"",
+	)
+
+	headers := []*types.Header{block1799.Header(), block1800.Header()}
+	fullVerifies := []bool{true, true}
+
+	_, results := adaptor.VerifyHeaders(blockchain, headers, fullVerifies)
+	for i := 0; i < len(headers); i++ {
+		select {
+		case result := <-results:
+			if i == 0 {
+				assert.Nil(t, result)
+				continue
+			}
+			assert.False(t, errors.Is(result, expectedErr), "VerifyHeaders should not observe fabricated batch blocks")
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for verify result %d", i)
 		}
 	}
 }

@@ -20,7 +20,7 @@ import (
 	"fmt"
 	"io"
 	"reflect"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -219,12 +219,26 @@ func (ctx ppctx) fields(obj *goja.Object) []string {
 				vals = append(vals, k)
 			}
 		}
-
 	}
-	iterOwnAndConstructorKeys(ctx.vm, obj, add)
-	sort.Strings(vals)
-	sort.Strings(methods)
+	iterEnumerableAndConstructorKeys(ctx.vm, obj, add)
+	slices.Sort(vals)
+	slices.Sort(methods)
 	return append(vals, methods...)
+}
+
+func iterEnumerableAndConstructorKeys(vm *goja.Runtime, obj *goja.Object, f func(string)) {
+	shadowed := make(map[string]bool)
+	iterOwnKeys(vm, obj, func(prop string) {
+		shadowed[prop] = true
+	})
+	iterEnumerableKeys(vm, obj, f)
+	if cp := constructorPrototype(vm, obj); cp != nil {
+		iterEnumerableKeys(vm, cp, func(prop string) {
+			if !shadowed[prop] {
+				f(prop)
+			}
+		})
+	}
 }
 
 func iterOwnAndConstructorKeys(vm *goja.Runtime, obj *goja.Object, f func(string)) {
@@ -239,6 +253,31 @@ func iterOwnAndConstructorKeys(vm *goja.Runtime, obj *goja.Object, f func(string
 				f(prop)
 			}
 		})
+	}
+}
+
+func iterEnumerableKeys(vm *goja.Runtime, obj *goja.Object, f func(string)) {
+	Object := vm.Get("Object").ToObject(vm)
+	keys, isFunc := goja.AssertFunction(Object.Get("keys"))
+	if !isFunc {
+		panic(vm.ToValue("Object.keys isn't a function"))
+	}
+	rv, err := keys(goja.Null(), obj)
+	if err != nil {
+		panic(vm.ToValue(fmt.Sprintf("Error getting enumerable object properties: %v", err)))
+	}
+	gv := rv.Export()
+	switch gv := gv.(type) {
+	case []interface{}:
+		for _, v := range gv {
+			f(v.(string))
+		}
+	case []string:
+		for _, v := range gv {
+			f(v)
+		}
+	default:
+		panic(fmt.Errorf("Object.keys returned unexpected type %T", gv))
 	}
 }
 

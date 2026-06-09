@@ -19,8 +19,9 @@ package utils
 
 import (
 	"crypto/ecdsa"
+	"encoding/json"
+	"errors"
 	"fmt"
-	"math"
 	"math/big"
 	"net"
 	"os"
@@ -39,9 +40,8 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/common/fdlimit"
 	"github.com/XinFinOrg/XDPoSChain/consensus"
 	"github.com/XinFinOrg/XDPoSChain/consensus/XDPoS"
-	"github.com/XinFinOrg/XDPoSChain/consensus/ethash"
 	"github.com/XinFinOrg/XDPoSChain/core"
-	"github.com/XinFinOrg/XDPoSChain/core/txpool"
+	"github.com/XinFinOrg/XDPoSChain/core/txpool/legacypool"
 	"github.com/XinFinOrg/XDPoSChain/core/vm"
 	"github.com/XinFinOrg/XDPoSChain/crypto"
 	"github.com/XinFinOrg/XDPoSChain/eth"
@@ -49,6 +49,7 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/eth/ethconfig"
 	"github.com/XinFinOrg/XDPoSChain/eth/filters"
 	"github.com/XinFinOrg/XDPoSChain/eth/gasprice"
+	"github.com/XinFinOrg/XDPoSChain/eth/tracers"
 	"github.com/XinFinOrg/XDPoSChain/ethdb"
 	"github.com/XinFinOrg/XDPoSChain/ethstats"
 	"github.com/XinFinOrg/XDPoSChain/internal/ethapi"
@@ -57,6 +58,7 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/metrics"
 	"github.com/XinFinOrg/XDPoSChain/metrics/exp"
 	"github.com/XinFinOrg/XDPoSChain/metrics/influxdb"
+	"github.com/XinFinOrg/XDPoSChain/miner"
 	"github.com/XinFinOrg/XDPoSChain/node"
 	"github.com/XinFinOrg/XDPoSChain/p2p"
 	"github.com/XinFinOrg/XDPoSChain/p2p/discover"
@@ -124,6 +126,11 @@ var (
 		Usage:    "XDC develop network",
 		Category: flags.EthCategory,
 	}
+	AllowBuiltInConfigOverrideFlag = &cli.BoolFlag{
+		Name:     "allow-builtin-config-override",
+		Usage:    "Allow same-hash custom overrides on built-in IDs to use custom chain config",
+		Category: flags.EthCategory,
+	}
 
 	// Dev mode
 	DeveloperFlag = &cli.BoolFlag{
@@ -143,10 +150,57 @@ var (
 		Category: flags.NetworkingCategory,
 	}
 
+	// Dump command options.
+	IterativeOutputFlag = &cli.BoolFlag{
+		Name:  "iterative",
+		Usage: "Print streaming JSON iteratively, delimited by newlines",
+		Value: true,
+	}
+	ExcludeStorageFlag = &cli.BoolFlag{
+		Name:  "nostorage",
+		Usage: "Exclude storage entries (save db lookups)",
+	}
+	IncludeIncompletesFlag = &cli.BoolFlag{
+		Name:  "incompletes",
+		Usage: "Include accounts for which we don't have the address (missing preimage)",
+	}
+	ExcludeCodeFlag = &cli.BoolFlag{
+		Name:  "nocode",
+		Usage: "Exclude contract code (save db lookups)",
+	}
+	StartKeyFlag = &cli.StringFlag{
+		Name:  "start",
+		Usage: "Start position. Either a hash or address",
+		Value: "0x0000000000000000000000000000000000000000000000000000000000000000",
+	}
+	DumpLimitFlag = &cli.Uint64Flag{
+		Name:  "limit",
+		Usage: "Max number of elements (0 = no limit)",
+		Value: 0,
+	}
+
 	SyncModeFlag = &cli.StringFlag{
 		Name:     "syncmode",
 		Usage:    `Blockchain sync mode ("fast" or "full")`,
 		Value:    ethconfig.Defaults.SyncMode.String(),
+		Category: flags.EthCategory,
+	}
+	FastSyncPivotNumberFlag = &cli.Uint64Flag{
+		Name:     "fastsyncpivotnumber",
+		Usage:    "Pivot block number for fast sync (0 = use default calculation)",
+		Value:    0,
+		Category: flags.EthCategory,
+	}
+	FastSyncPivotHashFlag = &cli.StringFlag{
+		Name:     "fastsyncpivothash",
+		Usage:    "Pivot block hash for fast sync verification (hex string, must be set if fastsyncpivotnumber is set)",
+		Value:    "",
+		Category: flags.EthCategory,
+	}
+	FastSyncPivotRootFlag = &cli.StringFlag{
+		Name:     "fastsyncpivotroot",
+		Usage:    "State root of pivot block for fast sync state download (hex string, zero = use latest.Root)",
+		Value:    "",
 		Category: flags.EthCategory,
 	}
 	GCModeFlag = &cli.StringFlag{
@@ -161,49 +215,6 @@ var (
 		Category: flags.AccountCategory,
 	}
 
-	// Ethash settings
-	EthashCacheDirFlag = &flags.DirectoryFlag{
-		Name:     "ethash-cachedir",
-		Aliases:  []string{"ethash.cachedir"},
-		Usage:    "Directory to store the ethash verification caches (default = inside the datadir)",
-		Category: flags.EthashCategory,
-	}
-	EthashCachesInMemoryFlag = &cli.IntFlag{
-		Name:     "ethash-cachesinmem",
-		Aliases:  []string{"ethash.cachesinmem"},
-		Usage:    "Number of recent ethash caches to keep in memory (16MB each)",
-		Value:    ethconfig.Defaults.Ethash.CachesInMem,
-		Category: flags.EthashCategory,
-	}
-	EthashCachesOnDiskFlag = &cli.IntFlag{
-		Name:     "ethash-cachesondisk",
-		Aliases:  []string{"ethash.cachesondisk"},
-		Usage:    "Number of recent ethash caches to keep on disk (16MB each)",
-		Value:    ethconfig.Defaults.Ethash.CachesOnDisk,
-		Category: flags.EthashCategory,
-	}
-	EthashDatasetDirFlag = &flags.DirectoryFlag{
-		Name:     "ethash-dagdir",
-		Aliases:  []string{"ethash.dagdir"},
-		Usage:    "Directory to store the ethash mining DAGs (default = inside home folder)",
-		Value:    flags.DirectoryString(ethconfig.Defaults.Ethash.DatasetDir),
-		Category: flags.EthashCategory,
-	}
-	EthashDatasetsInMemoryFlag = &cli.IntFlag{
-		Name:     "ethash-dagsinmem",
-		Aliases:  []string{"ethash.dagsinmem"},
-		Usage:    "Number of recent ethash mining DAGs to keep in memory (1+GB each)",
-		Value:    ethconfig.Defaults.Ethash.DatasetsInMem,
-		Category: flags.EthashCategory,
-	}
-	EthashDatasetsOnDiskFlag = &cli.IntFlag{
-		Name:     "ethash-dagsondisk",
-		Aliases:  []string{"ethash.dagsondisk"},
-		Usage:    "Number of recent ethash mining DAGs to keep on disk (1+GB each)",
-		Value:    ethconfig.Defaults.Ethash.DatasetsOnDisk,
-		Category: flags.EthashCategory,
-	}
-
 	// Transaction pool settings
 	TxPoolNoLocalsFlag = &cli.BoolFlag{
 		Name:     "txpool-nolocals",
@@ -215,20 +226,20 @@ var (
 		Name:     "txpool-journal",
 		Aliases:  []string{"txpool.journal"},
 		Usage:    "Disk journal for local transaction to survive node restarts",
-		Value:    txpool.DefaultConfig.Journal,
+		Value:    ethconfig.Defaults.TxPool.Journal,
 		Category: flags.TxPoolCategory,
 	}
 	TxPoolRejournalFlag = &cli.DurationFlag{
 		Name:     "txpool-rejournal",
 		Aliases:  []string{"txpool.rejournal"},
 		Usage:    "Time interval to regenerate the local transaction journal",
-		Value:    txpool.DefaultConfig.Rejournal,
+		Value:    ethconfig.Defaults.TxPool.Rejournal,
 		Category: flags.TxPoolCategory,
 	}
 	TxPoolPriceLimitFlag = &cli.Uint64Flag{
 		Name:     "txpool-pricelimit",
 		Aliases:  []string{"txpool.pricelimit"},
-		Usage:    "Minimum gas price limit to enforce for acceptance into the pool",
+		Usage:    "Minimum gas price tip to enforce for acceptance into the pool",
 		Value:    ethconfig.Defaults.TxPool.PriceLimit,
 		Category: flags.TxPoolCategory,
 	}
@@ -344,15 +355,15 @@ var (
 	MinerGasLimitFlag = &cli.Uint64Flag{
 		Name:     "miner-gaslimit",
 		Aliases:  []string{"targetgaslimit"},
-		Usage:    "Target gas limit sets the artificial target gas floor for the blocks to mine",
-		Value:    50000000,
+		Usage:    "Target gas ceiling for mined blocks",
+		Value:    ethconfig.Defaults.Miner.GasCeil,
 		Category: flags.MinerCategory,
 	}
 	MinerGasPriceFlag = &flags.BigFlag{
 		Name:     "miner-gasprice",
 		Aliases:  []string{"gasprice"},
-		Usage:    "Minimal gas price to accept for mining a transactions",
-		Value:    big.NewInt(1),
+		Usage:    "Minimum gas price for mining a transaction",
+		Value:    new(big.Int).Set(ethconfig.Defaults.Miner.GasPrice),
 		Category: flags.MinerCategory,
 	}
 	MinerEtherbaseFlag = &cli.StringFlag{
@@ -389,19 +400,48 @@ var (
 		Usage:    "Record information useful for VM and contract debugging",
 		Category: flags.VMCategory,
 	}
+	VMTraceFlag = &cli.StringFlag{
+		Name:     "vmtrace",
+		Usage:    "Name of tracer which should record internal VM operations (costly)",
+		Category: flags.VMCategory,
+	}
+	VMTraceJsonConfigFlag = &cli.StringFlag{
+		Name:     "vmtrace-config",
+		Usage:    "Tracer configuration (JSON)",
+		Value:    "{}",
+		Category: flags.VMCategory,
+	}
 
-	// API options
+	// API options.
 	RPCGlobalGasCapFlag = &cli.Uint64Flag{
 		Name:     "rpc-gascap",
 		Usage:    "Sets a cap on gas that can be used in eth_call/estimateGas (0=infinite)",
 		Value:    ethconfig.Defaults.RPCGasCap,
 		Category: flags.APICategory,
 	}
-	RPCGlobalTxFeeCap = &cli.Float64Flag{
+	RPCGlobalEVMTimeoutFlag = &cli.DurationFlag{
+		Name:     "rpc-evmtimeout",
+		Usage:    "Sets a timeout used for eth_call (0=infinite)",
+		Value:    ethconfig.Defaults.RPCEVMTimeout,
+		Category: flags.APICategory,
+	}
+	RPCGlobalTxFeeCapFlag = &cli.Float64Flag{
 		Name:     "rpc-txfeecap",
 		Aliases:  []string{"rpc.txfeecap"},
 		Usage:    "Sets a cap on transaction fee (in ether) that can be sent via the RPC APIs (0 = no cap)",
 		Value:    ethconfig.Defaults.RPCTxFeeCap,
+		Category: flags.APICategory,
+	}
+	RPCGlobalLogQueryLimit = &cli.IntFlag{
+		Name:     "rpc-logquerylimit",
+		Usage:    "Maximum number of alternative addresses or topics allowed per search position in eth_getLogs filter criteria (0 = no cap)",
+		Value:    ethconfig.Defaults.LogQueryLimit,
+		Category: flags.APICategory,
+	}
+	RPCGlobalRangeLimitFlag = &cli.Uint64Flag{
+		Name:     "rpc-rangelimit",
+		Usage:    "Maximum block range (end - begin) allowed for range queries (0 = unlimited)",
+		Value:    ethconfig.Defaults.RangeLimit,
 		Category: flags.APICategory,
 	}
 	// Authenticated RPC HTTP settings
@@ -435,11 +475,6 @@ var (
 		Usage:    "Reporting URL of a ethstats service (nodename:secret@host:port)",
 		Category: flags.MetricsCategory,
 	}
-	FakePoWFlag = &cli.BoolFlag{
-		Name:     "fakepow",
-		Usage:    "Disables proof-of-work verification",
-		Category: flags.LoggingCategory,
-	}
 	NoCompactionFlag = &cli.BoolFlag{
 		Name:     "nocompaction",
 		Usage:    "Disables db compaction after import",
@@ -461,7 +496,7 @@ var (
 		Name:     "http",
 		Aliases:  []string{"rpc"},
 		Usage:    "Enable the HTTP-RPC server",
-		Value:    true,
+		Value:    false,
 		Category: flags.APICategory,
 	}
 	HTTPListenAddrFlag = &cli.StringFlag{
@@ -496,12 +531,12 @@ var (
 		Name:     "http-api",
 		Aliases:  []string{"rpcapi"},
 		Usage:    "API's offered over the HTTP-RPC interface",
-		Value:    "debug,eth,net,txpool,web3,XDPoS",
+		Value:    "eth,net,txpool,web3,XDPoS",
 		Category: flags.APICategory,
 	}
 	HTTPPathPrefixFlag = &cli.StringFlag{
 		Name:     "http-rpcprefix",
-		Usage:    "HTTP path path prefix on which JSON-RPC is served. Use '/' to serve on all paths.",
+		Usage:    "HTTP path prefix on which JSON-RPC is served. Use '/' to serve on all paths.",
 		Value:    "",
 		Category: flags.APICategory,
 	}
@@ -535,7 +570,7 @@ var (
 	WSEnabledFlag = &cli.BoolFlag{
 		Name:     "ws",
 		Usage:    "Enable the WS-RPC server",
-		Value:    true,
+		Value:    false,
 		Category: flags.APICategory,
 	}
 	WSListenAddrFlag = &cli.StringFlag{
@@ -556,7 +591,7 @@ var (
 		Name:     "ws-api",
 		Aliases:  []string{"wsapi"},
 		Usage:    "API's offered over the WS-RPC interface",
-		Value:    "debug,eth,net,txpool,web3,XDPoS",
+		Value:    "eth,net,txpool,web3,XDPoS",
 		Category: flags.APICategory,
 	}
 	WSAllowedOriginsFlag = &cli.StringFlag{
@@ -582,23 +617,18 @@ var (
 		Usage:    "Comma separated list of JavaScript files to preload into the console",
 		Category: flags.APICategory,
 	}
-	AllowUnprotectedTxs = &cli.BoolFlag{
+	AllowUnprotectedTxsFlag = &cli.BoolFlag{
 		Name:     "rpc-allow-unprotected-txs",
 		Usage:    "Allow for unprotected (non EIP155 signed) transactions to be submitted via RPC",
 		Category: flags.APICategory,
 	}
-	EnablePersonal = &cli.BoolFlag{
-		Name:     "rpc.enabledeprecatedpersonal",
-		Usage:    "Enables the (deprecated) personal namespace",
-		Category: flags.APICategory,
-	}
-	BatchRequestLimit = &cli.IntFlag{
+	BatchRequestLimitFlag = &cli.IntFlag{
 		Name:     "rpc-batch-request-limit",
 		Usage:    "Maximum number of requests in a batch",
 		Value:    node.DefaultConfig.BatchRequestLimit,
 		Category: flags.APICategory,
 	}
-	BatchResponseMaxSize = &cli.IntFlag{
+	BatchResponseMaxSizeFlag = &cli.IntFlag{
 		Name:     "rpc-batch-response-max-size",
 		Usage:    "Maximum number of bytes returned from a batched call",
 		Value:    node.DefaultConfig.BatchResponseMaxSize,
@@ -622,6 +652,18 @@ var (
 		Name:     "port",
 		Usage:    "Network listening port",
 		Value:    30303,
+		Category: flags.NetworkingCategory,
+	}
+	PeersAllowlistFlag = &cli.StringFlag{
+		Name:     "peers-allowlist",
+		Usage:    "Comma separated NodeID or enode URLs for peer allowlist (only connect to them)",
+		Value:    "",
+		Category: flags.NetworkingCategory,
+	}
+	PeersDenylistFlag = &cli.StringFlag{
+		Name:     "peers-denylist",
+		Usage:    "Comma separated NodeID or enode URLs for peer denylist (will not connect to them)",
+		Value:    "",
 		Category: flags.NetworkingCategory,
 	}
 	BootnodesFlag = &cli.StringFlag{
@@ -664,9 +706,11 @@ var (
 		Category: flags.NetworkingCategory,
 	}
 	DiscoveryV5Flag = &cli.BoolFlag{
-		Name:     "v5disc",
-		Usage:    "Enables the experimental RLPx V5 (Topic Discovery) mechanism",
+		Name:     "discovery-v5",
+		Aliases:  []string{"discv5"},
+		Usage:    "Enables the V5 discovery mechanism",
 		Category: flags.NetworkingCategory,
+		Value:    node.DefaultConfig.P2P.DiscoveryV5,
 	}
 	NetrestrictFlag = &cli.StringFlag{
 		Name:     "netrestrict",
@@ -776,6 +820,13 @@ var (
 		Category: flags.MetricsCategory,
 	}
 
+	MetricsInfluxDBIntervalFlag = &cli.DurationFlag{
+		Name:     "metrics-influxdb-interval",
+		Usage:    "Interval between metrics reports to InfluxDB (with time unit, e.g. 10s)",
+		Value:    metrics.DefaultConfig.InfluxDBInterval,
+		Category: flags.MetricsCategory,
+	}
+
 	MetricsEnableInfluxDBV2Flag = &cli.BoolFlag{
 		Name:     "metrics-influxdbv2",
 		Usage:    "Enable metrics export/push to an external InfluxDB v2 database",
@@ -801,6 +852,11 @@ var (
 	}
 
 	// MISC settings
+	DeleteAllBadBlocksFlag = &cli.BoolFlag{
+		Name:     "delete-all-bad-blocks",
+		Usage:    "Delete all bad blocks in the database",
+		Category: flags.MiscCategory,
+	}
 	SetHeadFlag = &cli.Uint64Flag{
 		Name:     "set-head",
 		Usage:    "Rollback chain to block number",
@@ -821,56 +877,11 @@ var (
 	}
 
 	// XDC settings
-	Enable0xPrefixFlag = &cli.BoolFlag{
-		Name:     "enable-0x-prefix",
-		Usage:    "Addres use 0x-prefix (Deprecated: this is on by default, to use xdc prefix use --enable-xdc-prefix)",
-		Value:    true,
-		Category: flags.XdcCategory,
-	}
 	EnableXDCPrefixFlag = &cli.BoolFlag{
 		Name:     "enable-xdc-prefix",
-		Usage:    "Addres use xdc-prefix (default = false)",
+		Usage:    "Address use xdc-prefix (default = false)",
 		Value:    false,
 		Category: flags.XdcCategory,
-	}
-	XDCSlaveModeFlag = &cli.BoolFlag{
-		Name:     "slave",
-		Usage:    "Enable slave mode",
-		Category: flags.XdcCategory,
-	}
-
-	// XDCX settings
-	XDCXEnabledFlag = &cli.BoolFlag{
-		Name:     "XDCx",
-		Usage:    "Enable the XDCX protocol",
-		Category: flags.XdcxCategory,
-	}
-	XDCXDBEngineFlag = &cli.StringFlag{
-		Name:     "XDCx-dbengine",
-		Aliases:  []string{"XDCx.dbengine"},
-		Usage:    "Database engine for XDCX (leveldb, mongodb)",
-		Value:    "leveldb",
-		Category: flags.XdcxCategory,
-	}
-	XDCXDBNameFlag = &cli.StringFlag{
-		Name:     "XDCx-dbName",
-		Aliases:  []string{"XDCx.dbName"},
-		Usage:    "Database name for XDCX",
-		Value:    "XDCdex",
-		Category: flags.XdcxCategory,
-	}
-	XDCXDBConnectionUrlFlag = &cli.StringFlag{
-		Name:     "XDCx-dbConnectionUrl",
-		Aliases:  []string{"XDCx.dbConnectionUrl"},
-		Usage:    "ConnectionUrl to database if dbEngine is mongodb. Host:port. If there are multiple instances, separated by comma. Eg: localhost:27017,localhost:27018",
-		Value:    "localhost:27017",
-		Category: flags.XdcxCategory,
-	}
-	XDCXDBReplicaSetNameFlag = &cli.StringFlag{
-		Name:     "XDCx-dbReplicaSetName",
-		Aliases:  []string{"XDCx.dbReplicaSetName"},
-		Usage:    "ReplicaSetName if Master-Slave is setup",
-		Category: flags.XdcxCategory,
 	}
 )
 
@@ -937,6 +948,73 @@ func setNodeUserIdent(ctx *cli.Context, cfg *node.Config) {
 	if identity := ctx.String(IdentityFlag.Name); len(identity) > 0 {
 		cfg.UserIdent = identity
 	}
+}
+
+func setAllowlistAndDenylistForPeers(ctx *cli.Context, cfg *p2p.Config) {
+	flags.CheckExclusive(ctx, PeersAllowlistFlag, PeersDenylistFlag)
+
+	// setup allowlist for peers
+	if ctx.IsSet(PeersAllowlistFlag.Name) {
+		urls := SplitAndTrim(ctx.String(PeersAllowlistFlag.Name))
+		cfg.AllowPeers = make(map[discover.NodeID]struct{}, len(urls))
+		for _, url := range urls {
+			if url != "" {
+				node1, err1 := discover.HexID(url)
+				if err1 == nil {
+					cfg.AllowPeers[node1] = struct{}{}
+					log.Info("Add peer to allowlist", "id", node1)
+					continue
+				}
+				node2, err2 := discover.ParseNode(url)
+				if err2 == nil {
+					cfg.AllowPeers[node2.ID] = struct{}{}
+					log.Info("Add peer to allowlist", "enode", url, "id", node2.ID)
+					continue
+				}
+				log.Crit("Invalid peer id for allowlist", "url", url, "err1", err1, "err2", err2)
+			}
+		}
+	}
+
+	// setup denylist for peers
+	if ctx.IsSet(PeersDenylistFlag.Name) {
+		urls := SplitAndTrim(ctx.String(PeersDenylistFlag.Name))
+		cfg.DenyPeers = make(map[discover.NodeID]struct{}, len(urls))
+		for _, url := range urls {
+			if url != "" {
+				node1, err1 := discover.HexID(url)
+				if err1 == nil {
+					cfg.DenyPeers[node1] = struct{}{}
+					log.Info("Add peer to denylist", "id", node1)
+					continue
+				}
+				node2, err2 := discover.ParseNode(url)
+				if err2 == nil {
+					cfg.DenyPeers[node2.ID] = struct{}{}
+					log.Info("Add peer to denylist", "enode", url, "id", node2.ID)
+					continue
+				}
+				log.Crit("Invalid peer id for denylist", "url", url, "err1", err1, "err2", err2)
+			}
+		}
+	}
+}
+
+// removeDenylistedPeers removes bootstrap nodes which is in peers denylist
+func removeDenylistedPeers(cfg *p2p.Config) {
+	if len(cfg.DenyPeers) == 0 {
+		return
+	}
+
+	filteredNodes := make([]*discover.Node, 0, len(cfg.BootstrapNodes))
+	for _, node := range cfg.BootstrapNodes {
+		if _, ok := cfg.DenyPeers[node.ID]; ok {
+			log.Info("Remove denylisted peer", "enode", node, "id", node.ID)
+			continue
+		}
+		filteredNodes = append(filteredNodes, node)
+	}
+	cfg.BootstrapNodes = filteredNodes
 }
 
 // setBootstrapNodes creates a list of bootstrap nodes from the command line
@@ -1088,15 +1166,15 @@ func setHTTP(ctx *cli.Context, cfg *node.Config) {
 		cfg.HTTPTimeouts.IdleTimeout = ctx.Duration(HTTPIdleTimeoutFlag.Name)
 	}
 
-	if ctx.IsSet(AllowUnprotectedTxs.Name) {
-		cfg.AllowUnprotectedTxs = ctx.Bool(AllowUnprotectedTxs.Name)
+	if ctx.IsSet(AllowUnprotectedTxsFlag.Name) {
+		cfg.AllowUnprotectedTxs = ctx.Bool(AllowUnprotectedTxsFlag.Name)
 	}
 
-	if ctx.IsSet(BatchRequestLimit.Name) {
-		cfg.BatchRequestLimit = ctx.Int(BatchRequestLimit.Name)
+	if ctx.IsSet(BatchRequestLimitFlag.Name) {
+		cfg.BatchRequestLimit = ctx.Int(BatchRequestLimitFlag.Name)
 	}
-	if ctx.IsSet(BatchResponseMaxSize.Name) {
-		cfg.BatchResponseMaxSize = ctx.Int(BatchResponseMaxSize.Name)
+	if ctx.IsSet(BatchResponseMaxSizeFlag.Name) {
+		cfg.BatchResponseMaxSize = ctx.Int(BatchResponseMaxSizeFlag.Name)
 	}
 }
 
@@ -1123,7 +1201,7 @@ func setWS(ctx *cli.Context, cfg *node.Config) {
 // setIPC creates an IPC path configuration from the set command line flags,
 // returning an empty string if IPC was explicitly disabled, or the set path.
 func setIPC(ctx *cli.Context, cfg *node.Config) {
-	CheckExclusive(ctx, IPCDisabledFlag, IPCPathFlag)
+	flags.CheckExclusive(ctx, IPCDisabledFlag, IPCPathFlag)
 	switch {
 	case ctx.Bool(IPCDisabledFlag.Name):
 		cfg.IPCPath = ""
@@ -1202,11 +1280,11 @@ func setEtherbase(ctx *cli.Context, ks *keystore.KeyStore, cfg *ethconfig.Config
 		if err != nil {
 			Fatalf("Option %q: %v", MinerEtherbaseFlag.Name, err)
 		}
-		cfg.Etherbase = account.Address
+		cfg.Miner.Etherbase = account.Address
 	} else {
 		if !ctx.IsSet(UnlockedAccountFlag.Name) {
-			cfg.Etherbase = common.HexToAddress(ctx.String(MinerEtherbaseFlag.Name))
-			log.Info("Set etherbase", "address", cfg.Etherbase.Hex())
+			cfg.Miner.Etherbase = common.HexToAddress(ctx.String(MinerEtherbaseFlag.Name))
+			log.Info("Set etherbase", "address", cfg.Miner.Etherbase.Hex())
 		}
 	}
 }
@@ -1234,6 +1312,8 @@ func SetP2PConfig(ctx *cli.Context, cfg *p2p.Config) {
 	setNAT(ctx, cfg)
 	setListenAddress(ctx, cfg)
 	setBootstrapNodes(ctx, cfg)
+	setAllowlistAndDenylistForPeers(ctx, cfg)
+	removeDenylistedPeers(cfg)
 	// setBootstrapNodesV5(ctx, cfg)
 
 	if ctx.IsSet(MaxPeersFlag.Name) {
@@ -1246,11 +1326,13 @@ func SetP2PConfig(ctx *cli.Context, cfg *p2p.Config) {
 		cfg.MaxPendingPeers = ctx.Int(MaxPendingPeersFlag.Name)
 	}
 	if ctx.IsSet(NoDiscoverFlag.Name) {
-		cfg.NoDiscovery = true
+		cfg.NoDiscovery = ctx.Bool(NoDiscoverFlag.Name)
 	}
 
-	CheckExclusive(ctx, DiscoveryV5Flag, NoDiscoverFlag)
-	cfg.DiscoveryV5 = ctx.Bool(DiscoveryV5Flag.Name)
+	flags.CheckExclusive(ctx, DiscoveryV5Flag, NoDiscoverFlag)
+	if ctx.IsSet(DiscoveryV5Flag.Name) {
+		cfg.DiscoveryV5 = ctx.Bool(DiscoveryV5Flag.Name)
+	}
 
 	if netrestrict := ctx.String(NetrestrictFlag.Name); netrestrict != "" {
 		list, err := netutil.ParseNetlist(netrestrict)
@@ -1271,12 +1353,16 @@ func SetP2PConfig(ctx *cli.Context, cfg *p2p.Config) {
 
 // SetNodeConfig applies node-related command line flags to the config.
 func SetNodeConfig(ctx *cli.Context, cfg *node.Config) {
-	CheckExclusive(ctx, Enable0xPrefixFlag, EnableXDCPrefixFlag)
+	if ctx.IsSet(Enable0xPrefixFlag.Name) {
+		log.Warn("The flag enable-0x-prefix is deprecated, please remove this flag")
+		flags.CheckExclusive(ctx, Enable0xPrefixFlag, EnableXDCPrefixFlag)
+	}
 	SetP2PConfig(ctx, &cfg.P2P)
 	setIPC(ctx, cfg)
 	setHTTP(ctx, cfg)
 	setWS(ctx, cfg)
 	setNodeUserIdent(ctx, cfg)
+	SetDataDir(ctx, cfg)
 	setSmartCard(ctx, cfg)
 
 	if ctx.IsSet(JWTSecretFlag.Name) {
@@ -1284,18 +1370,7 @@ func SetNodeConfig(ctx *cli.Context, cfg *node.Config) {
 	}
 
 	if ctx.IsSet(EnablePersonal.Name) {
-		cfg.EnablePersonal = true
-	}
-
-	switch {
-	case ctx.IsSet(DataDirFlag.Name):
-		cfg.DataDir = ctx.String(DataDirFlag.Name)
-	case ctx.Bool(DeveloperFlag.Name):
-		cfg.DataDir = "" // unless explicitly requested, use memory databases
-	case ctx.Bool(TestnetFlag.Name):
-		cfg.DataDir = filepath.Join(node.DefaultDataDir(), "testnet")
-	case ctx.Bool(DevnetFlag.Name):
-		cfg.DataDir = filepath.Join(node.DefaultDataDir(), "devnet")
+		log.Warn(fmt.Sprintf("Option --%s is deprecated. The 'personal' RPC namespace has been removed.", EnablePersonal.Name))
 	}
 
 	if ctx.IsSet(KeyStoreDirFlag.Name) {
@@ -1336,11 +1411,24 @@ func setSmartCard(ctx *cli.Context, cfg *node.Config) {
 		return
 	}
 	if fi.Mode()&os.ModeType != os.ModeSocket {
-		log.Error("Invalid smartcard daemon path", "path", path, "type", fi.Mode().String())
+		log.Error("Invalid smartcard daemon path", "path", path, "type", fi.Mode())
 		return
 	}
 	// Smartcard daemon path exists and is a socket, enable it
 	cfg.SmartCardDaemonPath = path
+}
+
+func SetDataDir(ctx *cli.Context, cfg *node.Config) {
+	switch {
+	case ctx.IsSet(DataDirFlag.Name):
+		cfg.DataDir = ctx.String(DataDirFlag.Name)
+	case ctx.Bool(DeveloperFlag.Name):
+		cfg.DataDir = "" // unless explicitly requested, use memory databases
+	case ctx.Bool(TestnetFlag.Name) && cfg.DataDir == node.DefaultDataDir():
+		cfg.DataDir = filepath.Join(node.DefaultDataDir(), "testnet")
+	case ctx.Bool(DevnetFlag.Name) && cfg.DataDir == node.DefaultDataDir():
+		cfg.DataDir = filepath.Join(node.DefaultDataDir(), "devnet")
+	}
 }
 
 func setGPO(ctx *cli.Context, cfg *gasprice.Config) {
@@ -1358,7 +1446,7 @@ func setGPO(ctx *cli.Context, cfg *gasprice.Config) {
 	}
 }
 
-func setTxPool(ctx *cli.Context, cfg *txpool.Config) {
+func setTxPool(ctx *cli.Context, cfg *legacypool.Config) {
 	if ctx.IsSet(TxPoolNoLocalsFlag.Name) {
 		cfg.NoLocals = ctx.Bool(TxPoolNoLocalsFlag.Name)
 	}
@@ -1391,65 +1479,19 @@ func setTxPool(ctx *cli.Context, cfg *txpool.Config) {
 	}
 }
 
-func setEthash(ctx *cli.Context, cfg *ethconfig.Config) {
-	if ctx.IsSet(EthashCacheDirFlag.Name) {
-		cfg.Ethash.CacheDir = ctx.String(EthashCacheDirFlag.Name)
+func setMiner(ctx *cli.Context, cfg *miner.Config) {
+	if ctx.IsSet(MinerExtraDataFlag.Name) {
+		cfg.ExtraData = []byte(ctx.String(MinerExtraDataFlag.Name))
 	}
-	if ctx.IsSet(EthashDatasetDirFlag.Name) {
-		cfg.Ethash.DatasetDir = ctx.String(EthashDatasetDirFlag.Name)
+	if ctx.IsSet(MinerGasLimitFlag.Name) {
+		cfg.GasCeil = ctx.Uint64(MinerGasLimitFlag.Name)
 	}
-	if ctx.IsSet(EthashCachesInMemoryFlag.Name) {
-		cfg.Ethash.CachesInMem = ctx.Int(EthashCachesInMemoryFlag.Name)
+	if ctx.IsSet(MinerGasPriceFlag.Name) {
+		cfg.GasPrice = flags.GlobalBig(ctx, MinerGasPriceFlag.Name)
 	}
-	if ctx.IsSet(EthashCachesOnDiskFlag.Name) {
-		cfg.Ethash.CachesOnDisk = ctx.Int(EthashCachesOnDiskFlag.Name)
-	}
-	if ctx.IsSet(EthashDatasetsInMemoryFlag.Name) {
-		cfg.Ethash.DatasetsInMem = ctx.Int(EthashDatasetsInMemoryFlag.Name)
-	}
-	if ctx.IsSet(EthashDatasetsOnDiskFlag.Name) {
-		cfg.Ethash.DatasetsOnDisk = ctx.Int(EthashDatasetsOnDiskFlag.Name)
-	}
-}
-
-// CheckExclusive verifies that only a single isntance of the provided flags was
-// set by the user. Each flag might optionally be followed by a string type to
-// specialize it further.
-func CheckExclusive(ctx *cli.Context, args ...interface{}) {
-	set := make([]string, 0, 1)
-	for i := 0; i < len(args); i++ {
-		// Make sure the next argument is a flag and skip if not set
-		flag, ok := args[i].(cli.Flag)
-		if !ok {
-			panic(fmt.Sprintf("invalid argument, not cli.Flag type: %T", args[i]))
-		}
-		// Check if next arg extends current and expand its name if so
-		name := flag.Names()[0]
-
-		if i+1 < len(args) {
-			switch option := args[i+1].(type) {
-			case string:
-				// Extended flag check, make sure value set doesn't conflict with passed in option
-				if ctx.String(flag.Names()[0]) == option {
-					name += "=" + option
-					set = append(set, "--"+name)
-				}
-				// shift arguments and continue
-				i++
-				continue
-
-			case cli.Flag:
-			default:
-				panic(fmt.Sprintf("invalid argument, not cli.Flag or string extension: %T", args[i+1]))
-			}
-		}
-		// Mark the flag if it's set
-		if ctx.IsSet(flag.Names()[0]) {
-			set = append(set, "--"+name)
-		}
-	}
-	if len(set) > 1 {
-		Fatalf("Flags %v can't be used at the same time", strings.Join(set, ", "))
+	if cfg.GasCeil == 0 {
+		log.Warn("Sanitizing invalid miner gas limit", "provided", cfg.GasCeil, "updated", ethconfig.Defaults.Miner.GasCeil)
+		cfg.GasCeil = ethconfig.Defaults.Miner.GasCeil
 	}
 }
 
@@ -1457,40 +1499,27 @@ func SetXDCXConfig(ctx *cli.Context, cfg *XDCx.Config, XDCDataDir string) {
 	if ctx.IsSet(XDCXDataDirFlag.Name) {
 		log.Warn("The flag XDCx-datadir or XDCx.datadir is deprecated, please remove this flag")
 	}
+	if ctx.IsSet(XDCXDBNameFlag.Name) {
+		log.Warn("The flag XDCx-dbName or XDCx.dbName is deprecated, please remove this flag")
+	}
 	// XDCx datadir: XDCDataDir/XDCx
 	cfg.DataDir = filepath.Join(XDCDataDir, "XDCx")
-	log.Info("XDCX datadir", "path", cfg.DataDir)
-	if ctx.IsSet(XDCXDBEngineFlag.Name) {
-		cfg.DBEngine = ctx.String(XDCXDBEngineFlag.Name)
-	} else {
-		cfg.DBEngine = XDCXDBEngineFlag.Value
-	}
-	if ctx.IsSet(XDCXDBNameFlag.Name) {
-		cfg.DBName = ctx.String(XDCXDBNameFlag.Name)
-	} else {
-		cfg.DBName = XDCXDBNameFlag.Value
-	}
-	if ctx.IsSet(XDCXDBConnectionUrlFlag.Name) {
-		cfg.ConnectionUrl = ctx.String(XDCXDBConnectionUrlFlag.Name)
-	} else {
-		cfg.ConnectionUrl = XDCXDBConnectionUrlFlag.Value
-	}
-	if ctx.IsSet(XDCXDBReplicaSetNameFlag.Name) {
-		cfg.ReplicaSetName = ctx.String(XDCXDBReplicaSetNameFlag.Name)
-	}
+	cfg.DBName = "XDCdex"
+	log.Info("Set XDCX config", "DataDir", cfg.DataDir, "DBName", cfg.DBName)
 }
 
 // SetEthConfig applies eth-related command line flags to the config.
 func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 	// Avoid conflicting network flags
-	CheckExclusive(ctx, MainnetFlag, TestnetFlag, DevnetFlag, DeveloperFlag)
+	flags.CheckExclusive(ctx, MainnetFlag, TestnetFlag, DevnetFlag, DeveloperFlag)
 
 	ks := stack.AccountManager().Backends(keystore.KeyStoreType)[0].(*keystore.KeyStore)
 	setEtherbase(ctx, ks, cfg)
 	setGPO(ctx, &cfg.GPO)
 	setTxPool(ctx, &cfg.TxPool)
-	setEthash(ctx, cfg)
+	setMiner(ctx, &cfg.Miner)
 	setLes(ctx, cfg)
+	cfg.AllowBuiltInCustomRecovery = ctx.Bool(AllowBuiltInConfigOverrideFlag.Name)
 
 	// Cap the cache allowance and tune the garbage collector
 	mem, err := gopsutil.VirtualMemory()
@@ -1507,7 +1536,7 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 	}
 	// Ensure Go's GC ignores the database cache for trigger percentage
 	cache := ctx.Int(CacheFlag.Name)
-	gogc := math.Max(20, math.Min(100, 100/(float64(cache)/1024)))
+	gogc := max(20, min(100, 100/(float64(cache)/1024)))
 
 	log.Debug("Sanitizing Go's GC trigger", "percent", int(gogc))
 	godebug.SetGCPercent(int(gogc))
@@ -1515,6 +1544,37 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 	if ctx.IsSet(SyncModeFlag.Name) {
 		if err = cfg.SyncMode.UnmarshalText([]byte(ctx.String(SyncModeFlag.Name))); err != nil {
 			Fatalf("invalid --syncmode flag: %v", err)
+		}
+	}
+	pivotNumberSet := ctx.IsSet(FastSyncPivotNumberFlag.Name)
+	pivotHashSet := ctx.IsSet(FastSyncPivotHashFlag.Name)
+	pivotRootSet := ctx.IsSet(FastSyncPivotRootFlag.Name)
+	pivotHash := ctx.String(FastSyncPivotHashFlag.Name)
+	pivotRoot := ctx.String(FastSyncPivotRootFlag.Name)
+
+	if pivotNumberSet {
+		if !pivotHashSet || pivotHash == "" {
+			Fatalf("--%s must be set if --%s is set", FastSyncPivotHashFlag.Name, FastSyncPivotNumberFlag.Name)
+		}
+		if !pivotRootSet || pivotRoot == "" {
+			Fatalf("--%s must be set if --%s is set", FastSyncPivotRootFlag.Name, FastSyncPivotNumberFlag.Name)
+		}
+		cfg.FastSyncPivotNumber = ctx.Uint64(FastSyncPivotNumberFlag.Name)
+		if cfg.FastSyncPivotNumber == 0 {
+			Fatalf("--%s must be greater than 0 when explicitly set", FastSyncPivotNumberFlag.Name)
+		}
+		if err = cfg.FastSyncPivotHash.UnmarshalText([]byte(pivotHash)); err != nil {
+			Fatalf("invalid --%s flag: %v", FastSyncPivotHashFlag.Name, err)
+		}
+		if err = cfg.FastSyncPivotRoot.UnmarshalText([]byte(pivotRoot)); err != nil {
+			Fatalf("invalid --%s flag: %v", FastSyncPivotRootFlag.Name, err)
+		}
+	} else {
+		if pivotHashSet {
+			Fatalf("--%s must not be set without --%s", FastSyncPivotHashFlag.Name, FastSyncPivotNumberFlag.Name)
+		}
+		if pivotRootSet {
+			Fatalf("--%s must not be set without --%s", FastSyncPivotRootFlag.Name, FastSyncPivotNumberFlag.Name)
 		}
 	}
 
@@ -1527,9 +1587,10 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 		Fatalf("--%s must be either 'full' or 'archive'", GCModeFlag.Name)
 	}
 	cfg.NoPruning = ctx.String(GCModeFlag.Name) == "archive"
-	cfg.NoPrefetch = !ctx.Bool(CachePrefetchFlag.Name)
-	// Read the value from the flag no matter if it's set or not.
-	cfg.Preimages = ctx.Bool(CachePreimagesFlag.Name)
+	cfg.Prefetch = ctx.Bool(CachePrefetchFlag.Name)
+	if ctx.IsSet(CachePreimagesFlag.Name) {
+		cfg.Preimages = ctx.Bool(CachePreimagesFlag.Name)
+	}
 	if cfg.NoPruning && !cfg.Preimages {
 		cfg.Preimages = true
 		log.Info("Enabling recording of key preimages since archive mode is used")
@@ -1540,24 +1601,23 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 	if ctx.IsSet(CacheFlag.Name) || ctx.IsSet(CacheGCFlag.Name) {
 		cfg.TrieDirtyCache = ctx.Int(CacheFlag.Name) * ctx.Int(CacheGCFlag.Name) / 100
 	}
-	if ctx.IsSet(MinerThreadsFlag.Name) {
-		cfg.MinerThreads = ctx.Int(MinerThreadsFlag.Name)
+	if ctx.IsSet(RPCGlobalGasCapFlag.Name) {
+		cfg.RPCGasCap = ctx.Uint64(RPCGlobalGasCapFlag.Name)
+	}
+	if ctx.IsSet(RPCGlobalTxFeeCapFlag.Name) {
+		cfg.RPCTxFeeCap = ctx.Float64(RPCGlobalTxFeeCapFlag.Name)
 	}
 	if ctx.IsSet(RPCGlobalGasCapFlag.Name) {
 		cfg.RPCGasCap = ctx.Uint64(RPCGlobalGasCapFlag.Name)
 	}
-	if ctx.IsSet(RPCGlobalTxFeeCap.Name) {
-		cfg.RPCTxFeeCap = ctx.Float64(RPCGlobalTxFeeCap.Name)
+	if ctx.IsSet(RPCGlobalRangeLimitFlag.Name) {
+		cfg.RangeLimit = ctx.Uint64(RPCGlobalRangeLimitFlag.Name)
 	}
-	if ctx.IsSet(RPCGlobalGasCapFlag.Name) {
-		cfg.RPCGasCap = ctx.Uint64(RPCGlobalGasCapFlag.Name)
-	}
-	if ctx.IsSet(MinerExtraDataFlag.Name) {
-		cfg.ExtraData = []byte(ctx.String(MinerExtraDataFlag.Name))
-	}
-	cfg.GasPrice = flags.GlobalBig(ctx, MinerGasPriceFlag.Name)
 	if ctx.IsSet(CacheLogSizeFlag.Name) {
 		cfg.FilterLogCacheSize = ctx.Int(CacheLogSizeFlag.Name)
+	}
+	if ctx.IsSet(RPCGlobalLogQueryLimit.Name) {
+		cfg.LogQueryLimit = ctx.Int(RPCGlobalLogQueryLimit.Name)
 	}
 	if ctx.IsSet(VMEnableDebugFlag.Name) {
 		// TODO(fjl): force-enable this in --dev mode
@@ -1568,11 +1628,17 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 	} else {
 		log.Info("Global gas cap disabled")
 	}
+	if ctx.IsSet(RPCGlobalEVMTimeoutFlag.Name) {
+		cfg.RPCEVMTimeout = ctx.Duration(RPCGlobalEVMTimeoutFlag.Name)
+	}
 	if ctx.IsSet(StoreRewardFlag.Name) {
 		common.StoreRewardFolder = filepath.Join(stack.DataDir(), "XDC", "rewards")
-		if _, err := os.Stat(common.StoreRewardFolder); os.IsNotExist(err) {
+		if !common.FileExist(common.StoreRewardFolder) {
 			os.Mkdir(common.StoreRewardFolder, os.ModePerm)
 		}
+	}
+	if ctx.Bool(DeleteAllBadBlocksFlag.Name) {
+		cfg.DeleteAllBadBlocks = true
 	}
 	if ctx.IsSet(SetHeadFlag.Name) {
 		common.RollbackNumber = ctx.Uint64(SetHeadFlag.Name)
@@ -1585,18 +1651,17 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 	switch {
 	case ctx.Bool(MainnetFlag.Name):
 		if !ctx.IsSet(NetworkIdFlag.Name) {
-			cfg.NetworkId = 50
+			cfg.NetworkId = params.XDCMainnetChainConfig.ChainID.Uint64() // 50
 		}
 		cfg.Genesis = core.DefaultGenesisBlock()
 	case ctx.Bool(TestnetFlag.Name):
-		common.IsTestnet = true
 		if !ctx.IsSet(NetworkIdFlag.Name) {
-			cfg.NetworkId = 51
+			cfg.NetworkId = params.TestnetChainConfig.ChainID.Uint64() // 51
 		}
 		cfg.Genesis = core.DefaultTestnetGenesisBlock()
 	case ctx.Bool(DevnetFlag.Name):
 		if !ctx.IsSet(NetworkIdFlag.Name) {
-			cfg.NetworkId = 551
+			cfg.NetworkId = params.DevnetChainConfig.ChainID.Uint64() // 5551
 		}
 		cfg.Genesis = core.DefaultDevnetGenesisBlock()
 	case ctx.Bool(DeveloperFlag.Name):
@@ -1620,7 +1685,15 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 
 		cfg.Genesis = core.DeveloperGenesisBlock(uint64(ctx.Int(DeveloperPeriodFlag.Name)), developer.Address)
 		if !ctx.IsSet(MinerGasPriceFlag.Name) {
-			cfg.GasPrice = big.NewInt(1)
+			cfg.Miner.GasPrice = big.NewInt(1)
+		}
+	}
+
+	// VM tracing config.
+	if ctx.IsSet(VMTraceFlag.Name) {
+		if name := ctx.String(VMTraceFlag.Name); name != "" {
+			cfg.VMTrace = name
+			cfg.VMTraceJsonConfig = ctx.String(VMTraceJsonConfigFlag.Name)
 		}
 	}
 }
@@ -1630,14 +1703,13 @@ func RegisterEthService(stack *node.Node, cfg *ethconfig.Config, XDCXServ *XDCx.
 	if cfg.SyncMode == downloader.LightSync {
 		Fatalf("can't register eth service in light sync mode, light mode has been deprecated")
 		return nil, nil
-	} else {
-		backend, err := eth.New(stack, cfg, XDCXServ, lendingServ)
-		if err != nil {
-			Fatalf("Failed to register the Ethereum service: %v", err)
-		}
-
-		return backend.ApiBackend, backend
 	}
+	backend, err := eth.New(stack, cfg, XDCXServ, lendingServ)
+	if err != nil {
+		Fatalf("Failed to register the Ethereum service: %s", FormatChainConfigError(err))
+	}
+	stack.RegisterAPIs(tracers.APIs(backend.APIBackend))
+	return backend.APIBackend, backend
 }
 
 // RegisterEthStatsService configures the Ethereum Stats daemon and adds it to the node.
@@ -1659,12 +1731,11 @@ func SetNetworkFlagById(ctx *cli.Context, cfg *ethconfig.Config) {
 	if ctx.IsSet(NetworkIdFlag.Name) {
 		cfg.NetworkId = ctx.Uint64(NetworkIdFlag.Name)
 		switch cfg.NetworkId {
-		case 50:
+		case params.XDCMainnetChainConfig.ChainID.Uint64(): // 50
 			ctx.Set(MainnetFlag.Name, "true")
-		case 51:
-			common.IsTestnet = true
+		case params.TestnetChainConfig.ChainID.Uint64(): // 51
 			ctx.Set(TestnetFlag.Name, "true")
-		case 551:
+		case params.DevnetChainConfig.ChainID.Uint64(): // 5551
 			ctx.Set(DevnetFlag.Name, "true")
 		}
 	}
@@ -1696,14 +1767,17 @@ func SetupMetrics(cfg *metrics.Config) {
 		bucket       = cfg.InfluxDBBucket
 		organization = cfg.InfluxDBOrganization
 		tagsMap      = SplitTagsFlag(cfg.InfluxDBTags)
+		interval     = cfg.InfluxDBInterval
 	)
+	if (enableExport || enableExportV2) && interval <= 0 {
+		Fatalf("Invalid InfluxDB metrics interval %v, must be > 0", interval)
+	}
 	if enableExport {
-		log.Info("Enabling metrics export to InfluxDB")
-		go influxdb.InfluxDBWithTags(metrics.DefaultRegistry, 10*time.Second, endpoint, database, username, password, "geth.", tagsMap)
+		log.Info("Enabling metrics export to InfluxDB", "interval", interval)
+		go influxdb.InfluxDBWithTags(metrics.DefaultRegistry, interval, endpoint, database, username, password, "geth.", tagsMap)
 	} else if enableExportV2 {
-		tagsMap := SplitTagsFlag(cfg.InfluxDBTags)
-		log.Info("Enabling metrics export to InfluxDB (v2)")
-		go influxdb.InfluxDBV2WithTags(metrics.DefaultRegistry, 10*time.Second, endpoint, token, bucket, organization, "geth.", tagsMap)
+		log.Info("Enabling metrics export to InfluxDB (v2)", "interval", interval)
+		go influxdb.InfluxDBV2WithTags(metrics.DefaultRegistry, interval, endpoint, token, bucket, organization, "geth.", tagsMap)
 	}
 
 	// Expvar exporter.
@@ -1765,42 +1839,75 @@ func MakeGenesis(ctx *cli.Context) *core.Genesis {
 	return genesis
 }
 
-// MakeChain creates a chain manager from set command line flags.
-func MakeChain(ctx *cli.Context, stack *node.Node, readonly bool) (chain *core.BlockChain, chainDb ethdb.Database) {
-	var err error
-	chainDb = MakeChainDatabase(ctx, stack, readonly)
+// formatBlockChainOpenError rewrites readonly startup failures into operator-
+// facing remediation messages so config rewind and state-repair requirements
+// remain actionable without exposing internal startup details.
+func formatBlockChainOpenError(err error, readonly bool) string {
+	if errors.Is(err, core.ErrGenesisAllocUnavailable) {
+		return "Can't create BlockChain: " + core.GenesisAllocUnavailableRecoveryMessage
+	}
+	if !readonly {
+		return fmt.Sprintf("Can't create BlockChain: %v", err)
+	}
+	switch {
+	case errors.Is(err, core.ErrReadOnlyGenesisStateRecovery):
+		return "Can't open blockchain in readonly mode: genesis state is missing and requires recovery. Reopen the database in writable mode to recover the missing genesis state, then retry."
+	case errors.Is(err, core.ErrReadOnlyHeadStateRepair):
+		return "Can't open blockchain in readonly mode: head state is missing and requires repair. Reopen the database in writable mode to repair the missing head state, then retry."
+	case errors.Is(err, core.ErrReadOnlyBadHashRewind):
+		return "Can't open blockchain in readonly mode: the local chain contains a denylisted hash and requires rewind. Reopen the database in writable mode so the chain can rewind past the denylisted hash, then retry."
+	case errors.Is(err, core.ErrReadOnlyConfigRewind):
+		return "Can't open blockchain in readonly mode: the local chain configuration requires rewind. Use the correct --networkid/--datadir combination, or reopen the database in writable mode so the chain can rewind, then retry."
+	default:
+		return fmt.Sprintf("Can't create BlockChain: %v", err)
+	}
+}
 
-	config, _, err := core.SetupGenesisBlock(chainDb, MakeGenesis(ctx))
-	if err != nil {
-		Fatalf("%v", err)
+var makeChainFatalf = Fatalf
+
+// MakeChain creates a chain manager from set command line flags.
+func MakeChain(ctx *cli.Context, stack *node.Node, readonly bool) (*core.BlockChain, ethdb.Database) {
+	var (
+		gspec     = MakeGenesis(ctx)
+		chainDb   = MakeChainDatabase(ctx, stack, readonly)
+		config    *params.ChainConfig
+		ghash     common.Hash
+		compatErr *params.ConfigCompatError
+		err       error
+	)
+	if readonly {
+		// Readonly startup still needs compatibility metadata so chain open can
+		// surface ErrReadOnlyConfigRewind instead of collapsing rewindable config
+		// drift into a generic config conflict.
+		config, ghash, compatErr, err = core.LoadChainConfigWithCompatWithOverride(chainDb, gspec, ctx.Bool(AllowBuiltInConfigOverrideFlag.Name))
+		if err != nil {
+			makeChainFatalf("%v", err)
+		}
+	} else {
+		config, ghash, compatErr, err = core.SetupGenesisBlockWithOverride(chainDb, gspec, ctx.Bool(AllowBuiltInConfigOverrideFlag.Name))
+		if err != nil {
+			makeChainFatalf("%v", err)
+		}
 	}
 	var engine consensus.Engine
 	if config.XDPoS != nil {
-		engine = XDPoS.New(config, chainDb)
-	} else {
-		engine = ethash.NewFaker()
-		if !ctx.Bool(FakePoWFlag.Name) {
-			engine = ethash.New(ethash.Config{
-				CacheDir:       stack.ResolvePath(ethconfig.Defaults.Ethash.CacheDir),
-				CachesInMem:    ethconfig.Defaults.Ethash.CachesInMem,
-				CachesOnDisk:   ethconfig.Defaults.Ethash.CachesOnDisk,
-				DatasetDir:     stack.ResolvePath(ethconfig.Defaults.Ethash.DatasetDir),
-				DatasetsInMem:  ethconfig.Defaults.Ethash.DatasetsInMem,
-				DatasetsOnDisk: ethconfig.Defaults.Ethash.DatasetsOnDisk,
-			})
+		engine, err = XDPoS.New(config, chainDb)
+		if err != nil {
+			makeChainFatalf("%s", FormatChainConfigError(err))
 		}
-		Fatalf("Only support XDPoS consensus")
+	} else {
+		makeChainFatalf("Only support XDPoS consensus")
 	}
 	if gcmode := ctx.String(GCModeFlag.Name); gcmode != "full" && gcmode != "archive" {
-		Fatalf("--%s must be either 'full' or 'archive'", GCModeFlag.Name)
+		makeChainFatalf("--%s must be either 'full' or 'archive'", GCModeFlag.Name)
 	}
 	cache := &core.CacheConfig{
-		TrieCleanLimit:      ethconfig.Defaults.TrieCleanCache,
-		TrieCleanNoPrefetch: !ctx.Bool(CachePrefetchFlag.Name),
-		TrieDirtyLimit:      ethconfig.Defaults.TrieDirtyCache,
-		TrieDirtyDisabled:   ctx.String(GCModeFlag.Name) == "archive",
-		TrieTimeLimit:       ethconfig.Defaults.TrieTimeout,
-		Preimages:           ctx.Bool(CachePreimagesFlag.Name),
+		TrieCleanLimit:    ethconfig.Defaults.TrieCleanCache,
+		TrieCleanPrefetch: ctx.Bool(CachePrefetchFlag.Name),
+		TrieDirtyLimit:    ethconfig.Defaults.TrieDirtyCache,
+		TrieDirtyDisabled: ctx.String(GCModeFlag.Name) == "archive",
+		TrieTimeLimit:     ethconfig.Defaults.TrieTimeout,
+		Preimages:         ctx.Bool(CachePreimagesFlag.Name),
 	}
 	if cache.TrieDirtyDisabled && !cache.Preimages {
 		cache.Preimages = true
@@ -1813,10 +1920,27 @@ func MakeChain(ctx *cli.Context, stack *node.Node, readonly bool) (chain *core.B
 		cache.TrieCleanLimit = ctx.Int(CacheFlag.Name) * ctx.Int(CacheGCFlag.Name) / 100
 	}
 	vmcfg := vm.Config{EnablePreimageRecording: ctx.Bool(VMEnableDebugFlag.Name)}
-	chain, err = core.NewBlockChain(chainDb, cache, config, engine, vmcfg)
-	if err != nil {
-		Fatalf("Can't create BlockChain: %v", err)
+	if ctx.IsSet(VMTraceFlag.Name) {
+		if name := ctx.String(VMTraceFlag.Name); name != "" {
+			config := json.RawMessage(ctx.String(VMTraceJsonConfigFlag.Name))
+			t, err := tracers.LiveDirectory.New(name, config)
+			if err != nil {
+				makeChainFatalf("Failed to create tracer %q: %v", name, err)
+			}
+			vmcfg.Tracer = t
+		}
 	}
+	// Disable transaction indexing/unindexing by default.
+	var chain *core.BlockChain
+	if readonly {
+		chain, err = core.NewBlockChainReadOnlyResolved(chainDb, cache, gspec, engine, vmcfg, config, ghash, compatErr)
+	} else {
+		chain, err = core.NewBlockChainResolved(chainDb, cache, gspec, engine, vmcfg, config, ghash, compatErr)
+	}
+	if err != nil {
+		makeChainFatalf("%s", formatBlockChainOpenError(err, readonly))
+	}
+
 	return chain, chainDb
 }
 
@@ -1831,7 +1955,7 @@ func MakeConsolePreloads(ctx *cli.Context) []string {
 	preloads := []string{}
 
 	assets := ctx.String(JSpathFlag.Name)
-	for _, file := range strings.Split(ctx.String(PreloadJSFlag.Name), ",") {
+	for file := range strings.SplitSeq(ctx.String(PreloadJSFlag.Name), ",") {
 		preloads = append(preloads, common.AbsolutePath(assets, strings.TrimSpace(file)))
 	}
 	return preloads
@@ -1863,7 +1987,9 @@ func WalkMatch(root, pattern string) ([]string, error) {
 // RegisterFilterAPI adds the eth log filtering RPC API to the node.
 func RegisterFilterAPI(stack *node.Node, backend ethapi.Backend, ethcfg *ethconfig.Config) *filters.FilterSystem {
 	filterSystem := filters.NewFilterSystem(backend, filters.Config{
-		LogCacheSize: ethcfg.FilterLogCacheSize,
+		LogCacheSize:  ethcfg.FilterLogCacheSize,
+		LogQueryLimit: ethcfg.LogQueryLimit,
+		RangeLimit:    ethcfg.RangeLimit,
 	})
 	stack.RegisterAPIs([]rpc.API{{
 		Namespace: "eth",

@@ -19,19 +19,29 @@ import (
 	"bytes"
 	"context"
 	"crypto/ecdsa"
+	"encoding/json"
+	"errors"
 	"math/big"
 	"math/rand"
 	"testing"
-	"time"
 
+	"github.com/XinFinOrg/XDPoSChain/accounts"
 	"github.com/XinFinOrg/XDPoSChain/accounts/abi/bind"
 	"github.com/XinFinOrg/XDPoSChain/accounts/abi/bind/backends"
+	"github.com/XinFinOrg/XDPoSChain/accounts/keystore"
 	"github.com/XinFinOrg/XDPoSChain/common"
+	"github.com/XinFinOrg/XDPoSChain/consensus/XDPoS"
 	"github.com/XinFinOrg/XDPoSChain/consensus/XDPoS/utils"
 	"github.com/XinFinOrg/XDPoSChain/contracts/blocksigner"
+	"github.com/XinFinOrg/XDPoSChain/core"
+	"github.com/XinFinOrg/XDPoSChain/core/rawdb"
+	"github.com/XinFinOrg/XDPoSChain/core/state"
+	"github.com/XinFinOrg/XDPoSChain/core/txpool"
 	"github.com/XinFinOrg/XDPoSChain/core/types"
 	"github.com/XinFinOrg/XDPoSChain/crypto"
+	"github.com/XinFinOrg/XDPoSChain/event"
 	"github.com/XinFinOrg/XDPoSChain/params"
+	"github.com/XinFinOrg/XDPoSChain/trie"
 )
 
 var (
@@ -46,21 +56,104 @@ var (
 )
 
 func getCommonBackend() *backends.SimulatedBackend {
-	genesis := types.GenesisAlloc{acc1Addr: {Balance: big.NewInt(1000000000000)}}
-	backend := backends.NewXDCSimulatedBackend(genesis, 10000000, params.TestXDPoSMockChainConfig)
+	legacyConfig := *params.TestXDPoSMockChainConfig
+	futureForkBlock := big.NewInt(1_000_000_000)
+	legacyConfig.TIPSigningBlock = new(big.Int).Set(futureForkBlock)
+	legacyConfig.TIPRandomizeBlock = new(big.Int).Set(futureForkBlock)
+	legacyConfig.TIPIncreaseMasternodesBlock = new(big.Int).Set(futureForkBlock)
+	legacyConfig.DenylistBlock = new(big.Int).Set(futureForkBlock)
+	legacyConfig.TIPNoHalvingMNRewardBlock = new(big.Int).Set(futureForkBlock)
+	legacyConfig.TIPXDCXBlock = new(big.Int).Set(futureForkBlock)
+	legacyConfig.TIPXDCXLendingBlock = new(big.Int).Set(futureForkBlock)
+	legacyConfig.TIPXDCXCancellationFeeBlock = new(big.Int).Set(futureForkBlock)
+	legacyConfig.TIPTRC21FeeBlock = new(big.Int).Set(futureForkBlock)
+	legacyConfig.Gas50xBlock = new(big.Int).Set(futureForkBlock)
+	legacyConfig.BerlinBlock = new(big.Int).Set(futureForkBlock)
+	legacyConfig.LondonBlock = new(big.Int).Set(futureForkBlock)
+	legacyConfig.MergeBlock = new(big.Int).Set(futureForkBlock)
+	legacyConfig.ShanghaiBlock = new(big.Int).Set(futureForkBlock)
+	legacyConfig.TIPXDCXMinerDisableBlock = new(big.Int).Set(futureForkBlock)
+	legacyConfig.TIPXDCXReceiverDisableBlock = new(big.Int).Set(futureForkBlock)
+	legacyConfig.EIP1559Block = new(big.Int).Set(futureForkBlock)
+	legacyConfig.CancunBlock = new(big.Int).Set(futureForkBlock)
+	legacyConfig.PragueBlock = new(big.Int).Set(futureForkBlock)
+	legacyConfig.OsakaBlock = new(big.Int).Set(futureForkBlock)
+	legacyConfig.DynamicGasLimitBlock = new(big.Int).Set(futureForkBlock)
+	legacyConfig.TIPUpgradeRewardBlock = new(big.Int).Set(futureForkBlock)
+	legacyConfig.TIPUpgradePenaltyBlock = new(big.Int).Set(futureForkBlock)
+	legacyConfig.TIPEpochHalvingBlock = new(big.Int).Set(futureForkBlock)
+
+	blob, err := json.Marshal(&legacyConfig)
+	if err != nil {
+		panic(err)
+	}
+	if err := json.Unmarshal(blob, &legacyConfig); err != nil {
+		panic(err)
+	}
+
+	genesis := types.GenesisAlloc{acc1Addr: {Balance: big.NewInt(1000000000000000000)}}
+	backend := backends.NewXDCSimulatedBackend(genesis, 10000000, &legacyConfig)
 	backend.Commit()
 
 	return backend
 }
 
+type rewardReplayChain struct {
+	config  *params.ChainConfig
+	current *types.Header
+	headers map[uint64]*types.Header
+	blocks  map[uint64]*types.Block
+}
+
+func (c *rewardReplayChain) Config() *params.ChainConfig {
+	return c.config
+}
+
+func (c *rewardReplayChain) CurrentHeader() *types.Header {
+	return c.current
+}
+
+func (c *rewardReplayChain) GetHeader(hash common.Hash, number uint64) *types.Header {
+	header := c.headers[number]
+	if header == nil || header.Hash() != hash {
+		return nil
+	}
+	return header
+}
+
+func (c *rewardReplayChain) GetHeaderByNumber(number uint64) *types.Header {
+	return c.headers[number]
+}
+
+func (c *rewardReplayChain) GetHeaderByHash(hash common.Hash) *types.Header {
+	for _, header := range c.headers {
+		if header.Hash() == hash {
+			return header
+		}
+	}
+	return nil
+}
+
+func (c *rewardReplayChain) GetBlock(hash common.Hash, number uint64) *types.Block {
+	block := c.blocks[number]
+	if block == nil || block.Hash() != hash {
+		return nil
+	}
+	return block
+}
+
+// TestSendTxSign tests send tx sign.
 func TestSendTxSign(t *testing.T) {
 	accounts := []common.Address{acc2Addr, acc3Addr, acc4Addr}
 	keys := []*ecdsa.PrivateKey{acc2Key, acc3Key, acc4Key}
 	backend := getCommonBackend()
-	signer := types.HomesteadSigner{}
+	signer := types.LatestSigner(backend.BlockChain().Config())
 	ctx := context.Background()
 
-	transactOpts := bind.NewKeyedTransactor(acc1Key)
+	transactOpts, err := bind.NewKeyedTransactorWithChainID(acc1Key, backend.BlockChain().Config().ChainID)
+	if err != nil {
+		t.Fatalf("can't create transactor: %v", err)
+	}
 	blockSignerAddr, blockSigner, err := blocksigner.DeployBlockSigner(transactOpts, backend, big.NewInt(99))
 	if err != nil {
 		t.Fatalf("Can't get block signer: %v", err)
@@ -70,7 +163,7 @@ func TestSendTxSign(t *testing.T) {
 	nonces := make(map[*ecdsa.PrivateKey]int)
 	oldBlocks := make(map[common.Hash]common.Address)
 
-	signTx := func(ctx context.Context, backend *backends.SimulatedBackend, signer types.HomesteadSigner, nonces map[*ecdsa.PrivateKey]int, accKey *ecdsa.PrivateKey, blockNumber *big.Int, blockHash common.Hash) *types.Transaction {
+	signTx := func(ctx context.Context, backend *backends.SimulatedBackend, signer types.Signer, nonces map[*ecdsa.PrivateKey]int, accKey *ecdsa.PrivateKey, blockNumber *big.Int, blockHash common.Hash) *types.Transaction {
 		tx, _ := types.SignTx(CreateTxSign(blockNumber, blockHash, uint64(nonces[accKey]), blockSignerAddr), signer, accKey)
 		backend.SendTransaction(ctx, tx)
 		backend.Commit()
@@ -107,7 +200,7 @@ func TestSendTxSign(t *testing.T) {
 		}
 
 		if signers[0] != oldBlocks[blockHash] {
-			t.Errorf("Tx sign for block signer not match %v - %v", signers[0].String(), oldBlocks[blockHash].String())
+			t.Errorf("Tx sign for block signer not match %v - %v", signers[0], oldBlocks[blockHash])
 		}
 
 		if len(signers) != len(keys) {
@@ -116,12 +209,123 @@ func TestSendTxSign(t *testing.T) {
 	}
 }
 
+// TestGetRewardForCheckpointReplaysSigningTxsFromRawReceipts tests get reward for checkpoint replays signing txs from raw receipts.
+func TestGetRewardForCheckpointReplaysSigningTxsFromRawReceipts(t *testing.T) {
+	database := rawdb.NewMemoryDatabase()
+	config := params.TestXDPoSMockChainConfig
+	engine, err := XDPoS.New(config, database)
+	if err != nil {
+		t.Fatalf("failed to create XDPoS engine: %v", err)
+	}
+
+	checkpointExtra := append(bytes.Repeat([]byte{0x00}, utils.ExtraVanity), acc1Addr.Bytes()...)
+	checkpointExtra = append(checkpointExtra, make([]byte, utils.ExtraSeal)...)
+
+	checkpointHeader := types.NewBlock(&types.Header{
+		Number: big.NewInt(14),
+		Extra:  checkpointExtra,
+	}, nil, nil, trie.NewStackTrie(nil))
+	block15 := types.NewBlock(&types.Header{
+		Number:     big.NewInt(15),
+		ParentHash: checkpointHeader.Hash(),
+	}, nil, nil, trie.NewStackTrie(nil))
+	block16 := types.NewBlock(&types.Header{
+		Number:     big.NewInt(16),
+		ParentHash: block15.Hash(),
+	}, nil, nil, trie.NewStackTrie(nil))
+
+	signer := types.MakeSigner(config, big.NewInt(17))
+	signingTx, err := types.SignTx(CreateTxSign(big.NewInt(15), block15.Hash(), 0, common.BlockSignersBinary), signer, acc1Key)
+	if err != nil {
+		t.Fatalf("failed to sign replay tx: %v", err)
+	}
+	receipts := []*types.Receipt{{
+		Status:            types.ReceiptStatusSuccessful,
+		CumulativeGasUsed: 200000,
+		TxHash:            signingTx.Hash(),
+	}}
+	replayBlock := types.NewBlock(&types.Header{
+		Number:     big.NewInt(17),
+		ParentHash: block16.Hash(),
+	}, &types.Body{Transactions: []*types.Transaction{signingTx}}, receipts, trie.NewStackTrie(nil))
+	rawdb.WriteReceipts(database, replayBlock.Hash(), replayBlock.NumberU64(), receipts)
+
+	rawReceipts := rawdb.ReadRawReceipts(database, replayBlock.Hash(), replayBlock.NumberU64())
+	if len(rawReceipts) != 1 {
+		t.Fatalf("unexpected raw receipt count: have %d want 1", len(rawReceipts))
+	}
+	if rawReceipts[0].TxHash != (common.Hash{}) {
+		t.Fatalf("expected raw receipt without TxHash metadata, got %s", rawReceipts[0].TxHash)
+	}
+	precheckCached := engine.CacheNoneTIPSigningTxs(replayBlock.Header(), replayBlock.Transactions(), rawReceipts)
+	if len(precheckCached) != 1 {
+		t.Fatalf("unexpected cached signing tx count from raw receipts: have %d want 1", len(precheckCached))
+	}
+	if from := precheckCached[0].From(); from == nil || *from != acc1Addr {
+		t.Fatalf("unexpected signer recovered from replay tx: have %v want %s", from, acc1Addr)
+	}
+	if got := common.BytesToHash(precheckCached[0].Data()[len(precheckCached[0].Data())-32:]); got != block15.Hash() {
+		t.Fatalf("unexpected replay target hash: have %s want %s", got, block15.Hash())
+	}
+	masternodes := engine.GetMasternodesFromCheckpointHeader(checkpointHeader.Header())
+	if len(masternodes) != 1 || masternodes[0] != acc1Addr {
+		t.Fatalf("unexpected checkpoint masternodes: have %v want [%s]", masternodes, acc1Addr)
+	}
+
+	checkpointBlock := types.NewBlock(&types.Header{
+		Number:     big.NewInt(18),
+		ParentHash: replayBlock.Hash(),
+	}, nil, nil, trie.NewStackTrie(nil))
+	engine, err = XDPoS.New(config, database)
+	if err != nil {
+		t.Fatalf("failed to recreate XDPoS engine: %v", err)
+	}
+	chain := &rewardReplayChain{
+		config:  config,
+		current: checkpointBlock.Header(),
+		headers: map[uint64]*types.Header{
+			14: checkpointHeader.Header(),
+			15: block15.Header(),
+			16: block16.Header(),
+			17: replayBlock.Header(),
+			18: checkpointBlock.Header(),
+		},
+		blocks: map[uint64]*types.Block{
+			15: block15,
+			16: block16,
+			17: replayBlock,
+			18: checkpointBlock,
+		},
+	}
+	if _, ok := engine.GetCachedSigningTxs(replayBlock.Hash()); ok {
+		t.Fatal("expected empty signing cache before restart replay")
+	}
+
+	totalSigner := uint64(0)
+	signers, err := GetRewardForCheckpoint(engine, chain, checkpointBlock.Header(), 2, &totalSigner)
+	if err != nil {
+		t.Fatalf("GetRewardForCheckpoint returned error: %v", err)
+	}
+	if cached, ok := engine.GetCachedSigningTxs(replayBlock.Hash()); !ok || len(cached) != 1 {
+		t.Fatalf("expected replay block signing txs to be cached during reward replay, got ok=%v len=%d", ok, len(cached))
+	}
+	if totalSigner != 1 {
+		t.Fatalf("unexpected total signer count: have %d want 1", totalSigner)
+	}
+	rewardLog := signers[acc1Addr]
+	if rewardLog == nil {
+		t.Fatalf("expected signer %s to be reconstructed from replay", acc1Addr)
+	}
+	if rewardLog.Sign != 1 {
+		t.Fatalf("unexpected signer count for %s: have %d want 1", acc1Addr, rewardLog.Sign)
+	}
+}
+
 // Generate random string.
 func randomHash() common.Hash {
 	letterBytes := "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ123456789"
 	var b common.Hash
 	for i := range b {
-		rand.Seed(time.Now().UnixNano())
 		b[i] = letterBytes[rand.Intn(len(letterBytes))]
 	}
 	return b
@@ -144,6 +348,7 @@ func TestRandomMasterNode(t *testing.T) {
 	}
 }
 
+// TestEncryptDecrypt tests encrypt decrypt.
 func TestEncryptDecrypt(t *testing.T) {
 	//byteInteger := common.LeftPadBytes([]byte(new(big.Int).SetInt64(4).String()), 32)
 	randomByte := RandStringByte(32)
@@ -168,9 +373,8 @@ func isArrayEqual(a [][]int64, b [][]int64) bool {
 
 // Unit test for
 func TestGenM2FromRandomize(t *testing.T) {
-	var a []int64
+	a := make([]int64, 0, 11)
 	for i := 0; i <= 10; i++ {
-		rand.Seed(time.Now().UTC().UnixNano())
 		a = append(a, int64(rand.Intn(9999)))
 	}
 	b, err := GenM2FromRandomize(a, common.MaxMasternodes)
@@ -191,7 +395,7 @@ func TestGenM2FromRandomize(t *testing.T) {
 func TestBuildValidatorFromM2(t *testing.T) {
 	a := []int64{84, 58, 27, 96, 127, 60, 136, 20, 121, 31, 87, 85, 40, 120, 149, 109, 141, 145, 11, 110, 147, 35, 76, 46, 34, 108, 72, 103, 102, 12, 23, 47, 70, 86, 125, 112, 128, 13, 130, 98, 126, 62, 132, 111, 134, 6, 106, 67, 24, 91, 101, 50, 94, 43, 77, 73, 129, 71, 51, 10, 92, 29, 80, 95, 33, 100, 124, 75, 38, 133, 79, 83, 61, 36, 122, 99, 16, 28, 18, 116, 140, 97, 119, 82, 148, 48, 56, 32, 93, 107, 69, 68, 123, 81, 22, 137, 25, 115, 44, 8, 42, 131, 143, 17, 55, 89, 9, 15, 19, 59, 146, 54, 5, 30, 41, 144, 117, 1, 104, 49, 105, 45, 88, 78, 74, 135, 0, 21, 57, 3, 66, 52, 63, 138, 4, 114, 37, 118, 14, 2, 26, 7, 65, 139, 39, 64, 90, 142, 53, 113}
 	b := BuildValidatorFromM2(a)
-	c := utils.ExtractValidatorsFromBytes(b)
+	c, _ := utils.ExtractValidatorsFromBytes(b)
 	if !isArrayEqual([][]int64{a}, [][]int64{c}) {
 		t.Errorf("Fail to get m2 result %v", b)
 	}
@@ -209,4 +413,144 @@ func TestDecodeValidatorsHexData(t *testing.T) {
 		t.Errorf("Fail to get m2 result %v", b)
 	}
 	t.Log("b", b)
+}
+
+type createTxSignTestChain struct{}
+
+func (createTxSignTestChain) Config() *params.ChainConfig { return params.TestChainConfig }
+
+func (createTxSignTestChain) CurrentBlock() *types.Header {
+	return &types.Header{Number: big.NewInt(0)}
+}
+
+func (createTxSignTestChain) StateAt(common.Hash) (*state.StateDB, error) {
+	return state.New(types.EmptyRootHash, state.NewDatabase(rawdb.NewMemoryDatabase()))
+}
+
+func (createTxSignTestChain) SubscribeChainHeadEvent(ch chan<- core.ChainHeadEvent) event.Subscription {
+	return event.NewSubscription(func(quit <-chan struct{}) error {
+		<-quit
+		return nil
+	})
+}
+
+type nonceGuardSubPool struct {
+	seededNonce0 bool
+	added        []*types.Transaction
+}
+
+func (s *nonceGuardSubPool) Filter(tx *types.Transaction) bool { return true }
+
+func (s *nonceGuardSubPool) Init(gasTip uint64, head *types.Header, reserver txpool.Reserver) error {
+	return nil
+}
+
+func (s *nonceGuardSubPool) Close() error { return nil }
+
+func (s *nonceGuardSubPool) Reset(oldHead, newHead *types.Header) {}
+
+func (s *nonceGuardSubPool) SetGasTip(tip *big.Int) error { return nil }
+
+func (s *nonceGuardSubPool) Has(hash common.Hash) bool { return false }
+
+func (s *nonceGuardSubPool) Get(hash common.Hash) *types.Transaction { return nil }
+
+func (s *nonceGuardSubPool) ValidateTxBasics(tx *types.Transaction) error { return nil }
+
+func (s *nonceGuardSubPool) Add(txs []*types.Transaction, sync bool) []error {
+	errs := make([]error, len(txs))
+	for i, tx := range txs {
+		if tx.Nonce() == 0 && s.seededNonce0 {
+			errs[i] = txpool.ErrReplaceUnderpriced
+			continue
+		}
+		s.added = append(s.added, tx)
+		if tx.Nonce() == 0 {
+			s.seededNonce0 = true
+		}
+	}
+	return errs
+}
+
+func (s *nonceGuardSubPool) Pending(filter txpool.PendingFilter) map[common.Address][]*txpool.LazyTransaction {
+	return map[common.Address][]*txpool.LazyTransaction{}
+}
+
+func (s *nonceGuardSubPool) SubscribeTransactions(ch chan<- core.NewTxsEvent, reorgs bool) event.Subscription {
+	return event.NewSubscription(func(quit <-chan struct{}) error {
+		<-quit
+		return nil
+	})
+}
+
+func (s *nonceGuardSubPool) Nonce(addr common.Address) uint64 { return 1 }
+
+func (s *nonceGuardSubPool) Stats() (int, int) { return 0, 0 }
+
+func (s *nonceGuardSubPool) Content() (map[common.Address][]*types.Transaction, map[common.Address][]*types.Transaction) {
+	return map[common.Address][]*types.Transaction{}, map[common.Address][]*types.Transaction{}
+}
+
+func (s *nonceGuardSubPool) ContentFrom(addr common.Address) ([]*types.Transaction, []*types.Transaction) {
+	return nil, nil
+}
+
+func (s *nonceGuardSubPool) Status(hash common.Hash) txpool.TxStatus { return txpool.TxStatusUnknown }
+
+func (s *nonceGuardSubPool) SetSigner(f func(address common.Address) bool) {}
+
+func (s *nonceGuardSubPool) IsSigner(addr common.Address) bool { return false }
+
+// TestCreateTransactionSignUsesPoolNonce tests create transaction sign uses pool nonce.
+func TestCreateTransactionSignUsesPoolNonce(t *testing.T) {
+	password := "test-pass"
+	ks := keystore.NewKeyStore(t.TempDir(), keystore.LightScryptN, keystore.LightScryptP)
+
+	account, err := ks.ImportECDSA(acc1Key, password)
+	if err != nil {
+		t.Fatalf("failed to import signer account: %v", err)
+	}
+	if err := ks.Unlock(account, password); err != nil {
+		t.Fatalf("failed to unlock signer account: %v", err)
+	}
+
+	manager := accounts.NewManager(nil, ks)
+	defer manager.Close()
+
+	subpool := &nonceGuardSubPool{}
+	pool, err := txpool.New(0, createTxSignTestChain{}, []txpool.SubPool{subpool})
+	if err != nil {
+		t.Fatalf("failed to create txpool: %v", err)
+	}
+	defer pool.Close()
+
+	chainConfig := params.TestXDPoSMockChainConfig
+	if chainConfig == nil || chainConfig.XDPoS == nil {
+		t.Fatal("test requires XDPoS chain config")
+	}
+
+	seedTx := CreateTxSign(big.NewInt(0), common.Hash{0x1}, 0, common.BlockSignersBinary)
+	seedSigned, err := types.SignTx(seedTx, types.LatestSignerForChainID(chainConfig.ChainID), acc1Key)
+	if err != nil {
+		t.Fatalf("failed to sign seed tx: %v", err)
+	}
+	if err := pool.AddLocal(seedSigned, true); err != nil {
+		t.Fatalf("failed to seed pending nonce 0 tx: %v", err)
+	}
+
+	block := types.NewBlockWithHeader(&types.Header{Number: big.NewInt(0)})
+	err = CreateTransactionSign(chainConfig, pool, manager, block, rawdb.NewMemoryDatabase(), account.Address)
+	if errors.Is(err, txpool.ErrReplaceUnderpriced) {
+		t.Fatalf("CreateTransactionSign reused pending nonce and hit replacement rejection: %v", err)
+	}
+	if err != nil {
+		t.Fatalf("CreateTransactionSign failed: %v", err)
+	}
+
+	if len(subpool.added) < 2 {
+		t.Fatalf("expected seed tx and tx sign to be added, got %d txs", len(subpool.added))
+	}
+	if got := subpool.added[1].Nonce(); got != 1 {
+		t.Fatalf("tx sign nonce mismatch: got %d, want 1", got)
+	}
 }

@@ -22,7 +22,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"path"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -98,7 +98,7 @@ func TestAuthEndpoints(t *testing.T) {
 		t.Fatalf("failed to create jwt secret: %v", err)
 	}
 	// Geth must read it from a file, and does not support in-memory JWT secrets, so we create a temporary file.
-	jwtPath := path.Join(t.TempDir(), "jwt_secret")
+	jwtPath := filepath.Join(t.TempDir(), "jwt_secret")
 	if err := os.WriteFile(jwtPath, []byte(hexutil.Encode(secret[:])), 0600); err != nil {
 		t.Fatalf("failed to prepare jwt secret file: %v", err)
 	}
@@ -194,6 +194,69 @@ func TestAuthEndpoints(t *testing.T) {
 
 	for _, testCase := range testCases {
 		t.Run(testCase.name, testCase.Run)
+	}
+}
+
+func TestLocalAPIsDoNotStartAuthEndpoints(t *testing.T) {
+	conf := &Config{
+		HTTPHost: "127.0.0.1",
+		HTTPPort: 0,
+		WSHost:   "127.0.0.1",
+		WSPort:   0,
+		AuthAddr: "127.0.0.1",
+		AuthPort: 0,
+
+		HTTPModules: []string{"debug"},
+		WSModules:   []string{"debug"},
+	}
+	node, err := New(conf)
+	if err != nil {
+		t.Fatalf("could not create a new node: %v", err)
+	}
+	node.RegisterAPIs([]rpc.API{{
+		Namespace:     "debug",
+		Version:       "1.0",
+		Service:       helloRPC("hello debug"),
+		Public:        true,
+		Local:         true,
+		Authenticated: true,
+	}})
+	if err := node.Start(); err != nil {
+		t.Fatalf("failed to start test node: %v", err)
+	}
+	defer node.Close()
+
+	if node.httpAuth.httpHandler.Load() != nil {
+		t.Fatal("expected auth HTTP handler to remain disabled for local-only APIs")
+	}
+	if node.wsAuth.wsHandler.Load() != nil {
+		t.Fatal("expected auth WS handler to remain disabled for local-only APIs")
+	}
+
+	client := node.Attach()
+	defer client.Close()
+
+	var out string
+	if err := client.CallContext(context.Background(), &out, "debug_helloWorld"); err != nil {
+		t.Fatalf("failed to call local-only API over in-process RPC: %v", err)
+	}
+	if out != "hello debug" {
+		t.Fatalf("unexpected local-only API result: %q", out)
+	}
+
+	httpClient, err := rpc.DialHTTP(node.HTTPEndpoint())
+	if err != nil {
+		t.Fatalf("failed to dial HTTP endpoint: %v", err)
+	}
+	defer httpClient.Close()
+
+	err = httpClient.CallContext(context.Background(), &out, "debug_helloWorld")
+	if err == nil {
+		t.Fatal("expected local-only API to stay hidden from HTTP RPC")
+	}
+	rpcErr, ok := err.(rpc.Error)
+	if !ok || rpcErr.ErrorCode() != -32601 {
+		t.Fatalf("expected method-not-found for hidden local-only API, got %v", err)
 	}
 }
 

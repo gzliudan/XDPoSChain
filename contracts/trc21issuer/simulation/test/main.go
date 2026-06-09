@@ -14,10 +14,12 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/contracts/trc21issuer"
 	"github.com/XinFinOrg/XDPoSChain/contracts/trc21issuer/simulation"
 	"github.com/XinFinOrg/XDPoSChain/ethclient"
+	"github.com/XinFinOrg/XDPoSChain/params"
 )
 
 var (
 	trc21TokenAddr = common.HexToAddress("0x80430A33EaB86890a346bCf64F86CFeAC73287f3")
+	chainConfig    = params.XDCMainnetChainConfig
 )
 
 func airDropTokenToAccountNoXDC() {
@@ -30,9 +32,9 @@ func airDropTokenToAccountNoXDC() {
 	mainAccount.Nonce = big.NewInt(int64(nonce))
 	mainAccount.Value = big.NewInt(0)      // in wei
 	mainAccount.GasLimit = uint64(4000000) // in units
-	mainAccount.GasPrice = big.NewInt(0).Mul(common.TRC21GasPrice, big.NewInt(2))
+	mainAccount.GasPrice = big.NewInt(0).Lsh(common.TRC21GasPrice, 1)
 	trc21Instance, _ := trc21issuer.NewTRC21(mainAccount, trc21TokenAddr, client)
-	trc21IssuerInstance, _ := trc21issuer.NewTRC21Issuer(mainAccount, common.TRC21IssuerSMC, client)
+	trc21IssuerInstance, _ := trc21issuer.NewTRC21Issuer(mainAccount, chainConfig.TRC21IssuerSMC, client)
 	// air drop token
 	remainFee, _ := trc21IssuerInstance.GetTokenCapacity(trc21TokenAddr)
 	tx, err := trc21Instance.Transfer(simulation.AirdropAddr, simulation.AirDropAmount)
@@ -51,7 +53,7 @@ func airDropTokenToAccountNoXDC() {
 	}
 	gasUsed := hexutil.MustDecodeUint64(receipt["gasUsed"].(string))
 	blockNumber := hexutil.MustDecodeUint64(receipt["blockNumber"].(string))
-	fee := common.GetGasFee(blockNumber, gasUsed)
+	fee := params.GetGasFee(blockNumber, gasUsed, chainConfig)
 	fmt.Println("fee", fee.Uint64(), "number", blockNumber)
 	remainFee = big.NewInt(0).Sub(remainFee, fee)
 	//check balance fee
@@ -59,10 +61,8 @@ func airDropTokenToAccountNoXDC() {
 	if err != nil || balanceIssuerFee.Cmp(remainFee) != 0 {
 		log.Fatal("can't get balance token fee in  smart contract: ", err, "got", balanceIssuerFee, "wanted", remainFee)
 	}
-	if err != nil {
-		log.Fatal("can't execute transferAmount in tr21:", err)
-	}
 }
+
 func testTransferTRC21TokenWithAccountNoXDC() {
 	client, err := ethclient.Dial(simulation.RpcEndpoint)
 	if err != nil {
@@ -75,9 +75,9 @@ func testTransferTRC21TokenWithAccountNoXDC() {
 	airDropAccount.Nonce = big.NewInt(int64(nonce))
 	airDropAccount.Value = big.NewInt(0)      // in wei
 	airDropAccount.GasLimit = uint64(4000000) // in units
-	airDropAccount.GasPrice = big.NewInt(0).Mul(common.TRC21GasPrice, big.NewInt(2))
+	airDropAccount.GasPrice = big.NewInt(0).Lsh(common.TRC21GasPrice, 1)
 	trc21Instance, _ := trc21issuer.NewTRC21(airDropAccount, trc21TokenAddr, client)
-	trc21IssuerInstance, _ := trc21issuer.NewTRC21Issuer(airDropAccount, common.TRC21IssuerSMC, client)
+	trc21IssuerInstance, _ := trc21issuer.NewTRC21Issuer(airDropAccount, chainConfig.TRC21IssuerSMC, client)
 
 	remainFee, _ := trc21IssuerInstance.GetTokenCapacity(trc21TokenAddr)
 	airDropBalanceBefore, _ := trc21Instance.BalanceOf(simulation.AirdropAddr)
@@ -113,7 +113,7 @@ func testTransferTRC21TokenWithAccountNoXDC() {
 	}
 	gasUsed := hexutil.MustDecodeUint64(receipt["gasUsed"].(string))
 	blockNumber := hexutil.MustDecodeUint64(receipt["blockNumber"].(string))
-	fee := common.GetGasFee(blockNumber, gasUsed)
+	fee := params.GetGasFee(blockNumber, gasUsed, chainConfig)
 	fmt.Println("fee", fee.Uint64(), "number", blockNumber)
 	remainFee = big.NewInt(0).Sub(remainFee, fee)
 	//check balance fee
@@ -122,11 +122,12 @@ func testTransferTRC21TokenWithAccountNoXDC() {
 		log.Fatal("can't get balance token fee in  smart contract: ", err, "got", balanceIssuerFee, "wanted", remainFee)
 	}
 	//check trc21 SMC balance
-	balance, err = client.BalanceAt(context.Background(), common.TRC21IssuerSMC, nil)
+	balance, err = client.BalanceAt(context.Background(), chainConfig.TRC21IssuerSMC, nil)
 	if err != nil || balance.Cmp(remainFee) != 0 {
 		log.Fatal("can't get balance token fee in  smart contract: ", err, "got", balanceIssuerFee, "wanted", remainFee)
 	}
 }
+
 func testTransferTrc21Fail() {
 	client, err := ethclient.Dial(simulation.RpcEndpoint)
 	if err != nil {
@@ -137,9 +138,9 @@ func testTransferTrc21Fail() {
 	airDropAccount.Nonce = big.NewInt(int64(nonce))
 	airDropAccount.Value = big.NewInt(0)      // in wei
 	airDropAccount.GasLimit = uint64(4000000) // in units
-	airDropAccount.GasPrice = big.NewInt(0).Mul(common.TRC21GasPrice, big.NewInt(2))
+	airDropAccount.GasPrice = big.NewInt(0).Lsh(common.TRC21GasPrice, 1)
 	trc21Instance, _ := trc21issuer.NewTRC21(airDropAccount, trc21TokenAddr, client)
-	trc21IssuerInstance, _ := trc21issuer.NewTRC21Issuer(airDropAccount, common.TRC21IssuerSMC, client)
+	trc21IssuerInstance, _ := trc21issuer.NewTRC21Issuer(airDropAccount, chainConfig.TRC21IssuerSMC, client)
 	balanceIssuerFee, _ := trc21IssuerInstance.GetTokenCapacity(trc21TokenAddr)
 
 	minFee, err := trc21Instance.MinFee()
@@ -179,7 +180,7 @@ func testTransferTrc21Fail() {
 	}
 	gasUsed := hexutil.MustDecodeUint64(receipt["gasUsed"].(string))
 	blockNumber := hexutil.MustDecodeUint64(receipt["blockNumber"].(string))
-	fee := common.GetGasFee(blockNumber, gasUsed)
+	fee := params.GetGasFee(blockNumber, gasUsed, chainConfig)
 	fmt.Println("fee", fee.Uint64(), "number", blockNumber)
 	remainFee = big.NewInt(0).Sub(remainFee, fee)
 	//check balance fee
@@ -188,12 +189,12 @@ func testTransferTrc21Fail() {
 		log.Fatal("can't get balance token fee in  smart contract: ", err, "got", balanceIssuerFee, "wanted", remainFee)
 	}
 	//check trc21 SMC balance
-	balance, err = client.BalanceAt(context.Background(), common.TRC21IssuerSMC, nil)
+	balance, err = client.BalanceAt(context.Background(), chainConfig.TRC21IssuerSMC, nil)
 	if err != nil || balance.Cmp(remainFee) != 0 {
 		log.Fatal("can't get balance token fee in  smart contract: ", err, "got", balanceIssuerFee, "wanted", remainFee)
 	}
-
 }
+
 func main() {
 	fmt.Println("========================")
 	fmt.Println("airdropAddr", simulation.AirdropAddr.Hex())

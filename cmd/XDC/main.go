@@ -29,7 +29,7 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/accounts/keystore"
 	"github.com/XinFinOrg/XDPoSChain/cmd/utils"
 	"github.com/XinFinOrg/XDPoSChain/consensus/XDPoS"
-	"github.com/XinFinOrg/XDPoSChain/console"
+	"github.com/XinFinOrg/XDPoSChain/console/prompt"
 	"github.com/XinFinOrg/XDPoSChain/core"
 	"github.com/XinFinOrg/XDPoSChain/eth"
 	"github.com/XinFinOrg/XDPoSChain/ethclient"
@@ -39,10 +39,11 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/log"
 	"github.com/XinFinOrg/XDPoSChain/metrics"
 	"github.com/XinFinOrg/XDPoSChain/node"
-	"github.com/XinFinOrg/XDPoSChain/params"
 	"github.com/urfave/cli/v2"
 
-	// Force-load the native, to trigger registration
+	// Force-load the tracer engines to trigger registration
+	_ "github.com/XinFinOrg/XDPoSChain/eth/tracers/js"
+	_ "github.com/XinFinOrg/XDPoSChain/eth/tracers/live"
 	_ "github.com/XinFinOrg/XDPoSChain/eth/tracers/native"
 )
 
@@ -51,16 +52,16 @@ const (
 )
 
 var (
-	// Git SHA1 commit hash of the release (set via linker flags)
-	gitCommit = ""
 	// The app that holds all commands and flags.
-	app = flags.NewApp(gitCommit, "the XDPoSChain command line interface")
+	app = flags.NewApp("the XDPoSChain command line interface")
 
 	// The app that holds all commands and flags.
 	nodeFlags = slices.Concat([]cli.Flag{
 		utils.IdentityFlag,
 		utils.UnlockedAccountFlag,
 		utils.PasswordFileFlag,
+		utils.PeersAllowlistFlag,
+		utils.PeersDenylistFlag,
 		utils.BootnodesFlag,
 		utils.BootnodesV4Flag,
 		utils.BootnodesV5Flag,
@@ -69,16 +70,6 @@ var (
 		utils.USBFlag,
 		utils.SmartCardDaemonPathFlag,
 		utils.EnablePersonal,
-		//utils.EthashCacheDirFlag,
-		//utils.EthashCachesInMemoryFlag,
-		//utils.EthashCachesOnDiskFlag,
-		//utils.EthashDatasetDirFlag,
-		//utils.EthashDatasetsInMemoryFlag,
-		//utils.EthashDatasetsOnDiskFlag,
-		utils.XDCXEnabledFlag,
-		utils.XDCXDBEngineFlag,
-		utils.XDCXDBConnectionUrlFlag,
-		utils.XDCXDBReplicaSetNameFlag,
 		utils.XDCXDBNameFlag,
 		utils.TxPoolNoLocalsFlag,
 		utils.TxPoolJournalFlag,
@@ -91,6 +82,9 @@ var (
 		utils.TxPoolGlobalQueueFlag,
 		utils.TxPoolLifetimeFlag,
 		utils.SyncModeFlag,
+		utils.FastSyncPivotNumberFlag,
+		utils.FastSyncPivotHashFlag,
+		utils.FastSyncPivotRootFlag,
 		utils.GCModeFlag,
 		// utils.LightServFlag,  // deprecated
 		// utils.LightPeersFlag, // deprecated
@@ -124,7 +118,10 @@ var (
 		//utils.VMEnableDebugFlag,
 		utils.Enable0xPrefixFlag,
 		utils.EnableXDCPrefixFlag,
+		utils.VMTraceFlag,
+		utils.VMTraceJsonConfigFlag,
 		utils.NetworkIdFlag,
+		utils.AllowBuiltInConfigOverrideFlag,
 		utils.HTTPCORSDomainFlag,
 		utils.AuthListenFlag,
 		utils.AuthPortFlag,
@@ -132,7 +129,6 @@ var (
 		utils.JWTSecretFlag,
 		utils.HTTPVirtualHostsFlag,
 		utils.EthStatsURLFlag,
-		//utils.FakePoWFlag,
 		//utils.NoCompactionFlag,
 		//utils.GpoBlocksFlag,
 		//utils.GpoPercentileFlag,
@@ -145,12 +141,13 @@ var (
 		utils.AnnounceTxsFlag,
 		utils.StoreRewardFlag,
 		utils.SetHeadFlag,
-		utils.XDCSlaveModeFlag,
+		utils.DeleteAllBadBlocksFlag,
 	}, utils.NetworkFlags, utils.DatabaseFlags)
 
 	rpcFlags = []cli.Flag{
 		utils.HTTPEnabledFlag,
 		utils.RPCGlobalGasCapFlag,
+		utils.RPCGlobalEVMTimeoutFlag,
 		utils.HTTPListenAddrFlag,
 		utils.HTTPPortFlag,
 		utils.HTTPReadTimeoutFlag,
@@ -167,10 +164,12 @@ var (
 		utils.WSPathPrefixFlag,
 		utils.IPCDisabledFlag,
 		utils.IPCPathFlag,
-		utils.RPCGlobalTxFeeCap,
-		utils.AllowUnprotectedTxs,
-		utils.BatchRequestLimit,
-		utils.BatchResponseMaxSize,
+		utils.RPCGlobalTxFeeCapFlag,
+		utils.RPCGlobalLogQueryLimit,
+		utils.AllowUnprotectedTxsFlag,
+		utils.BatchRequestLimitFlag,
+		utils.BatchResponseMaxSizeFlag,
+		utils.RPCGlobalRangeLimitFlag,
 	}
 
 	metricsFlags = []cli.Flag{
@@ -184,6 +183,7 @@ var (
 		utils.MetricsInfluxDBUsernameFlag,
 		utils.MetricsInfluxDBPasswordFlag,
 		utils.MetricsInfluxDBTagsFlag,
+		utils.MetricsInfluxDBIntervalFlag,
 		utils.MetricsEnableInfluxDBV2Flag,
 		utils.MetricsInfluxDBTokenFlag,
 		utils.MetricsInfluxDBBucketFlag,
@@ -194,7 +194,7 @@ var (
 func init() {
 	// Initialize the CLI app and start XDC
 	app.Action = XDC
-	app.Copyright = "Copyright (c) 2024 XDPoSChain"
+	app.Copyright = "Copyright 2019-2026 XDC Network"
 	app.Commands = []*cli.Command{
 		// See chaincmd.go:
 		initCommand,
@@ -212,8 +212,6 @@ func init() {
 		attachCommand,
 		javascriptCommand,
 		// See misccmd.go:
-		makecacheCommand,
-		makedagCommand,
 		versionCommand,
 		licenseCommand,
 		// See config.go
@@ -243,13 +241,12 @@ func init() {
 		// Start system runtime metrics collection
 		go metrics.CollectProcessMetrics(3 * time.Second)
 
-		params.TargetGasLimit = ctx.Uint64(utils.MinerGasLimitFlag.Name)
 		return nil
 	}
 
 	app.After = func(ctx *cli.Context) error {
 		debug.Exit()
-		console.Stdin.Close() // Resets terminal mode.
+		prompt.Stdin.Close() // Resets terminal mode.
 		return nil
 	}
 }
@@ -267,17 +264,20 @@ func main() {
 func XDC(ctx *cli.Context) error {
 	stack, backend, cfg := makeFullNode(ctx)
 	defer stack.Close()
-	startNode(ctx, stack, backend, cfg)
+	startNode(ctx, stack, backend, cfg, false)
 	stack.Wait()
+	if engine, ok := backend.Engine().(*XDPoS.XDPoS); ok {
+		engine.Stop()
+	}
 	return nil
 }
 
 // startNode boots up the system node and all registered protocols, after which
 // it unlocks any requested accounts, and starts the RPC/IPC interfaces and the
 // miner.
-func startNode(ctx *cli.Context, stack *node.Node, backend ethapi.Backend, cfg XDCConfig) {
+func startNode(ctx *cli.Context, stack *node.Node, backend ethapi.Backend, cfg XDCConfig, isConsole bool) {
 	// Start up the node itself
-	utils.StartNode(stack)
+	utils.StartNode(stack, isConsole)
 
 	// Unlock any account specifically requested
 	backends := stack.AccountManager().Backends(keystore.KeyStoreType)
@@ -350,35 +350,27 @@ func startNode(ctx *cli.Context, stack *node.Node, backend ethapi.Backend, cfg X
 		go func() {
 			started := false
 			ok := false
-			slaveMode := ctx.IsSet(utils.XDCSlaveModeFlag.Name)
 			var err error
 			ok, err = ethBackend.ValidateMasternode()
 			if err != nil {
 				utils.Fatalf("Can't verify masternode permission: %v", err)
 			}
 			if ok {
-				if slaveMode {
-					log.Info("Masternode slave mode found.")
-					started = false
-				} else {
-					log.Info("Masternode found. Enabling staking mode...")
-					// Use a reduced number of threads if requested
-					if threads := ctx.Int(utils.MinerThreadsFlag.Name); threads > 0 {
-						type threaded interface {
-							SetThreads(threads int)
-						}
-						if th, ok := ethBackend.Engine().(threaded); ok {
-							th.SetThreads(threads)
-						}
+				log.Info("Masternode found. Enabling staking mode...")
+				// Use a reduced number of threads if requested
+				if threads := ctx.Int(utils.MinerThreadsFlag.Name); threads > 0 {
+					type threaded interface {
+						SetThreads(threads int)
 					}
-					// Set the gas price to the limits from the CLI and start mining
-					ethBackend.TxPool().SetGasPrice(cfg.Eth.GasPrice)
-					if err := ethBackend.StartStaking(true); err != nil {
-						utils.Fatalf("Failed to start staking: %v", err)
+					if th, ok := ethBackend.Engine().(threaded); ok {
+						th.SetThreads(threads)
 					}
-					started = true
-					log.Info("Enabled staking node!!!")
 				}
+				if err := ethBackend.StartStaking(true); err != nil {
+					utils.Fatalf("Failed to start staking: %v", err)
+				}
+				started = true
+				log.Info("Enabled staking node!!!")
 			}
 			defer close(core.CheckpointCh)
 			for range core.CheckpointCh {
@@ -399,28 +391,21 @@ func startNode(ctx *cli.Context, stack *node.Node, backend ethapi.Backend, cfg X
 						log.Info("Cancelled mining mode!!!")
 					}
 				} else if !started {
-					if slaveMode {
-						log.Info("Masternode slave mode found.")
-						started = false
-					} else {
-						log.Info("Masternode found. Enabling staking mode...")
-						// Use a reduced number of threads if requested
-						if threads := ctx.Int(utils.MinerThreadsFlag.Name); threads > 0 {
-							type threaded interface {
-								SetThreads(threads int)
-							}
-							if th, ok := ethBackend.Engine().(threaded); ok {
-								th.SetThreads(threads)
-							}
+					log.Info("Masternode found. Enabling staking mode...")
+					// Use a reduced number of threads if requested
+					if threads := ctx.Int(utils.MinerThreadsFlag.Name); threads > 0 {
+						type threaded interface {
+							SetThreads(threads int)
 						}
-						// Set the gas price to the limits from the CLI and start mining
-						ethBackend.TxPool().SetGasPrice(cfg.Eth.GasPrice)
-						if err := ethBackend.StartStaking(true); err != nil {
-							utils.Fatalf("Failed to start staking: %v", err)
+						if th, ok := ethBackend.Engine().(threaded); ok {
+							th.SetThreads(threads)
 						}
-						started = true
-						log.Info("Enabled staking node!!!")
 					}
+					if err := ethBackend.StartStaking(true); err != nil {
+						utils.Fatalf("Failed to start staking: %v", err)
+					}
+					started = true
+					log.Info("Enabled staking node!!!")
 				}
 			}
 		}()

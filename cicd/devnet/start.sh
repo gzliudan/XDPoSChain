@@ -1,4 +1,12 @@
 #!/bin/bash
+
+# Restore nodekey from secret before XDC init runs, so init does not generate a new one.
+if [ -n "$NODE_KEY" ] && [ ! -f /work/xdcchain/XDC/nodekey ]; then
+  mkdir -p /work/xdcchain/XDC
+  echo "$NODE_KEY" > /work/xdcchain/XDC/nodekey
+  echo "Restored nodekey from NODE_KEY secret."
+fi
+
 if [ ! -d /work/xdcchain/XDC/chaindata ]
 then
   if test -z "$PRIVATE_KEY"
@@ -8,7 +16,7 @@ then
   fi
   echo $PRIVATE_KEY >> /tmp/key
   wallet=$(XDC account import --password .pwd --datadir /work/xdcchain /tmp/key | awk -F '[{}]' '{print $2}')
-  XDC --datadir /work/xdcchain init /work/genesis.json
+  XDC --datadir /work/xdcchain init /work/genesis.json 2>&1 | tee /work/xdcchain/init.log
 else
   wallet=$(XDC account list --datadir /work/xdcchain | head -n 1 | awk -F '[{}]' '{print $2}')
 fi
@@ -95,26 +103,68 @@ else
   gc_mode=$GC_MODE
 fi
 
-netstats="${NODE_NAME}-${wallet}-${instance_ip}:xinfin_xdpos_hybrid_network_stats@devnetstats.hashlabs.apothem.network:1999"
+fastsync_args=()
+if test -n "$FASTSYNC_PIVOT_NUMBER" || test -n "$FASTSYNC_PIVOT_HASH" || test -n "$FASTSYNC_PIVOT_ROOT"
+then
+  if test -z "$FASTSYNC_PIVOT_NUMBER" || test -z "$FASTSYNC_PIVOT_HASH" || test -z "$FASTSYNC_PIVOT_ROOT"
+  then
+    echo "Error: FASTSYNC_PIVOT_NUMBER, FASTSYNC_PIVOT_HASH, and FASTSYNC_PIVOT_ROOT must all be set together."
+    exit 1
+  fi
+  echo "FASTSYNC_PIVOT_NUMBER found, set to $FASTSYNC_PIVOT_NUMBER"
+  echo "FASTSYNC_PIVOT_HASH found, set to $FASTSYNC_PIVOT_HASH"
+  echo "FASTSYNC_PIVOT_ROOT found, set to $FASTSYNC_PIVOT_ROOT"
+  fastsync_args=(
+    --fastsyncpivotnumber "${FASTSYNC_PIVOT_NUMBER}"
+    --fastsyncpivothash "${FASTSYNC_PIVOT_HASH}"
+    --fastsyncpivotroot "${FASTSYNC_PIVOT_ROOT}"
+  )
+fi
 
+miner_gaslimit=50000000
+if test -z "$MINER_GASLIMIT"
+then
+  echo "MINER_GASLIMIT not set, default to $miner_gaslimit"
+else
+  echo "MINER_GASLIMIT found, set to $MINER_GASLIMIT"
+  miner_gaslimit=$MINER_GASLIMIT
+fi
+
+
+netstats_default="${NODE_NAME}-${wallet}-${instance_ip}:xinfin_xdpos_hybrid_network_stats@devnetstats.hashlabs.apothem.network:1999"
+if test -z "$NETSTATS_CONFIG"
+then
+  echo "NETSTATS_CONFIG not set, default to hashlabs devnet stats"
+  netstats=$netstats_default
+else
+  echo "NETSTATS_CONFIG found, set to $NETSTATS_CONFIG"
+  netstats="${NODE_NAME}-${wallet}-${instance_ip}:$NETSTATS_CONFIG"
+fi
 
 echo "Running a node with wallet: ${wallet} at IP: ${instance_ip}"
 echo "Starting nodes with $bootnodes ..."
 
+config_arg=""
+if [ -f /work/config.toml ]; then
+  echo "config.toml found, using static peers from --config /work/config.toml"
+  config_arg="--config /work/config.toml"
+fi
+
 # Note: --gcmode=archive means node will store all historical data. This will lead to high memory usage. But sync mode require archive to sync
 # https://github.com/XinFinOrg/XDPoSChain/issues/268
 
-XDC --ethstats ${netstats} \
+XDC ${config_arg} --ethstats ${netstats} \
 --gcmode ${gc_mode} --syncmode ${sync_mode} \
 --nat extip:${instance_ip} \
 --bootnodes ${bootnodes} \
---datadir /work/xdcchain --networkid 551 \
+--datadir /work/xdcchain --networkid 5551 \
 --port $port --http --http-corsdomain "*" --http-addr 0.0.0.0 \
 --http-port $rpc_port \
 --http-api db,eth,net,txpool,web3,XDPoS \
 --http-vhosts "*" --unlock "${wallet}" --password /work/.pwd --mine \
---miner-gasprice "1" --miner-gaslimit "50000000" --verbosity ${log_level} \
+--miner-gasprice "1" --miner-gaslimit "${miner_gaslimit}" --verbosity ${log_level} \
 --debugdatadir /work/xdcchain \
 --store-reward \
+"${fastsync_args[@]}" \
 --ws --ws-addr=0.0.0.0 --ws-port $ws_port \
 --ws-origins "*" 2>&1 >>/work/xdcchain/xdc.log | tee -a /work/xdcchain/xdc.log

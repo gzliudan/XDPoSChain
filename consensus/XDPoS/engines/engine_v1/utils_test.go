@@ -10,6 +10,15 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/params"
 )
 
+// TestShouldDisableFullVerifyForMainnetChain tests should disable full verify for mainnet chain.
+func TestShouldDisableFullVerifyForMainnetChain(t *testing.T) {
+	engine := New(params.XDCMainnetChainConfig, nil)
+	if engine.shouldDisableFullVerify() {
+		t.Fatal("expected mainnet chain config to keep full verification enabled")
+	}
+}
+
+// TestGetM1M2FromCheckpointHeader tests get m 1 m 2 from checkpoint header.
 func TestGetM1M2FromCheckpointHeader(t *testing.T) {
 	masternodes := []common.Address{
 		common.StringToAddress("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
@@ -23,8 +32,9 @@ func TestGetM1M2FromCheckpointHeader(t *testing.T) {
 	}
 	epoch := uint64(900)
 	config := &params.ChainConfig{
+		TIPRandomizeBlock: big.NewInt(3464000),
 		XDPoS: &params.XDPoSConfig{
-			Epoch: uint64(epoch),
+			Epoch: epoch,
 		},
 	}
 	testMoveM2 := []uint64{0, 0, 0, 1, 1, 1, 2, 2, 2, 0, 0, 0, 1, 1, 1, 2, 2, 2}

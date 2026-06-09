@@ -70,9 +70,6 @@ var (
 	// be modified via out-of-range or non-contiguous headers.
 	ErrInvalidVotingChain = errors.New("invalid voting chain")
 
-	ErrInvalidHeaderOrder = errors.New("invalid header order")
-	ErrInvalidChild       = errors.New("invalid header child")
-
 	// errUnauthorized is returned if a header is signed by a non-authorized entity.
 	ErrUnauthorized = errors.New("unauthorized")
 
@@ -88,11 +85,12 @@ var (
 	ErrEmptyEpochSwitchValidators = errors.New("empty validators list on epoch switch block")
 
 	ErrInvalidV2Extra                = errors.New("invalid v2 extra in the block")
+	ErrInvalidQuorumCert             = errors.New("invalid quorum cert")
 	ErrInvalidQC                     = errors.New("invalid QC content")
 	ErrInvalidQCSignatures           = errors.New("invalid QC Signatures")
 	ErrInvalidTC                     = errors.New("invalid TC content")
 	ErrInvalidTCSignatures           = errors.New("invalid TC Signatures")
-	ErrEmptyBlockInfoHash            = errors.New("blockInfo hash is empty")
+	ErrInvalidSignature              = errors.New("invalid signature")
 	ErrInvalidFieldInNonEpochSwitch  = errors.New("invalid field exist in a non-epoch swtich block")
 	ErrValidatorNotWithinMasternodes = errors.New("validator address is not in the master node list")
 	ErrCoinbaseAndValidatorMismatch  = errors.New("validator and coinbase address in header does not match")

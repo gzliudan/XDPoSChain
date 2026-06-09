@@ -35,28 +35,9 @@ package secp256k1
 import (
 	"crypto/elliptic"
 	"math/big"
-)
 
-const (
-	// number of bits in a big.Word
-	wordBits = 32 << (uint64(^big.Word(0)) >> 63)
-	// number of bytes in a big.Word
-	wordBytes = wordBits / 8
+	"github.com/XinFinOrg/XDPoSChain/common/math"
 )
-
-// readBits encodes the absolute value of bigint as big-endian bytes. Callers
-// must ensure that buf has enough space. If buf is too short the result will
-// be incomplete.
-func readBits(bigint *big.Int, buf []byte) {
-	i := len(buf)
-	for _, d := range bigint.Bits() {
-		for j := 0; j < wordBytes && i > 0; j++ {
-			i--
-			buf[i] = byte(d)
-			d >>= 8
-		}
-	}
-}
 
 // This code is from https://github.com/ThePiachu/GoBit and implements
 // several Koblitz elliptic curves over prime fields.
@@ -92,6 +73,10 @@ func (bitCurve *BitCurve) Params() *elliptic.CurveParams {
 
 // IsOnCurve returns true if the given (x,y) lies on the BitCurve.
 func (bitCurve *BitCurve) IsOnCurve(x, y *big.Int) bool {
+	if x.Cmp(bitCurve.P) >= 0 || y.Cmp(bitCurve.P) >= 0 {
+		return false
+	}
+
 	// y² = x³ + b
 	y2 := new(big.Int).Mul(y, y) //y²
 	y2.Mod(y2, bitCurve.P)       //y²%P
@@ -224,13 +209,13 @@ func (bitCurve *BitCurve) doubleJacobian(x, y, z *big.Int) (*big.Int, *big.Int, 
 	d.Mul(d, d)                 //(X1+B)²
 	d.Sub(d, a)                 //(X1+B)²-A
 	d.Sub(d, c)                 //(X1+B)²-A-C
-	d.Mul(d, big.NewInt(2))     //2*((X1+B)²-A-C)
+	d.Lsh(d, 1)                 //2*((X1+B)²-A-C)
 
 	e := new(big.Int).Mul(big.NewInt(3), a) //3*A
 	f := new(big.Int).Mul(e, e)             //E²
 
-	x3 := new(big.Int).Mul(big.NewInt(2), d) //2*D
-	x3.Sub(f, x3)                            //F-2*D
+	x3 := new(big.Int).Lsh(d, 1) //2*D
+	x3.Sub(f, x3)                //F-2*D
 	x3.Mod(x3, bitCurve.P)
 
 	y3 := new(big.Int).Sub(d, x3)                  //D-X3
@@ -239,7 +224,7 @@ func (bitCurve *BitCurve) doubleJacobian(x, y, z *big.Int) (*big.Int, *big.Int, 
 	y3.Mod(y3, bitCurve.P)
 
 	z3 := new(big.Int).Mul(y, z) //Y1*Z1
-	z3.Mul(big.NewInt(2), z3)    //3*Y1*Z1
+	z3.Lsh(z3, 1)                //3*Y1*Z1
 	z3.Mod(z3, bitCurve.P)
 
 	return x3, y3, z3
@@ -257,8 +242,8 @@ func (bitCurve *BitCurve) Marshal(x, y *big.Int) []byte {
 	byteLen := (bitCurve.BitSize + 7) >> 3
 	ret := make([]byte, 1+2*byteLen)
 	ret[0] = 4 // uncompressed point flag
-	readBits(x, ret[1:1+byteLen])
-	readBits(y, ret[1+byteLen:])
+	math.ReadBits(x, ret[1:1+byteLen])
+	math.ReadBits(y, ret[1+byteLen:])
 	return ret
 }
 

@@ -409,13 +409,14 @@ func (ls *LendingStateDB) updateLendingExchange(stateObject *lendingExchangeStat
 	ls.setError(ls.trie.TryUpdate(addr[:], data))
 }
 
-// Retrieve a state object given my the address. Returns nil if not found.
+// Retrieve a state object given by the address. Returns nil if not found.
 func (ls *LendingStateDB) getLendingExchange(addr common.Hash) (stateObject *lendingExchangeState) {
 	// Prefer 'live' objects.
 	if obj := ls.lendingExchangeStates[addr]; obj != nil {
 		return obj
 	}
 	// Load the object from the database.
+	// TODO(daniel): use trie.TryGetAccount, ref PR #25458
 	enc, err := ls.trie.TryGet(addr[:])
 	if len(enc) == 0 {
 		ls.setError(err)
@@ -578,7 +579,7 @@ func (ls *LendingStateDB) Commit() (root common.Hash, err error) {
 		}
 	}
 	// Write trie changes.
-	root, err = ls.trie.Commit(func(_ [][]byte, _ []byte, leaf []byte, parent common.Hash) error {
+	root, err = ls.trie.Commit(func(_ [][]byte, _ []byte, leaf []byte, parent common.Hash, _ []byte) error {
 		var exchange lendingObject
 		if err := rlp.DecodeBytes(leaf, &exchange); err != nil {
 			return nil

@@ -9,7 +9,12 @@ then
   fi
   echo $PRIVATE_KEY >> /tmp/key
   wallet=$(XDC account import --password .pwd --datadir /work/xdcchain /tmp/key | awk -F '[{}]' '{print $2}')
-  XDC --datadir /work/xdcchain init /work/genesis.json
+  XDC --datadir /work/xdcchain init /work/genesis.json 2>&1 | tee /work/xdcchain/init.log
+  init_status=${PIPESTATUS[0]}
+  if [ "$init_status" -ne 0 ]
+  then
+    exit "$init_status"
+  fi
 else
   wallet=$(XDC account list --datadir /work/xdcchain | head -n 1 | awk -F '[{}]' '{print $2}')
 fi
@@ -25,6 +30,7 @@ do
         bootnodes="${bootnodes},$line"
     fi
 done < "$input"
+
 #check last line since it's not included in "read" command https://stackoverflow.com/questions/12916352/shell-script-read-missing-last-line
 if [ -z "${bootnodes}" ]
 then
@@ -72,23 +78,56 @@ fi
 sync_mode=full
 if test -z "$SYNC_MODE"
 then
-  echo "SYNC_MODE not set, default to full" #full or fast
+  echo "SYNC_MODE not set, default to $sync_mode" #full or fast
 else
   echo "SYNC_MODE found, set to $SYNC_MODE"
   sync_mode=$SYNC_MODE
 fi
 
-gc_mode=archive
+gc_mode=full
 if test -z "$GC_MODE"
 then
-  echo "GC_MODE not set, default to archive" #full or archive
+  echo "GC_MODE not set, default to $gc_mode" #full or archive
 else
   echo "GC_MODE found, set to $GC_MODE"
   gc_mode=$GC_MODE
 fi
 
+ethstats_address=stats.apothem.network:2000
+if test -z "$STATS_ADDRESS"
+then
+  echo "STATS_ADDRESS not set, default to $ethstats_address"
+else
+  echo "STATS_ADDRESS found, set to $STATS_ADDRESS"
+  ethstats_address=$STATS_ADDRESS
+fi
+
+ethstats_secret=xdc_xinfin_apothem_network_stats
+if test -z "$STATS_SECRET"
+then
+  echo "STATS_SECRET not set, default to $ethstats_secret"
+else
+  echo "STATS_SECRET found, set to $STATS_SECRET"
+  ethstats_secret=$STATS_SECRET
+fi
+
+netstats="${NODE_NAME}-${wallet}:$ethstats_secret@$ethstats_address"
+
+fastsync_args=""
+if test -n "$FASTSYNC_PIVOT_NUMBER" || test -n "$FASTSYNC_PIVOT_HASH" || test -n "$FASTSYNC_PIVOT_ROOT"
+then
+  if test -z "$FASTSYNC_PIVOT_NUMBER" || test -z "$FASTSYNC_PIVOT_HASH" || test -z "$FASTSYNC_PIVOT_ROOT"
+  then
+    echo "Error: FASTSYNC_PIVOT_NUMBER, FASTSYNC_PIVOT_HASH, and FASTSYNC_PIVOT_ROOT must all be set together."
+    exit 1
+  fi
+  echo "FASTSYNC_PIVOT_NUMBER found, set to $FASTSYNC_PIVOT_NUMBER"
+  echo "FASTSYNC_PIVOT_HASH found, set to $FASTSYNC_PIVOT_HASH"
+  echo "FASTSYNC_PIVOT_ROOT found, set to $FASTSYNC_PIVOT_ROOT"
+  fastsync_args="--fastsyncpivotnumber ${FASTSYNC_PIVOT_NUMBER} --fastsyncpivothash ${FASTSYNC_PIVOT_HASH} --fastsyncpivotroot ${FASTSYNC_PIVOT_ROOT}"
+fi
+
 INSTANCE_IP=$(curl https://checkip.amazonaws.com)
-netstats="${NODE_NAME}-${wallet}-${INSTANCE_IP}:xdc_xinfin_apothem_network_stats@stats.apothem.network:2000"
 
 
 echo "Running a node with wallet: ${wallet} at IP: ${INSTANCE_IP}"
@@ -109,5 +148,6 @@ XDC --ethstats ${netstats} \
 --miner-gasprice "1" --miner-gaslimit "420000000" --verbosity ${log_level} \
 --debugdatadir /work/xdcchain \
 --store-reward \
+${fastsync_args} \
 --ws --ws-addr=0.0.0.0 --ws-port $ws_port \
 --ws-origins "*" 2>&1 >>/work/xdcchain/xdc.log | tee -a /work/xdcchain/xdc.log

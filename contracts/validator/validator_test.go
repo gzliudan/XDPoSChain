@@ -30,7 +30,6 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/common"
 	"github.com/XinFinOrg/XDPoSChain/common/hexutil"
 	contractValidator "github.com/XinFinOrg/XDPoSChain/contracts/validator/contract"
-	"github.com/XinFinOrg/XDPoSChain/core/state"
 	"github.com/XinFinOrg/XDPoSChain/core/types"
 	"github.com/XinFinOrg/XDPoSChain/crypto"
 	"github.com/XinFinOrg/XDPoSChain/log"
@@ -50,13 +49,17 @@ var (
 	acc4Addr   = crypto.PubkeyToAddress(acc4Key.PublicKey)
 )
 
+// TestValidator tests validator.
 func TestValidator(t *testing.T) {
-	contractBackend := backends.NewXDCSimulatedBackend(types.GenesisAlloc{addr: {Balance: big.NewInt(1000000000)}}, 10000000, params.TestXDPoSMockChainConfig)
-	transactOpts := bind.NewKeyedTransactor(key)
+	contractBackend := backends.NewXDCSimulatedBackend(types.GenesisAlloc{addr: {Balance: big.NewInt(0).Mul(big.NewInt(1e18), big.NewInt(1000))}}, 10000000, params.TestXDPoSMockChainConfig)
+	transactOpts, err := bind.NewKeyedTransactorWithChainID(key, params.TestXDPoSMockChainConfig.ChainID)
+	if err != nil {
+		t.Fatalf("can't create transactor: %v", err)
+	}
 
 	validatorCap := new(big.Int)
 	validatorCap.SetString("50000000000000000000000", 10)
-	validatorAddress, validator, err := DeployValidator(transactOpts, contractBackend, []common.Address{addr}, []*big.Int{validatorCap}, addr)
+	validatorAddress, validator, err := DeployValidator(transactOpts, contractBackend, []common.Address{addr}, []*big.Int{validatorCap}, addr, nil, nil)
 	if err != nil {
 		t.Fatalf("can't deploy root registry: %v", err)
 	}
@@ -86,16 +89,26 @@ func TestValidator(t *testing.T) {
 	contractBackend.Commit()
 }
 
+// TestRewardBalance tests reward balance.
 func TestRewardBalance(t *testing.T) {
 	contractBackend := backends.NewXDCSimulatedBackend(types.GenesisAlloc{
-		acc1Addr: {Balance: new(big.Int).SetUint64(10000000)},
-		acc2Addr: {Balance: new(big.Int).SetUint64(10000000)},
-		acc4Addr: {Balance: new(big.Int).SetUint64(10000000)},
+		acc1Addr: {Balance: big.NewInt(0).Mul(big.NewInt(1e18), big.NewInt(1000))},
+		acc2Addr: {Balance: big.NewInt(0).Mul(big.NewInt(1e18), big.NewInt(1000))},
+		acc4Addr: {Balance: big.NewInt(0).Mul(big.NewInt(1e18), big.NewInt(1000))},
 	}, 42000000, params.TestXDPoSMockChainConfig)
-	acc1Opts := bind.NewKeyedTransactor(acc1Key)
-	acc2Opts := bind.NewKeyedTransactor(acc2Key)
+	acc1Opts, err := bind.NewKeyedTransactorWithChainID(acc1Key, params.TestXDPoSMockChainConfig.ChainID)
+	if err != nil {
+		t.Fatalf("can't create acc1 transactor: %v", err)
+	}
+	acc2Opts, err := bind.NewKeyedTransactorWithChainID(acc2Key, params.TestXDPoSMockChainConfig.ChainID)
+	if err != nil {
+		t.Fatalf("can't create acc2 transactor: %v", err)
+	}
 	accounts := []*bind.TransactOpts{acc1Opts, acc2Opts}
-	transactOpts := bind.NewKeyedTransactor(acc1Key)
+	transactOpts, err := bind.NewKeyedTransactorWithChainID(acc1Key, params.TestXDPoSMockChainConfig.ChainID)
+	if err != nil {
+		t.Fatalf("can't create deploy transactor: %v", err)
+	}
 
 	// validatorAddr, _, baseValidator, err := contract.DeployXDCValidator(transactOpts, contractBackend, big.NewInt(50000), big.NewInt(99), big.NewInt(100), big.NewInt(100))
 	validatorCap := new(big.Int)
@@ -118,7 +131,10 @@ func TestRewardBalance(t *testing.T) {
 	contractBackend.Commit()
 
 	// Propose master node acc3Addr.
-	opts := bind.NewKeyedTransactor(acc4Key)
+	opts, err := bind.NewKeyedTransactorWithChainID(acc4Key, params.TestXDPoSMockChainConfig.ChainID)
+	if err != nil {
+		t.Fatalf("can't create proposer transactor: %v", err)
+	}
 	opts.Value = new(big.Int).SetUint64(50000)
 	acc4Validator, _ := NewValidator(opts, validatorAddr, contractBackend)
 	acc4Validator.Propose(acc3Addr)
@@ -131,7 +147,6 @@ func TestRewardBalance(t *testing.T) {
 	}
 	logCaps := make(map[int]*logCap)
 	for i := 0; i <= 10; i++ {
-		rand.Seed(time.Now().UTC().UnixNano())
 		randIndex := rand.Intn(len(accounts))
 		randCap := rand.Intn(10) * 1000
 		if randCap <= 0 {
@@ -148,7 +163,7 @@ func TestRewardBalance(t *testing.T) {
 		logCaps[i] = &logCap{accounts[randIndex].From.String(), randCap}
 	}
 
-	foundationAddr := common.FoudationAddrBinary
+	foundationAddr := common.FoundationAddrBinary
 	totalReward := new(big.Int).SetInt64(15 * 1000)
 	rewards, err := GetRewardBalancesRate(foundationAddr, acc3Addr, totalReward, baseValidator)
 	if err != nil {
@@ -179,10 +194,9 @@ func TestRewardBalance(t *testing.T) {
 
 		t.Errorf("reward total %v - %v", totalReward, afterReward)
 	}
-
 }
 
-func GetRewardBalancesRate(foudationWalletAddr common.Address, masterAddr common.Address, totalReward *big.Int, validator *contractValidator.XDCValidator) (map[common.Address]*big.Int, error) {
+func GetRewardBalancesRate(foundationWalletAddr common.Address, masterAddr common.Address, totalReward *big.Int, validator *contractValidator.XDCValidator) (map[common.Address]*big.Int, error) {
 	owner := GetCandidatesOwnerBySigner(validator, masterAddr)
 	balances := make(map[common.Address]*big.Int)
 	rewardMaster := new(big.Int).Mul(totalReward, new(big.Int).SetInt64(common.RewardMasterPercent))
@@ -229,22 +243,21 @@ func GetRewardBalancesRate(foudationWalletAddr common.Address, masterAddr common
 		}
 	}
 
-	foudationReward := new(big.Int).Mul(totalReward, new(big.Int).SetInt64(common.RewardFoundationPercent))
-	foudationReward = new(big.Int).Div(foudationReward, new(big.Int).SetInt64(100))
-	balances[foudationWalletAddr] = foudationReward
+	foundationReward := new(big.Int).Mul(totalReward, new(big.Int).SetInt64(common.RewardFoundationPercent))
+	foundationReward = new(big.Int).Div(foundationReward, new(big.Int).SetInt64(100))
+	balances[foundationWalletAddr] = foundationReward
 
 	jsonHolders, err := json.Marshal(balances)
 	if err != nil {
 		log.Error("Fail to parse json holders", "error", err)
 		return nil, err
 	}
-	log.Info("Holders reward", "holders", string(jsonHolders), "masternode", masterAddr.String())
+	log.Info("Holders reward", "holders", string(jsonHolders), "masternode", masterAddr)
 
 	return balances, nil
 }
 
 func GetCandidatesOwnerBySigner(validator *contractValidator.XDCValidator, signerAddr common.Address) common.Address {
-	owner := signerAddr
 	opts := new(bind.CallOpts)
 	owner, err := validator.GetCandidateOwner(opts, signerAddr)
 	if err != nil {
@@ -254,11 +267,12 @@ func GetCandidatesOwnerBySigner(validator *contractValidator.XDCValidator, signe
 
 	return owner
 }
+
 func toyVoteTx(t *testing.T, nonce uint64, amount *big.Int, to, addr common.Address) *types.Transaction {
 	vote := "6dd7d8ea" // VoteMethod = "0x6dd7d8ea"
 	action := fmt.Sprintf("%s%s%s", vote, "000000000000000000000000", addr.String()[3:])
 	data := common.Hex2Bytes(action)
-	gasPrice := big.NewInt(0)
+	gasPrice := big.NewInt(20_000_000_000)
 	tx := types.NewTransaction(nonce, to, amount, 5000000, gasPrice, data)
 	signedTX, err := types.SignTx(tx, types.FrontierSigner{}, acc4Key)
 	if err != nil {
@@ -266,21 +280,26 @@ func toyVoteTx(t *testing.T, nonce uint64, amount *big.Int, to, addr common.Addr
 	}
 	return signedTX
 }
+
+// TestStatedbUtils tests statedb utils.
 func TestStatedbUtils(t *testing.T) {
 	validatorCap := new(big.Int)
 	validatorCap.SetString("50000000000000000000000", 10)
 	voteAmount := new(big.Int)
 	voteAmount.SetString("25000000000000000000000", 10)
 	genesisAlloc := types.GenesisAlloc{
-		addr:     {Balance: big.NewInt(1000000000)},
+		addr:     {Balance: big.NewInt(0).Mul(big.NewInt(1e18), big.NewInt(1000))},
 		acc1Addr: {Balance: validatorCap},
 		acc2Addr: {Balance: validatorCap},
 		acc4Addr: {Balance: validatorCap},
 	}
 	contractBackend := backends.NewXDCSimulatedBackend(genesisAlloc, 10000000, params.TestXDPoSMockChainConfig)
-	transactOpts := bind.NewKeyedTransactor(key)
+	transactOpts, err := bind.NewKeyedTransactorWithChainID(key, params.TestXDPoSMockChainConfig.ChainID)
+	if err != nil {
+		t.Fatalf("can't create transactor: %v", err)
+	}
 
-	validatorAddress, _, err := DeployValidator(transactOpts, contractBackend, []common.Address{addr, acc3Addr}, []*big.Int{validatorCap, validatorCap}, addr)
+	validatorAddress, _, err := DeployValidator(transactOpts, contractBackend, []common.Address{addr, acc3Addr}, []*big.Int{validatorCap, validatorCap}, addr, nil, nil)
 	if err != nil {
 		t.Fatalf("can't deploy root registry: %v", err)
 	}
@@ -320,7 +339,7 @@ func TestStatedbUtils(t *testing.T) {
 	if err != nil {
 		t.Fatalf("can't get candidates: %v", err)
 	}
-	candidates_statedb := state.GetCandidates(statedb)
+	candidates_statedb := statedb.GetCandidates()
 	if !reflect.DeepEqual(candidates, candidates_statedb) {
 		t.Fatalf("candidates not equal, statedb utils is wrong,\nbind calling result\n%v\nstatedb result\n%v", candidates, candidates_statedb)
 	}
@@ -332,18 +351,18 @@ func TestStatedbUtils(t *testing.T) {
 		if err != nil {
 			t.Fatalf("can't get candidate cap: %v", err)
 		}
-		cap_statedb := state.GetCandidateCap(statedb, it)
+		cap_statedb := statedb.GetCandidateCap(it)
 		if cap.Cmp(cap_statedb) != 0 {
 			t.Fatalf("cap not equal, statedb utils is wrong")
 		}
-		if cap.Cmp(big.NewInt(0)) == 0 {
+		if cap.Sign() == 0 {
 			t.Fatalf("cap should not be zero")
 		}
 		owner, err := validator.GetCandidateOwner(it)
 		if err != nil {
 			t.Fatalf("can't get candidate owner: %v", err)
 		}
-		owner_statedb := state.GetCandidateOwner(statedb, it)
+		owner_statedb := statedb.GetCandidateOwner(it)
 		if !reflect.DeepEqual(owner, owner_statedb) {
 			t.Fatalf("owner not equal, statedb utils is wrong")
 		}
@@ -352,7 +371,7 @@ func TestStatedbUtils(t *testing.T) {
 	if err != nil {
 		t.Fatalf("can't get voters: %v", err)
 	}
-	voters_statedb := state.GetVoters(statedb, acc3Addr)
+	voters_statedb := statedb.GetVoters(acc3Addr)
 	if !reflect.DeepEqual(voters, voters_statedb) {
 		t.Fatalf("voters not equal, statedb utils is wrong,\nbind calling result\n%v\nstatedb result\n%v", voters, voters_statedb)
 	}
@@ -364,11 +383,11 @@ func TestStatedbUtils(t *testing.T) {
 		if err != nil {
 			t.Fatalf("can't get voter cap: %v", err)
 		}
-		cap_statedb := state.GetVoterCap(statedb, acc3Addr, it)
+		cap_statedb := statedb.GetVoterCap(acc3Addr, it)
 		if cap.Cmp(cap_statedb) != 0 {
 			t.Fatalf("cap not equal, statedb utils is wrong")
 		}
-		if cap.Cmp(big.NewInt(0)) == 0 {
+		if cap.Sign() == 0 {
 			t.Fatalf("cap should not be zero")
 		}
 	}

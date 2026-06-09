@@ -194,10 +194,8 @@ func (tx *LendingTransaction) From() *common.Address {
 		} else {
 			return &f
 		}
-
 	}
 	return nil
-
 }
 
 // WithSignature returns a new transaction with the given signature.
@@ -214,7 +212,6 @@ func (tx *LendingTransaction) WithSignature(signer LendingSigner, sig []byte) (*
 
 // ImportSignature make lending tx with specific signature
 func (tx *LendingTransaction) ImportSignature(V, R, S *big.Int) *LendingTransaction {
-
 	if V != nil {
 		tx.data.V = V
 	}
@@ -245,7 +242,7 @@ func (tx *LendingTransaction) CacheHash() {
 }
 
 // Size returns the true RLP encoded storage size of the transaction, either by
-// encoding and returning it, or returning a previsouly cached value.
+// encoding and returning it, or returning a previously cached value.
 func (tx *LendingTransaction) Size() common.StorageSize {
 	if size := tx.size.Load(); size != nil {
 		return size.(common.StorageSize)

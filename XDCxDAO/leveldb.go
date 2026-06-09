@@ -2,9 +2,7 @@ package XDCxDAO
 
 import (
 	"bytes"
-	"encoding/hex"
 	"errors"
-	"sync"
 
 	"github.com/XinFinOrg/XDPoSChain/common"
 	"github.com/XinFinOrg/XDPoSChain/core/rawdb"
@@ -19,7 +17,6 @@ type BatchItem struct {
 type BatchDatabase struct {
 	db         ethdb.Database
 	emptyKey   []byte
-	lock       sync.RWMutex
 	cacheLimit int
 	Debug      bool
 }
@@ -48,35 +45,14 @@ func NewBatchDatabaseWithEncode(datadir string, cacheLimit int) *BatchDatabase {
 	}
 
 	return batchDB
-
 }
 
 func (db *BatchDatabase) IsEmptyKey(key []byte) bool {
 	return len(key) == 0 || bytes.Equal(key, db.emptyKey)
 }
 
-func (db *BatchDatabase) getCacheKey(key []byte) string {
-	return hex.EncodeToString(key)
-}
-
-func (db *BatchDatabase) HasObject(hash common.Hash, val interface{}) (bool, error) {
-	// for mongodb only
-	return false, nil
-}
-
 func (db *BatchDatabase) GetObject(hash common.Hash, val interface{}) (interface{}, error) {
-	// for mongodb only
 	return nil, nil
-}
-
-func (db *BatchDatabase) PutObject(hash common.Hash, val interface{}) error {
-	// for mongodb only
-	return nil
-}
-
-func (db *BatchDatabase) DeleteObject(hash common.Hash, val interface{}) error {
-	// for mongodb only
-	return nil
 }
 
 func (db *BatchDatabase) Put(key []byte, val []byte) error {

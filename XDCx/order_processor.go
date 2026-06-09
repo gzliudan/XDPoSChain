@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/XinFinOrg/XDPoSChain/core/tracing"
 	"github.com/XinFinOrg/XDPoSChain/core/types"
 
 	"github.com/XinFinOrg/XDPoSChain/consensus"
@@ -243,7 +244,7 @@ func (XDCx *XDCX) processOrderList(coinbase common.Address, chain consensus.Chai
 				inversePrice := tradingStateDB.GetLastPrice(tradingstate.GetTradingOrderBookHash(common.XDCNativeAddressBinary, oldestOrder.QuoteToken))
 				quoteTokenDecimal, err := XDCx.GetTokenDecimal(chain, statedb, oldestOrder.QuoteToken)
 				if err != nil || quoteTokenDecimal.Sign() == 0 {
-					return nil, nil, nil, fmt.Errorf("fail to get tokenDecimal: Token: %v . Err: %v", oldestOrder.QuoteToken.String(), err)
+					return nil, nil, nil, fmt.Errorf("fail to get tokenDecimal: Token: %v . Err: %v", oldestOrder.QuoteToken, err)
 				}
 				log.Debug("TryGet inversePrice XDC/QuoteToken", "inversePrice", inversePrice)
 				if inversePrice != nil && inversePrice.Sign() > 0 {
@@ -368,17 +369,17 @@ func (XDCx *XDCX) processOrderList(coinbase common.Address, chain consensus.Chai
 func (XDCx *XDCX) getTradeQuantity(quotePrice *big.Int, coinbase common.Address, chain consensus.ChainContext, statedb *state.StateDB, takerOrder *tradingstate.OrderItem, makerOrder *tradingstate.OrderItem, quantityToTrade *big.Int) (*big.Int, bool, *tradingstate.SettleBalance, error) {
 	baseTokenDecimal, err := XDCx.GetTokenDecimal(chain, statedb, makerOrder.BaseToken)
 	if err != nil || baseTokenDecimal.Sign() == 0 {
-		return tradingstate.Zero, false, nil, fmt.Errorf("fail to get tokenDecimal: Token: %v . Err: %v", makerOrder.BaseToken.String(), err)
+		return tradingstate.Zero, false, nil, fmt.Errorf("fail to get tokenDecimal: Token: %v . Err: %v", makerOrder.BaseToken, err)
 	}
 	quoteTokenDecimal, err := XDCx.GetTokenDecimal(chain, statedb, makerOrder.QuoteToken)
 	if err != nil || quoteTokenDecimal.Sign() == 0 {
-		return tradingstate.Zero, false, nil, fmt.Errorf("fail to get tokenDecimal: Token: %v . Err: %v", makerOrder.QuoteToken.String(), err)
+		return tradingstate.Zero, false, nil, fmt.Errorf("fail to get tokenDecimal: Token: %v . Err: %v", makerOrder.QuoteToken, err)
 	}
 	if makerOrder.QuoteToken == common.XDCNativeAddressBinary {
 		quotePrice = quoteTokenDecimal
 	}
 	if takerOrder.ExchangeAddress == makerOrder.ExchangeAddress {
-		if err := tradingstate.CheckRelayerFee(takerOrder.ExchangeAddress, new(big.Int).Mul(common.RelayerFee, big.NewInt(2)), statedb); err != nil {
+		if err := tradingstate.CheckRelayerFee(takerOrder.ExchangeAddress, new(big.Int).Lsh(common.RelayerFee, 1), statedb); err != nil {
 			log.Debug("Reject order Taker Exchnage = Maker Exchange , relayer not enough fee ", "err", err)
 			return tradingstate.Zero, false, nil, nil
 		}
@@ -587,11 +588,15 @@ func DoSettleBalance(coinbase common.Address, takerOrder, makerOrder *tradingsta
 		return err
 	}
 	mapRelayerFee[makerOrder.ExchangeAddress] = newRelayerMakerFee
-	tradingstate.SetSubRelayerFee(takerOrder.ExchangeAddress, newRelayerTakerFee, common.RelayerFee, statedb)
-	tradingstate.SetSubRelayerFee(makerOrder.ExchangeAddress, newRelayerMakerFee, common.RelayerFee, statedb)
+	if err := tradingstate.SetSubRelayerFee(takerOrder.ExchangeAddress, newRelayerTakerFee, common.RelayerFee, statedb); err != nil {
+		return err
+	}
+	if err := tradingstate.SetSubRelayerFee(makerOrder.ExchangeAddress, newRelayerMakerFee, common.RelayerFee, statedb); err != nil {
+		return err
+	}
 
 	masternodeOwner := statedb.GetOwner(coinbase)
-	statedb.AddBalance(masternodeOwner, matchingFee)
+	statedb.AddBalance(masternodeOwner, matchingFee, tracing.BalanceChangeUnspecified)
 
 	err = tradingstate.SetTokenBalance(takerOrder.UserAddress, newTakerInTotal, settleBalance.Taker.InToken, statedb)
 	if err != nil {
@@ -635,7 +640,7 @@ func (XDCx *XDCX) ProcessCancelOrder(header *types.Header, tradingStateDB *tradi
 	}
 	baseTokenDecimal, err := XDCx.GetTokenDecimal(chain, statedb, order.BaseToken)
 	if err != nil || baseTokenDecimal.Sign() == 0 {
-		log.Debug("Fail to get tokenDecimal ", "Token", order.BaseToken.String(), "err", err)
+		log.Debug("Fail to get tokenDecimal ", "Token", order.BaseToken, "err", err)
 		return err, false
 	}
 	// order: basic order information (includes orderId, orderHash, baseToken, quoteToken) which user send to XDCx to cancel order
@@ -680,7 +685,7 @@ func (XDCx *XDCX) ProcessCancelOrder(header *types.Header, tradingStateDB *tradi
 	}
 	masternodeOwner := statedb.GetOwner(coinbase)
 	// relayers pay XDC for masternode
-	statedb.AddBalance(masternodeOwner, common.RelayerCancelFee)
+	statedb.AddBalance(masternodeOwner, common.RelayerCancelFee, tracing.BalanceChangeUnspecified)
 
 	relayerOwner := tradingstate.GetRelayerOwner(originOrder.ExchangeAddress, statedb)
 	switch originOrder.Side {
@@ -782,38 +787,6 @@ func (XDCx *XDCX) UpdateMediumPriceBeforeEpoch(epochNumber uint64, tradingStateD
 			epochPriceResult[orderbook] = mediumPriceCurrent
 		}
 		tradingStateDB.SetMediumPrice(orderbook, tradingstate.Zero, tradingstate.Zero)
-	}
-	if XDCx.IsSDKNode() {
-		if err := XDCx.LogEpochPrice(epochNumber, epochPriceResult); err != nil {
-			log.Error("failed to update epochPrice", "err", err)
-		}
-	}
-	return nil
-}
-
-// put average price of epoch to mongodb for tracking liquidation trades
-// epochPriceResult: a map of epoch average price, key is orderbook hash , value is epoch average price
-// orderbook hash genereted from baseToken, quoteToken at XDPoSChain/XDCx/tradingstate/common.go:214
-func (XDCx *XDCX) LogEpochPrice(epochNumber uint64, epochPriceResult map[common.Hash]*big.Int) error {
-	db := XDCx.GetMongoDB()
-	db.InitBulk()
-
-	for orderbook, price := range epochPriceResult {
-		if price.Sign() <= 0 {
-			continue
-		}
-		epochPriceItem := &tradingstate.EpochPriceItem{
-			Epoch:     epochNumber,
-			Orderbook: orderbook,
-			Price:     price,
-		}
-		epochPriceItem.Hash = epochPriceItem.ComputeHash()
-		if err := db.PutObject(epochPriceItem.Hash, epochPriceItem); err != nil {
-			return err
-		}
-	}
-	if err := db.CommitBulk(); err != nil {
-		return err
 	}
 	return nil
 }

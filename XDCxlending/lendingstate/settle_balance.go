@@ -72,7 +72,7 @@ func GetSettleBalance(isXDCXLendingFork bool,
 				log.Debug("quantity lending too small", "quantityToLend", quantityToLend, "takerFee", takerFee)
 				return result, ErrQuantityTradeTooSmall
 			}
-			if lendingToken != common.XDCNativeAddressBinary && lendTokenXDCPrice != nil && lendTokenXDCPrice.Cmp(common.Big0) > 0 {
+			if lendingToken != common.XDCNativeAddressBinary && lendTokenXDCPrice != nil && lendTokenXDCPrice.Sign() > 0 {
 				exTakerReceivedFee := new(big.Int).Mul(takerFee, lendTokenXDCPrice)
 				exTakerReceivedFee = new(big.Int).Div(exTakerReceivedFee, lendTokenDecimal)
 
@@ -122,7 +122,7 @@ func GetSettleBalance(isXDCXLendingFork bool,
 				log.Debug("quantity lending too small", "quantityToLend", quantityToLend, "makerFee", makerFee)
 				return result, ErrQuantityTradeTooSmall
 			}
-			if lendingToken != common.XDCNativeAddressBinary && lendTokenXDCPrice != nil && lendTokenXDCPrice.Cmp(common.Big0) > 0 {
+			if lendingToken != common.XDCNativeAddressBinary && lendTokenXDCPrice != nil && lendTokenXDCPrice.Sign() > 0 {
 				exMakerReceivedFee := new(big.Int).Mul(makerFee, lendTokenXDCPrice)
 				exMakerReceivedFee = new(big.Int).Div(exMakerReceivedFee, lendTokenDecimal)
 
@@ -159,7 +159,6 @@ func GetSettleBalance(isXDCXLendingFork bool,
 			}
 		}
 	} else {
-
 		collateralQuantity := new(big.Int).Mul(quantityToLend, collateralTokenDecimal)
 		collateralQuantity = new(big.Int).Mul(collateralQuantity, depositRate) // eg: depositRate = 150%
 		collateralQuantity = new(big.Int).Div(collateralQuantity, big.NewInt(100))
@@ -172,7 +171,7 @@ func GetSettleBalance(isXDCXLendingFork bool,
 			log.Debug("quantity lending too small", "quantityToLend", quantityToLend, "borrowFee", borrowFee)
 			return result, ErrQuantityTradeTooSmall
 		}
-		if lendingToken != common.XDCNativeAddressBinary && lendTokenXDCPrice != nil && lendTokenXDCPrice.Cmp(common.Big0) > 0 {
+		if lendingToken != common.XDCNativeAddressBinary && lendTokenXDCPrice != nil && lendTokenXDCPrice.Sign() > 0 {
 			// exReceivedFee: the fee amount which borrowingRelayer will receive
 			exReceivedFee := new(big.Int).Mul(borrowFee, lendTokenXDCPrice)
 			exReceivedFee = new(big.Int).Div(exReceivedFee, lendTokenDecimal)
@@ -236,7 +235,7 @@ func CalculateInterestRate(finalizeTime, liquidationTime, term uint64, apr uint6
 	// the time interval which borrower have to pay interest
 	// (T + T1) / 2
 	timeToPayInterest := new(big.Int).Add(new(big.Int).SetUint64(term), new(big.Int).SetUint64(borrowingTime))
-	timeToPayInterest = new(big.Int).Div(timeToPayInterest, new(big.Int).SetUint64(2))
+	timeToPayInterest = new(big.Int).Rsh(timeToPayInterest, 1)
 
 	interestRate := new(big.Int).SetUint64(apr)
 	interestRate = new(big.Int).Mul(interestRate, timeToPayInterest)

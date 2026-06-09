@@ -3,6 +3,7 @@ package engine_v2
 import (
 	"github.com/XinFinOrg/XDPoSChain/common"
 	"github.com/XinFinOrg/XDPoSChain/consensus"
+	"github.com/XinFinOrg/XDPoSChain/consensus/XDPoS/utils"
 	"github.com/XinFinOrg/XDPoSChain/core/types"
 )
 
@@ -36,12 +37,12 @@ func (x *XDPoS_v2) GetCurrentRoundFaker() types.Round {
 
 // Utils for test to get current Pool size
 func (x *XDPoS_v2) GetVotePoolSizeFaker(vote *types.Vote) int {
-	return x.votePool.Size(vote)
+	return x.votePool.Size(vote.PoolKey())
 }
 
 // Utils for test to get Timeout Pool Size
 func (x *XDPoS_v2) GetTimeoutPoolSizeFaker(timeout *types.Timeout) int {
-	return x.timeoutPool.Size(timeout)
+	return x.timeoutPool.Size(timeout.PoolKey())
 }
 
 // WARN: This function is designed for testing purpose only!
@@ -85,4 +86,23 @@ func (x *XDPoS_v2) AuthorizeFaker(signer common.Address) {
 
 func (x *XDPoS_v2) GetForensicsFaker() *Forensics {
 	return x.ForensicsProcessor
+}
+
+// WARN: This function is designed for testing purpose only!
+func (x *XDPoS_v2) GetTCEpochInfoFaker(chain consensus.ChainReader, timeoutRound types.Round) (*types.EpochSwitchInfo, error) {
+	return x.getTCEpochInfo(chain, timeoutRound)
+}
+
+// WARN: This function is designed for testing purpose only!
+func (x *XDPoS_v2) OnVotePoolThresholdReachedFaker(chain consensus.ChainReader, pooledVotes map[common.Hash]utils.PoolObj, currentVoteMsg utils.PoolObj, proposedBlockHeader *types.Header) error {
+	x.lock.Lock()
+	defer x.lock.Unlock()
+	return x.onVotePoolThresholdReached(chain, pooledVotes, currentVoteMsg, proposedBlockHeader)
+}
+
+// WARN: This function is designed for testing purpose only!
+func (x *XDPoS_v2) OnTimeoutPoolThresholdReachedFaker(chain consensus.ChainReader, pooledTimeouts map[common.Hash]utils.PoolObj, currentTimeoutMsg utils.PoolObj, gapNumber uint64) error {
+	x.lock.Lock()
+	defer x.lock.Unlock()
+	return x.onTimeoutPoolThresholdReached(chain, pooledTimeouts, currentTimeoutMsg, gapNumber)
 }

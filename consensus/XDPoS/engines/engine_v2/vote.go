@@ -29,9 +29,10 @@ func (x *XDPoS_v2) sendVote(chainReader consensus.ChainReader, blockInfo *types.
 		return err
 	}
 	epochSwitchNumber := epochSwitchInfo.EpochSwitchBlockInfo.Number.Uint64()
-	gapNumber := epochSwitchNumber - epochSwitchNumber%x.config.Epoch - x.config.Gap
-	// prevent overflow
-	if epochSwitchNumber-epochSwitchNumber%x.config.Epoch < x.config.Gap {
+	gapNumber := epochSwitchNumber - epochSwitchNumber%x.config.Epoch
+	if gapNumber > x.config.Gap {
+		gapNumber -= x.config.Gap
+	} else {
 		gapNumber = 0
 	}
 	signedHash, err := x.signSignature(types.VoteSigHash(&types.VoteForSign{
@@ -76,7 +77,9 @@ func (x *XDPoS_v2) voteHandler(chain consensus.ChainReader, voteMsg *types.Vote)
 
 	// Collect vote
 	numberOfVotesInPool, pooledVotes := x.votePool.Add(voteMsg)
+	log.Trace("[voteHandler] New vote", "signer", voteMsg.GetSigner().Hex(), "proposedBlockInfoRound", voteMsg.ProposedBlockInfo.Round, "proposedBlockInfoNumber", voteMsg.ProposedBlockInfo.Number.Uint64(), "proposedBlockInfoHash", voteMsg.ProposedBlockInfo.Hash.Hex())
 	log.Debug("[voteHandler] collect votes", "number", numberOfVotesInPool)
+
 	go x.ForensicsProcessor.DetectEquivocationInVotePool(voteMsg, x.votePool)
 	go x.ForensicsProcessor.ProcessVoteEquivocation(chain, x, voteMsg)
 
@@ -127,10 +130,9 @@ func (x *XDPoS_v2) verifyVotes(chain consensus.ChainReader, votes map[common.Has
 	emptySigner := common.Address{}
 	// Filter out non-Master nodes signatures
 	var wg sync.WaitGroup
-	wg.Add(len(votes))
-	for h, vote := range votes {
-		go func(hash common.Hash, v *types.Vote) {
-			defer wg.Done()
+	for _, vote := range votes {
+		wg.Go(func() {
+			v := vote.(*types.Vote)
 			signerAddress := v.GetSigner()
 			if signerAddress != emptySigner {
 				// verify that signer belongs to the final masternodes, we have not do so in previous steps
@@ -153,7 +155,7 @@ func (x *XDPoS_v2) verifyVotes(chain consensus.ChainReader, votes map[common.Has
 			})
 			verified, masterNode, err := x.verifyMsgSignature(signedVote, v.Signature, masternodes)
 			if err != nil {
-				log.Warn("[verifyVotes] error while verifying vote signature", "error", err.Error())
+				log.Warn("[verifyVotes] error while verifying vote signature", "err", err)
 				return
 			}
 
@@ -162,7 +164,7 @@ func (x *XDPoS_v2) verifyVotes(chain consensus.ChainReader, votes map[common.Has
 				return
 			}
 			v.SetSigner(masterNode)
-		}(h, vote.(*types.Vote))
+		})
 	}
 	wg.Wait()
 	elapsed := time.Since(start)
@@ -189,13 +191,27 @@ func (x *XDPoS_v2) onVotePoolThresholdReached(chain consensus.ChainReader, poole
 		return errors.New("fail on voteHandler due to failure in getting epoch switch info")
 	}
 
+	// verify and deduplicate; drop invalid/duplicate votes rather than bail,
+	// so a single byzantine sender cannot stall QC generation for a round
+	signedVoteObj := types.VoteSigHash(&types.VoteForSign{
+		ProposedBlockInfo: currentVoteMsg.(*types.Vote).ProposedBlockInfo,
+		GapNumber:         currentVoteMsg.(*types.Vote).GapNumber,
+	})
+	validSignatures, _, duplicates, err := x.verifyAllSignatures(signedVoteObj, validSignatures, epochInfo.Masternodes)
+	if err != nil {
+		log.Warn("[onVotePoolThresholdReached] some vote signatures failed verification, continuing with valid subset", "error", err)
+	}
+	if len(duplicates) > 0 {
+		log.Warn("[onVotePoolThresholdReached] duplicate signers in vote pool, dropping duplicates", "duplicates", duplicates)
+	}
+
 	// Skip and wait for the next vote to process again if valid votes is less than what we required
 	certThreshold := x.config.V2.Config(uint64(currentVoteMsg.(*types.Vote).ProposedBlockInfo.Round)).CertThreshold
 	if float64(len(validSignatures)) < float64(epochInfo.MasternodesLen)*certThreshold {
 		log.Warn("[onVotePoolThresholdReached] Not enough valid signatures to generate QC", "VotesSignaturesAfterFilter", validSignatures, "NumberOfValidVotes", len(validSignatures), "NumberOfVotes", len(pooledVotes))
 		return nil
 	}
-	// Genrate QC
+	// Generate QC
 	quorumCert := &types.QuorumCert{
 		ProposedBlockInfo: currentVoteMsg.(*types.Vote).ProposedBlockInfo,
 		Signatures:        validSignatures,
@@ -285,7 +301,7 @@ func (x *XDPoS_v2) hygieneVotePool() {
 		}
 		// Clean up any votes round that is 10 rounds older
 		if keyedRound < int64(round)-utils.PoolHygieneRound {
-			log.Debug("[hygieneVotePool] Cleaned vote poll at round", "Round", keyedRound, "currentRound", round, "Key", k)
+			log.Debug("[hygieneVotePool] Cleaned vote pool at round", "Round", keyedRound, "currentRound", round, "Key", k)
 			x.votePool.ClearByPoolKey(k)
 		}
 	}

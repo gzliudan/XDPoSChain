@@ -84,7 +84,7 @@ func genValueTx(nbytes int) func(int, *BlockGen) {
 	return func(i int, gen *BlockGen) {
 		toaddr := common.Address{}
 		data := make([]byte, nbytes)
-		gas, _ := IntrinsicGas(data, nil, false, false, false)
+		gas, _ := IntrinsicGas(data, nil, nil, false, false, false)
 		tx, _ := types.SignTx(types.NewTransaction(gen.TxNonce(benchRootAddr), toaddr, big.NewInt(1), gas, nil, data), types.HomesteadSigner{}, benchRootKey)
 		gen.AddTx(tx)
 	}
@@ -110,7 +110,7 @@ func init() {
 func genTxRing(naccounts int) func(int, *BlockGen) {
 	from := 0
 	return func(i int, gen *BlockGen) {
-		gas := CalcGasLimit(gen.PrevBlock(i - 1))
+		gas := CalcGasLimit(gen.PrevBlock(i-1).GasLimit(), params.XDCGenesisGasLimit)
 		for {
 			gas -= params.TxGas
 			if gas < params.TxGas {
@@ -158,19 +158,17 @@ func benchInsertChain(b *testing.B, disk bool, gen func(int, *BlockGen)) {
 		}
 		defer db.Close()
 	}
-
 	// Generate a chain of b.N blocks using the supplied block
 	// generator function.
-	gspec := Genesis{
-		Config: params.TestChainConfig,
+	gspec := &Genesis{
 		Alloc:  types.GenesisAlloc{benchRootAddr: {Balance: benchRootFunds}},
+		Config: params.TestChainConfig,
 	}
-	genesis := gspec.MustCommit(db)
-	chain, _ := GenerateChain(gspec.Config, genesis, ethash.NewFaker(), db, b.N, gen)
+	_, chain, _ := GenerateChainWithGenesis(gspec, ethash.NewFaker(), b.N, gen)
 
 	// Time the insertion of the new chain.
 	// State and blocks are stored in the same DB.
-	chainman, _ := NewBlockChain(db, nil, gspec.Config, ethash.NewFaker(), vm.Config{})
+	chainman, _ := NewBlockChain(db, nil, gspec, ethash.NewFaker(), vm.Config{})
 	defer chainman.Stop()
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -182,37 +180,66 @@ func benchInsertChain(b *testing.B, disk bool, gen func(int, *BlockGen)) {
 func BenchmarkChainRead_header_10k(b *testing.B) {
 	benchReadChain(b, false, 10000)
 }
+
 func BenchmarkChainRead_full_10k(b *testing.B) {
 	benchReadChain(b, true, 10000)
 }
+
 func BenchmarkChainRead_header_100k(b *testing.B) {
+	if testing.Short() {
+		b.Skip("Skipping in short-mode")
+	}
 	benchReadChain(b, false, 100000)
 }
+
 func BenchmarkChainRead_full_100k(b *testing.B) {
+	if testing.Short() {
+		b.Skip("Skipping in short-mode")
+	}
 	benchReadChain(b, true, 100000)
 }
+
 func BenchmarkChainRead_header_500k(b *testing.B) {
+	if testing.Short() {
+		b.Skip("Skipping in short-mode")
+	}
 	benchReadChain(b, false, 500000)
 }
+
 func BenchmarkChainRead_full_500k(b *testing.B) {
+	if testing.Short() {
+		b.Skip("Skipping in short-mode")
+	}
 	benchReadChain(b, true, 500000)
 }
+
 func BenchmarkChainWrite_header_10k(b *testing.B) {
 	benchWriteChain(b, false, 10000)
 }
+
 func BenchmarkChainWrite_full_10k(b *testing.B) {
 	benchWriteChain(b, true, 10000)
 }
+
 func BenchmarkChainWrite_header_100k(b *testing.B) {
 	benchWriteChain(b, false, 100000)
 }
+
 func BenchmarkChainWrite_full_100k(b *testing.B) {
 	benchWriteChain(b, true, 100000)
 }
+
 func BenchmarkChainWrite_header_500k(b *testing.B) {
+	if testing.Short() {
+		b.Skip("Skipping in short-mode")
+	}
 	benchWriteChain(b, false, 500000)
 }
+
 func BenchmarkChainWrite_full_500k(b *testing.B) {
+	if testing.Short() {
+		b.Skip("Skipping in short-mode")
+	}
 	benchWriteChain(b, true, 500000)
 }
 
@@ -236,6 +263,11 @@ func makeChainForBench(db ethdb.Database, full bool, count uint64) {
 		rawdb.WriteCanonicalHash(db, hash, n)
 		rawdb.WriteTd(db, hash, n, big.NewInt(int64(n+1)))
 
+		if n == 0 {
+			rawdb.WriteChainConfig(db, hash, params.TestChainConfig)
+		}
+		rawdb.WriteHeadHeaderHash(db, hash)
+
 		if full || n == 0 {
 			block := types.NewBlockWithHeader(header)
 			rawdb.WriteBody(db, hash, n, block.Body())
@@ -245,7 +277,7 @@ func makeChainForBench(db ethdb.Database, full bool, count uint64) {
 }
 
 func benchWriteChain(b *testing.B, full bool, count uint64) {
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		dir := b.TempDir()
 		db, err := rawdb.NewLevelDBDatabase(dir, 128, 1024, "", false)
 		if err != nil {
@@ -268,14 +300,12 @@ func benchReadChain(b *testing.B, full bool, count uint64) {
 	db.Close()
 
 	b.ReportAllocs()
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		db, err := rawdb.NewLevelDBDatabase(dir, 128, 1024, "", false)
 		if err != nil {
 			b.Fatalf("error opening database at %v: %v", dir, err)
 		}
-		chain, err := NewBlockChain(db, nil, params.TestChainConfig, ethash.NewFaker(), vm.Config{})
+		chain, err := NewBlockChain(db, nil, nil, ethash.NewFaker(), vm.Config{})
 		if err != nil {
 			b.Fatalf("error creating chain: %v", err)
 		}

@@ -27,40 +27,32 @@ import (
 	"strconv"
 
 	"github.com/XinFinOrg/XDPoSChain/common/hexutil"
-	"golang.org/x/crypto/sha3"
+	"github.com/XinFinOrg/XDPoSChain/crypto/keccak"
 )
 
 const (
-	HashLength                       = 32
-	AddressLength                    = 20
-	BlockSigners                     = "xdc0000000000000000000000000000000000000089"
-	MasternodeVotingSMC              = "xdc0000000000000000000000000000000000000088"
-	RandomizeSMC                     = "xdc0000000000000000000000000000000000000090"
-	FoudationAddr                    = "xdc0000000000000000000000000000000000000068"
-	TeamAddr                         = "xdc0000000000000000000000000000000000000099"
-	XDCXAddr                         = "xdc0000000000000000000000000000000000000091"
-	TradingStateAddr                 = "xdc0000000000000000000000000000000000000092"
-	XDCXLendingAddress               = "xdc0000000000000000000000000000000000000093"
-	XDCXLendingFinalizedTradeAddress = "xdc0000000000000000000000000000000000000094"
-	XDCNativeAddress                 = "xdc0000000000000000000000000000000000000001"
-	LendingLockAddress               = "xdc0000000000000000000000000000000000000011"
-	VoteMethod                       = "0x6dd7d8ea"
-	UnvoteMethod                     = "0x02aa9be2"
-	ProposeMethod                    = "0x01267951"
-	ResignMethod                     = "0xae6e43f5"
-	SignMethod                       = "0xe341eaa4"
-	XDCXApplyMethod                  = "0xc6b32f34"
-	XDCZApplyMethod                  = "0xc6b32f34"
+	HashLength      = 32
+	AddressLength   = 20
+	VoteMethod      = "0x6dd7d8ea"
+	UnvoteMethod    = "0x02aa9be2"
+	ProposeMethod   = "0x01267951"
+	ResignMethod    = "0xae6e43f5"
+	SignMethod      = "0xe341eaa4"
+	XDCXApplyMethod = "0xc6b32f34"
+	XDCZApplyMethod = "0xc6b32f34"
 )
 
 var (
+	hashT    = reflect.TypeFor[Hash]()
+	addressT = reflect.TypeFor[Address]()
+
 	// MaxHash represents the maximum possible hash value.
 	MaxHash = HexToHash("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
 
 	BlockSignersBinary                     = HexToAddress("0x0000000000000000000000000000000000000089")
 	MasternodeVotingSMCBinary              = HexToAddress("0x0000000000000000000000000000000000000088")
 	RandomizeSMCBinary                     = HexToAddress("0x0000000000000000000000000000000000000090")
-	FoudationAddrBinary                    = HexToAddress("0x0000000000000000000000000000000000000068")
+	FoundationAddrBinary                   = HexToAddress("0x0000000000000000000000000000000000000068")
 	TeamAddrBinary                         = HexToAddress("0x0000000000000000000000000000000000000099")
 	XDCXAddrBinary                         = HexToAddress("0x0000000000000000000000000000000000000091")
 	TradingStateAddrBinary                 = HexToAddress("0x0000000000000000000000000000000000000092")
@@ -69,11 +61,6 @@ var (
 	XDCNativeAddressBinary                 = HexToAddress("0x0000000000000000000000000000000000000001")
 	LendingLockAddressBinary               = HexToAddress("0x0000000000000000000000000000000000000011")
 	MintedRecordAddressBinary              = HexToAddress("0x000000000000000000000000000000000000009a")
-)
-
-var (
-	hashT    = reflect.TypeOf(Hash{})
-	addressT = reflect.TypeOf(Address{})
 )
 
 // Hash represents the 32 byte Keccak256 hash of arbitrary data.
@@ -247,11 +234,20 @@ func IsHexAddress(s string) bool {
 	return len(s) == 2*AddressLength && isHex(s)
 }
 
+func (a Address) TerminalString() string {
+	return string(a.checksumHex())
+}
+
 // IsZero returns if a address is empty
 func (a Address) IsZero() bool { return a == Address{} }
 
 // Str gets the string representation of the underlying address
 func (a Address) Str() string { return string(a[:]) }
+
+// Cmp compares two addresses.
+func (a Address) Cmp(other Address) int {
+	return bytes.Compare(a[:], other[:])
+}
 
 // Bytes gets the string representation of the underlying address.
 func (a Address) Bytes() []byte { return a[:] }
@@ -281,7 +277,7 @@ func (a *Address) checksumHex() []byte {
 	buf := a.hex()
 
 	// compute checksum
-	sha := sha3.NewLegacyKeccak256()
+	sha := keccak.NewLegacyKeccak256()
 	sha.Write(buf[2:])
 	hash := sha.Sum(nil)
 	for i := 2; i < len(buf); i++ {
@@ -405,15 +401,15 @@ func ExtractAddressToBytes(penalties []Address) []byte {
 	return data
 }
 
-func ExtractAddressFromBytes(bytePenalties []byte) []Address {
-	if bytePenalties != nil && len(bytePenalties) < AddressLength {
+func ExtractAddressFromBytes(rawBytes []byte) []Address {
+	if len(rawBytes) < AddressLength {
 		return []Address{}
 	}
-	penalties := make([]Address, len(bytePenalties)/AddressLength)
-	for i := 0; i < len(penalties); i++ {
-		copy(penalties[i][:], bytePenalties[i*AddressLength:])
+	addresses := make([]Address, len(rawBytes)/AddressLength)
+	for i := 0; i < len(addresses); i++ {
+		copy(addresses[i][:], rawBytes[i*AddressLength:])
 	}
-	return penalties
+	return addresses
 }
 
 // AddressEIP55 is an alias of Address with a customized json marshaller
@@ -438,7 +434,7 @@ func isString(input []byte) bool {
 // UnmarshalJSON parses a hash in hex syntax.
 func (d *Decimal) UnmarshalJSON(input []byte) error {
 	if !isString(input) {
-		return &json.UnmarshalTypeError{Value: "non-string", Type: reflect.TypeOf(uint64(0))}
+		return &json.UnmarshalTypeError{Value: "non-string", Type: reflect.TypeFor[uint64]()}
 	}
 	if i, err := strconv.ParseUint(string(input[1:len(input)-1]), 10, 64); err == nil {
 		*d = Decimal(i)

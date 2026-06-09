@@ -10,7 +10,10 @@ type PoolObj interface {
 	Hash() common.Hash
 	PoolKey() string
 	GetSigner() common.Address
+	DeepCopy() interface{}
 }
+
+// Note: must use `NewPool()` to create `Pool` since field `objList` is a map
 type Pool struct {
 	objList map[string]map[common.Hash]PoolObj
 	lock    sync.RWMutex // Protects the pool fields
@@ -21,11 +24,21 @@ func NewPool() *Pool {
 		objList: make(map[string]map[common.Hash]PoolObj),
 	}
 }
+
 func (p *Pool) Get() map[string]map[common.Hash]PoolObj {
-	return p.objList
+	p.lock.RLock()
+	defer p.lock.RUnlock()
+	dataCopy := make(map[string]map[common.Hash]PoolObj, len(p.objList))
+	for k1, v1 := range p.objList {
+		dataCopy[k1] = make(map[common.Hash]PoolObj, len(v1))
+		for k2, v2 := range v1 {
+			dataCopy[k1][k2] = v2.DeepCopy().(PoolObj)
+		}
+	}
+
+	return dataCopy
 }
 
-// return true if it has reached threshold
 func (p *Pool) Add(obj PoolObj) (int, map[common.Hash]PoolObj) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
@@ -37,11 +50,19 @@ func (p *Pool) Add(obj PoolObj) (int, map[common.Hash]PoolObj) {
 	}
 	objListKeyed[obj.Hash()] = obj
 	numOfItems := len(objListKeyed)
-	return numOfItems, objListKeyed
+
+	dataCopy := make(map[common.Hash]PoolObj, len(objListKeyed))
+	for k, v := range objListKeyed {
+		dataCopy[k] = v.DeepCopy().(PoolObj)
+	}
+
+	return numOfItems, dataCopy
 }
 
-func (p *Pool) Size(obj PoolObj) int {
-	poolKey := obj.PoolKey()
+func (p *Pool) Size(poolKey string) int {
+	p.lock.RLock()
+	defer p.lock.RUnlock()
+
 	objListKeyed, ok := p.objList[poolKey]
 	if !ok {
 		return 0
@@ -53,7 +74,7 @@ func (p *Pool) PoolObjKeysList() []string {
 	p.lock.RLock()
 	defer p.lock.RUnlock()
 
-	var keyList []string
+	keyList := make([]string, 0, len(p.objList))
 	for key := range p.objList {
 		keyList = append(keyList, key)
 	}
@@ -85,8 +106,8 @@ func (p *Pool) Clear() {
 }
 
 func (p *Pool) GetObjsByKey(poolKey string) []PoolObj {
-	p.lock.Lock()
-	defer p.lock.Unlock()
+	p.lock.RLock()
+	defer p.lock.RUnlock()
 
 	objListKeyed, ok := p.objList[poolKey]
 	if !ok {
@@ -95,8 +116,8 @@ func (p *Pool) GetObjsByKey(poolKey string) []PoolObj {
 	objList := make([]PoolObj, len(objListKeyed))
 	cnt := 0
 	for _, obj := range objListKeyed {
-		objList[cnt] = obj
-		cnt += 1
+		objList[cnt] = obj.DeepCopy().(PoolObj)
+		cnt++
 	}
 	return objList
 }

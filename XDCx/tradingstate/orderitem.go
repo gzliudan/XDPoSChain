@@ -170,7 +170,7 @@ func (o *OrderItem) SetBSON(raw bson.Raw) error {
 
 	if decoded.Signature != nil {
 		o.Signature = &Signature{
-			V: byte(decoded.Signature.V),
+			V: decoded.Signature.V,
 			R: common.HexToHash(decoded.Signature.R),
 			S: common.HexToHash(decoded.Signature.S),
 		}
@@ -205,7 +205,6 @@ func (o *OrderItem) VerifyOrder(state *state.StateDB) error {
 
 // VerifyBasicOrderInfo verify basic info
 func (o *OrderItem) VerifyBasicOrderInfo() error {
-
 	if o.Status == OrderNew {
 		if o.Type == Limit {
 			if err := o.verifyPrice(); err != nil {
@@ -271,7 +270,6 @@ func (o *OrderItem) verifyOrderType() error {
 
 // verify order side
 func (o *OrderItem) verifyOrderSide() error {
-
 	if o.Side != Bid && o.Side != Ask {
 		log.Debug("Invalid orderSide", "side", o.Side)
 		return ErrInvalidOrderSide
@@ -279,16 +277,9 @@ func (o *OrderItem) verifyOrderSide() error {
 	return nil
 }
 
-func (o *OrderItem) encodedSide() *big.Int {
-	if o.Side == Bid {
-		return big.NewInt(0)
-	}
-	return big.NewInt(1)
-}
-
 // verifyPrice make sure price is a positive number
 func (o *OrderItem) verifyPrice() error {
-	if o.Price == nil || o.Price.Cmp(big.NewInt(0)) <= 0 {
+	if o.Price == nil || o.Price.Sign() <= 0 {
 		log.Debug("Invalid price", "price", o.Price.String())
 		return ErrInvalidPrice
 	}
@@ -297,7 +288,7 @@ func (o *OrderItem) verifyPrice() error {
 
 // verifyQuantity make sure quantity is a positive number
 func (o *OrderItem) verifyQuantity() error {
-	if o.Quantity == nil || o.Quantity.Cmp(big.NewInt(0)) <= 0 {
+	if o.Quantity == nil || o.Quantity.Sign() <= 0 {
 		log.Debug("Invalid quantity", "quantity", o.Quantity.String())
 		return ErrInvalidQuantity
 	}
@@ -314,18 +305,22 @@ func (o *OrderItem) verifyStatus() error {
 }
 
 func IsValidRelayer(statedb *state.StateDB, address common.Address) bool {
+	contract, ok := relayerRegistrationSMC(statedb)
+	if !ok {
+		return false
+	}
 	slot := RelayerMappingSlot["RELAYER_LIST"]
 	locRelayerState := GetLocMappingAtKey(address.Hash(), slot)
 
 	locBigDeposit := new(big.Int).SetUint64(uint64(0)).Add(locRelayerState, RelayerStructMappingSlot["_deposit"])
 	locHashDeposit := common.BigToHash(locBigDeposit)
-	balance := statedb.GetState(common.RelayerRegistrationSMC, locHashDeposit).Big()
+	balance := statedb.GetState(contract, locHashDeposit).Big()
 	if balance.Cmp(new(big.Int).Mul(common.BasePrice, common.RelayerLockedFund)) <= 0 {
-		log.Debug("Relayer is not in relayer list", "relayer", address.String(), "balance", balance)
+		log.Debug("Relayer is not in relayer list", "relayer", address, "balance", balance)
 		return false
 	}
 	if IsResignedRelayer(address, statedb) {
-		log.Debug("Relayer has resigned", "relayer", address.String())
+		log.Debug("Relayer has resigned", "relayer", address)
 		return false
 	}
 	return true
@@ -379,7 +374,7 @@ func VerifyBalance(statedb *state.StateDB, XDCxStateDb *TradingStateDB, order *t
 	expectedBalance := balanceResult.Taker.OutTotal
 	actualBalance := GetTokenBalance(order.UserAddress(), balanceResult.Taker.OutToken, statedb)
 	if actualBalance.Cmp(expectedBalance) < 0 {
-		return fmt.Errorf("token: %s . ExpectedBalance: %s . ActualBalance: %s", balanceResult.Taker.OutToken.Hex(), expectedBalance.String(), actualBalance.String())
+		return fmt.Errorf("token: %s . ExpectedBalance: %s . ActualBalance: %s", balanceResult.Taker.OutToken.Hex(), expectedBalance, actualBalance)
 	}
 	return nil
 }
@@ -399,7 +394,6 @@ func (s *Signature) MarshalSignature() ([]byte, error) {
 
 // Verify returns the address that corresponds to the given signature and signed message
 func (s *Signature) Verify(hash common.Hash) (common.Address, error) {
-
 	hashBytes := hash.Bytes()
 	sigBytes, err := s.MarshalSignature()
 	if err != nil {

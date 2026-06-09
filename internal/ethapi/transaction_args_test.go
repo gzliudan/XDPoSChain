@@ -19,7 +19,6 @@ package ethapi
 import (
 	"context"
 	"errors"
-	"fmt"
 	"math/big"
 	"reflect"
 	"testing"
@@ -46,7 +45,7 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/rpc"
 )
 
-// TestSetFeeDefaults tests the logic for filling in default fee values works as expected.
+// TestSetFeeDefaults tests set fee defaults.
 func TestSetFeeDefaults(t *testing.T) {
 	type test struct {
 		name     string
@@ -60,7 +59,7 @@ func TestSetFeeDefaults(t *testing.T) {
 		b        = newBackendMock()
 		zero     = (*hexutil.Big)(big.NewInt(0))
 		fortytwo = (*hexutil.Big)(big.NewInt(42))
-		maxFee   = (*hexutil.Big)(new(big.Int).Add(new(big.Int).Mul(b.current.BaseFee, big.NewInt(2)), fortytwo.ToInt()))
+		maxFee   = (*hexutil.Big)(new(big.Int).Add(new(big.Int).Lsh(b.current.BaseFee, 1), fortytwo.ToInt()))
 		al       = &types.AccessList{types.AccessTuple{Address: common.Address{0xaa}, StorageKeys: []common.Hash{{0x01}}}}
 	)
 
@@ -159,28 +158,28 @@ func TestSetFeeDefaults(t *testing.T) {
 			false,
 			&TransactionArgs{MaxFeePerGas: maxFee},
 			nil,
-			fmt.Errorf("maxFeePerGas and maxPriorityFeePerGas are not valid before EIP-1559 is active"),
+			errors.New("maxFeePerGas and maxPriorityFeePerGas are not valid before EIP-1559 is active"),
 		},
 		{
 			"dynamic fee tx pre-London, priorityFee set",
 			false,
 			&TransactionArgs{MaxPriorityFeePerGas: fortytwo},
 			nil,
-			fmt.Errorf("maxFeePerGas and maxPriorityFeePerGas are not valid before EIP-1559 is active"),
+			errors.New("maxFeePerGas and maxPriorityFeePerGas are not valid before EIP-1559 is active"),
 		},
 		{
 			"dynamic fee tx, maxFee < priorityFee",
 			true,
 			&TransactionArgs{MaxFeePerGas: maxFee, MaxPriorityFeePerGas: (*hexutil.Big)(big.NewInt(1000))},
 			nil,
-			fmt.Errorf("maxFeePerGas (0x3e) < maxPriorityFeePerGas (0x3e8)"),
+			errors.New("maxFeePerGas (0x3e) < maxPriorityFeePerGas (0x3e8)"),
 		},
 		{
 			"dynamic fee tx, maxFee < priorityFee while setting default",
 			true,
 			&TransactionArgs{MaxFeePerGas: (*hexutil.Big)(big.NewInt(7))},
 			nil,
-			fmt.Errorf("maxFeePerGas (0x7) < maxPriorityFeePerGas (0x2a)"),
+			errors.New("maxFeePerGas (0x7) < maxPriorityFeePerGas (0x2a)"),
 		},
 		{
 			"dynamic fee tx post-London, explicit gas price",
@@ -196,21 +195,21 @@ func TestSetFeeDefaults(t *testing.T) {
 			false,
 			&TransactionArgs{GasPrice: fortytwo, MaxFeePerGas: maxFee, MaxPriorityFeePerGas: fortytwo},
 			nil,
-			fmt.Errorf("both gasPrice and (maxFeePerGas or maxPriorityFeePerGas) specified"),
+			errors.New("both gasPrice and (maxFeePerGas or maxPriorityFeePerGas) specified"),
 		},
 		{
 			"set gas price and maxPriorityFee",
 			false,
 			&TransactionArgs{GasPrice: fortytwo, MaxPriorityFeePerGas: fortytwo},
 			nil,
-			fmt.Errorf("both gasPrice and (maxFeePerGas or maxPriorityFeePerGas) specified"),
+			errors.New("both gasPrice and (maxFeePerGas or maxPriorityFeePerGas) specified"),
 		},
 		{
 			"set gas price and maxFee",
 			true,
 			&TransactionArgs{GasPrice: fortytwo, MaxFeePerGas: maxFee},
 			nil,
-			fmt.Errorf("both gasPrice and (maxFeePerGas or maxPriorityFeePerGas) specified"),
+			errors.New("both gasPrice and (maxFeePerGas or maxPriorityFeePerGas) specified"),
 		},
 	}
 
@@ -242,19 +241,24 @@ type backendMock struct {
 
 func newBackendMock() *backendMock {
 	config := &params.ChainConfig{
-		ChainId:             big.NewInt(42),
-		HomesteadBlock:      big.NewInt(0),
-		DAOForkBlock:        nil,
-		DAOForkSupport:      true,
-		EIP150Block:         big.NewInt(0),
-		EIP155Block:         big.NewInt(0),
-		EIP158Block:         big.NewInt(0),
-		ByzantiumBlock:      big.NewInt(0),
-		ConstantinopleBlock: big.NewInt(0),
-		PetersburgBlock:     big.NewInt(0),
-		IstanbulBlock:       big.NewInt(0),
-		BerlinBlock:         big.NewInt(0),
-		Eip1559Block:        big.NewInt(1000),
+		ChainID:                big.NewInt(42),
+		HomesteadBlock:         big.NewInt(0),
+		DAOForkBlock:           nil,
+		DAOForkSupport:         true,
+		EIP150Block:            big.NewInt(0),
+		EIP155Block:            big.NewInt(0),
+		EIP158Block:            big.NewInt(0),
+		ByzantiumBlock:         big.NewInt(0),
+		ConstantinopleBlock:    big.NewInt(0),
+		PetersburgBlock:        big.NewInt(0),
+		IstanbulBlock:          big.NewInt(0),
+		TIPTRC21FeeBlock:       big.NewInt(0),
+		BerlinBlock:            big.NewInt(0),
+		EIP1559Block:           big.NewInt(1000),
+		TRC21IssuerSMC:         params.TestnetChainConfig.TRC21IssuerSMC,
+		XDCXListingSMC:         params.TestnetChainConfig.XDCXListingSMC,
+		RelayerRegistrationSMC: params.TestnetChainConfig.RelayerRegistrationSMC,
+		LendingRegistrationSMC: params.TestnetChainConfig.LendingRegistrationSMC,
 	}
 	return &backendMock{
 		current: &types.Header{
@@ -262,7 +266,7 @@ func newBackendMock() *backendMock {
 			Number:     big.NewInt(1100),
 			GasLimit:   8_000_000,
 			GasUsed:    8_000_000,
-			Time:       big.NewInt(555),
+			Time:       555,
 			Extra:      make([]byte, 32),
 			BaseFee:    big.NewInt(10),
 		},
@@ -318,7 +322,7 @@ func (b *backendMock) HeaderByNumberOrHash(ctx context.Context, blockNrOrHash rp
 	return nil, nil
 }
 
-func (b *backendMock) CurrentBlock() *types.Block { return nil }
+func (b *backendMock) CurrentBlock() *types.Header { return nil }
 
 func (b *backendMock) BlockByNumber(ctx context.Context, number rpc.BlockNumber) (*types.Block, error) {
 	return nil, nil
@@ -350,7 +354,7 @@ func (b *backendMock) GetTd(ctx context.Context, hash common.Hash) *big.Int {
 	return nil
 }
 
-func (b *backendMock) GetEVM(context.Context, core.Message, *state.StateDB, *tradingstate.TradingStateDB, *types.Header, *vm.Config) (*vm.EVM, func() error, error) {
+func (b *backendMock) GetEVM(context.Context, *state.StateDB, *tradingstate.TradingStateDB, *types.Header, *vm.Config, *vm.BlockContext) (*vm.EVM, func() error, error) {
 	return nil, nil, nil
 }
 
@@ -371,10 +375,10 @@ func (b *backendMock) GetPoolNonce(ctx context.Context, addr common.Address) (ui
 	return 0, nil
 }
 func (b *backendMock) Stats() (pending int, queued int) { return 0, 0 }
-func (b *backendMock) TxPoolContent() (map[common.Address]types.Transactions, map[common.Address]types.Transactions) {
+func (b *backendMock) TxPoolContent() (map[common.Address][]*types.Transaction, map[common.Address][]*types.Transaction) {
 	return nil, nil
 }
-func (b *backendMock) TxPoolContentFrom(addr common.Address) (types.Transactions, types.Transactions) {
+func (b *backendMock) TxPoolContentFrom(addr common.Address) ([]*types.Transaction, []*types.Transaction) {
 	return nil, nil
 }
 func (b *backendMock) SubscribeNewTxsEvent(chan<- core.NewTxsEvent) event.Subscription { return nil }
@@ -425,10 +429,6 @@ func (b *backendMock) GetMasternodesCap(uint64) map[common.Address]*big.Int {
 	return nil
 }
 
-func (b *backendMock) GetOrderNonce(common.Hash) (uint64, error) {
-	return 0, nil
-}
-
 func (b *backendMock) GetBody(ctx context.Context, hash common.Hash, number rpc.BlockNumber) (*types.Body, error) {
 	return nil, nil
 }
@@ -449,24 +449,8 @@ func (b *backendMock) LendingService() *XDCxlending.Lending {
 	return nil
 }
 
-func (b *backendMock) OrderStats() (int, int) {
-	return 0, 0
-}
-
-func (b *backendMock) OrderTxPoolContent() (map[common.Address]types.OrderTransactions, map[common.Address]types.OrderTransactions) {
-	return nil, nil
-}
-
 func (b *backendMock) ProtocolVersion() int {
 	return 0
-}
-
-func (b *backendMock) SendLendingTx(context.Context, *types.LendingTransaction) error {
-	return nil
-}
-
-func (b *backendMock) SendOrderTx(context.Context, *types.OrderTransaction) error {
-	return nil
 }
 
 func (b *backendMock) XDCxService() *XDCx.XDCX {

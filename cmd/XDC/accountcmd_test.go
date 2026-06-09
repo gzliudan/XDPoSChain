@@ -22,6 +22,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cespare/cp"
 )
@@ -76,8 +77,8 @@ func TestAccountNew(t *testing.T) {
 	XDC.Expect(`
 Your new account is locked with a password. Please give a password. Do not forget this password.
 !! Unsupported terminal, password will be echoed.
-Passphrase: {{.InputLine "foobar"}}
-Repeat passphrase: {{.InputLine "foobar"}}
+Password: {{.InputLine "foobar"}}
+Repeat password: {{.InputLine "foobar"}}
 
 Your new key was generated
 
@@ -121,9 +122,9 @@ func TestAccountNewBadRepeat(t *testing.T) {
 	XDC.Expect(`
 Your new account is locked with a password. Please give a password. Do not forget this password.
 !! Unsupported terminal, password will be echoed.
-Passphrase: {{.InputLine "something"}}
-Repeat passphrase: {{.InputLine "something else"}}
-Fatal: Passphrases do not match
+Password: {{.InputLine "something"}}
+Repeat password: {{.InputLine "something else"}}
+Fatal: Passwords do not match
 `)
 }
 
@@ -135,10 +136,10 @@ func TestAccountUpdate(t *testing.T) {
 	XDC.Expect(`
 Unlocking account f466859ead1932d743d622cb74fc058882e8648a | Attempt 1/3
 !! Unsupported terminal, password will be echoed.
-Passphrase: {{.InputLine "foobar"}}
+Password: {{.InputLine "foobar"}}
 Please give a new password. Do not forget this password.
-Passphrase: {{.InputLine "foobar2"}}
-Repeat passphrase: {{.InputLine "foobar2"}}
+Password: {{.InputLine "foobar2"}}
+Repeat password: {{.InputLine "foobar2"}}
 `)
 }
 
@@ -148,7 +149,7 @@ func TestWalletImport(t *testing.T) {
 	defer XDC.ExpectExit()
 	XDC.Expect(`
 !! Unsupported terminal, password will be echoed.
-Passphrase: {{.InputLine "foo"}}
+Password: {{.InputLine "foo"}}
 Address: {xdcd4584b5f6229b7be90727b0fc8c6b91bb427821f}
 `)
 
@@ -193,7 +194,7 @@ func TestWalletImportBadPassword(t *testing.T) {
 	defer XDC.ExpectExit()
 	XDC.Expect(`
 !! Unsupported terminal, password will be echoed.
-Passphrase: {{.InputLine "wrong"}}
+Password: {{.InputLine "wrong"}}
 Fatal: could not decrypt key with given password
 `)
 }
@@ -204,11 +205,12 @@ func TestUnlockFlag(t *testing.T) {
 	XDC := runXDC(t,
 		"--nat", "none", "--nodiscover", "--maxpeers", "0", "--port", "0", "--nousb", "--cache", "256", "--ipcdisable",
 		"--datadir", datadir, "--unlock", "f466859ead1932d743d622cb74fc058882e8648a",
-		"js", "testdata/empty.js")
+		"console", "--exec", "loadScript('testdata/empty.js')")
 	XDC.Expect(`
 Unlocking account f466859ead1932d743d622cb74fc058882e8648a | Attempt 1/3
 !! Unsupported terminal, password will be echoed.
-Passphrase: {{.InputLine "foobar"}}
+Password: {{.InputLine "foobar"}}
+undefined
 `)
 	XDC.ExpectExit()
 
@@ -233,11 +235,11 @@ func TestUnlockFlagWrongPassword(t *testing.T) {
 	XDC.Expect(`
 Unlocking account f466859ead1932d743d622cb74fc058882e8648a | Attempt 1/3
 !! Unsupported terminal, password will be echoed.
-Passphrase: {{.InputLine "wrong1"}}
+Password: {{.InputLine "wrong1"}}
 Unlocking account f466859ead1932d743d622cb74fc058882e8648a | Attempt 2/3
-Passphrase: {{.InputLine "wrong2"}}
+Password: {{.InputLine "wrong2"}}
 Unlocking account f466859ead1932d743d622cb74fc058882e8648a | Attempt 3/3
-Passphrase: {{.InputLine "wrong3"}}
+Password: {{.InputLine "wrong3"}}
 Fatal: Failed to unlock account f466859ead1932d743d622cb74fc058882e8648a (could not decrypt key with given password)
 `)
 }
@@ -248,13 +250,14 @@ func TestUnlockFlagMultiIndex(t *testing.T) {
 	defer os.RemoveAll(datadir)
 	XDC := runXDC(t,
 		"--nat", "none", "--nodiscover", "--maxpeers", "0", "--port", "0", "--nousb", "--cache", "128", "--ipcdisable",
-		"--datadir", datadir, "--unlock", "0,2", "js", "testdata/empty.js")
+		"--datadir", datadir, "--unlock", "0,2", "console", "--exec", "loadScript('testdata/empty.js')")
 	XDC.Expect(`
 Unlocking account 0 | Attempt 1/3
 !! Unsupported terminal, password will be echoed.
-Passphrase: {{.InputLine "foobar"}}
+Password: {{.InputLine "foobar"}}
 Unlocking account 2 | Attempt 1/3
-Passphrase: {{.InputLine "foobar"}}
+Password: {{.InputLine "foobar"}}
+undefined
 `)
 	XDC.ExpectExit()
 
@@ -276,7 +279,10 @@ func TestUnlockFlagPasswordFile(t *testing.T) {
 	XDC := runXDC(t,
 		"--nat", "none", "--nodiscover", "--maxpeers", "0", "--port", "0", "--nousb", "--cache", "128", "--ipcdisable",
 		"--datadir", datadir, "--password", "testdata/passwords.txt", "--unlock", "0,2",
-		"js", "testdata/empty.js")
+		"console", "--exec", "loadScript('testdata/empty.js')")
+	XDC.Expect(`
+undefined
+`)
 	XDC.ExpectExit()
 
 	wantMessages := []string{
@@ -308,7 +314,7 @@ func TestUnlockFlagAmbiguous(t *testing.T) {
 	XDC := runXDC(t,
 		"--nat", "none", "--nodiscover", "--maxpeers", "0", "--port", "0", "--nousb", "--cache", "128", "--ipcdisable",
 		"--keystore", store, "--unlock", "f466859ead1932d743d622cb74fc058882e8648a",
-		"js", "testdata/empty.js")
+		"console", "--exec", "loadScript('testdata/empty.js')")
 	defer XDC.ExpectExit()
 
 	// Helper for the expect template, returns absolute keystore path.
@@ -319,14 +325,15 @@ func TestUnlockFlagAmbiguous(t *testing.T) {
 	XDC.Expect(`
 Unlocking account f466859ead1932d743d622cb74fc058882e8648a | Attempt 1/3
 !! Unsupported terminal, password will be echoed.
-Passphrase: {{.InputLine "foobar"}}
+Password: {{.InputLine "foobar"}}
 Multiple key files exist for address f466859ead1932d743d622cb74fc058882e8648a:
    keystore://{{keypath "1"}}
    keystore://{{keypath "2"}}
-Testing your passphrase against all of them...
-Your passphrase unlocked keystore://{{keypath "1"}}
+Testing your password against all of them...
+Your password unlocked keystore://{{keypath "1"}}
 In order to avoid this warning, you need to remove the following duplicate key files:
    keystore://{{keypath "2"}}
+undefined
 `)
 	XDC.ExpectExit()
 
@@ -346,6 +353,7 @@ func TestUnlockFlagAmbiguousWrongPassword(t *testing.T) {
 	XDC := runXDC(t,
 		"--nat", "none", "--nodiscover", "--maxpeers", "0", "--port", "0", "--nousb", "--cache", "128", "--ipcdisable",
 		"--keystore", store, "--unlock", "f466859ead1932d743d622cb74fc058882e8648a")
+	XDC.KillTimeout = 90 * time.Second
 	defer XDC.ExpectExit()
 
 	// Helper for the expect template, returns absolute keystore path.
@@ -356,11 +364,11 @@ func TestUnlockFlagAmbiguousWrongPassword(t *testing.T) {
 	XDC.Expect(`
 Unlocking account f466859ead1932d743d622cb74fc058882e8648a | Attempt 1/3
 !! Unsupported terminal, password will be echoed.
-Passphrase: {{.InputLine "wrong"}}
+Password: {{.InputLine "wrong"}}
 Multiple key files exist for address f466859ead1932d743d622cb74fc058882e8648a:
    keystore://{{keypath "1"}}
    keystore://{{keypath "2"}}
-Testing your passphrase against all of them...
+Testing your password against all of them...
 Fatal: None of the listed files could be unlocked.
 `)
 	XDC.ExpectExit()

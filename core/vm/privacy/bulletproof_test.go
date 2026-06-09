@@ -146,7 +146,6 @@ func TestInnerProductProveLen64Rand(t *testing.T) {
 		t.Error("Inner Product Proof incorrect")
 		fmt.Printf("Values Used: \n\ta = %s\n\tb = %s\n", a, b)
 	}
-
 }
 
 func TestInnerProductVerifyFastLen1(t *testing.T) {
@@ -281,11 +280,9 @@ func TestInnerProductVerifyFastLen64Rand(t *testing.T) {
 		t.Error("Inner Product Proof incorrect")
 		fmt.Printf("Values Used: \n\ta = %s\n\tb = %s\n", a, b)
 	}
-
 }
 
 func TestMRPProveZERO(t *testing.T) {
-
 	mRangeProof, _ := MRPProve([]*big.Int{
 		new(big.Int).SetInt64(0),
 	})
@@ -294,7 +291,6 @@ func TestMRPProveZERO(t *testing.T) {
 }
 
 func TestMRPProve_MAX_2_POW_64(t *testing.T) {
-
 	mRangeProof, _ := MRPProve([]*big.Int{
 		new(big.Int).SetUint64(0xFFFFFFFFFFFFFFFF),
 	})
@@ -303,7 +299,6 @@ func TestMRPProve_MAX_2_POW_64(t *testing.T) {
 }
 
 func TestMRPProveOutOfSupportedRange(t *testing.T) {
-
 	value, _ := new(big.Int).SetString("FFFFFFFFFFFFFFFFFFFF", 16)
 	_, err := MRPProve([]*big.Int{
 		value,
@@ -312,7 +307,6 @@ func TestMRPProveOutOfSupportedRange(t *testing.T) {
 }
 
 func TestMRPProve_RANDOM(t *testing.T) {
-
 	mRangeProof, _ := MRPProve(Rand64Vector(1))
 	mv := MRPVerify(&mRangeProof)
 	assert.Equal(t, mv, true, " MRProof incorrect")
@@ -343,7 +337,6 @@ func Rand64Vector(l int) []*big.Int {
 }
 
 func TestMRPProveValueNumberNotSupported(t *testing.T) {
-
 	_, err := MRPProve(Rand64Vector(3))
 	assert.NotNil(t, err, "MRProof incorrect - accepted 3 inputs")
 
@@ -416,7 +409,7 @@ func parseTestData(filePath string) MultiRangeProof {
 	// var result map[string]interface{}
 	result := BulletProof{}
 
-	json.Unmarshal([]byte(byteValue), &result)
+	json.Unmarshal(byteValue, &result)
 
 	fmt.Println("result ", result.Tau)
 	fmt.Println("result ", result.Th)

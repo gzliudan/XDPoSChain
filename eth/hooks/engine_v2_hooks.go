@@ -2,18 +2,22 @@ package hooks
 
 import (
 	"errors"
+	"fmt"
 	"math/big"
+	"slices"
 	"time"
 
 	"github.com/XinFinOrg/XDPoSChain/common"
-	"github.com/XinFinOrg/XDPoSChain/common/sort"
+	"github.com/XinFinOrg/XDPoSChain/common/math"
 	"github.com/XinFinOrg/XDPoSChain/consensus"
 	"github.com/XinFinOrg/XDPoSChain/consensus/XDPoS"
 	"github.com/XinFinOrg/XDPoSChain/consensus/XDPoS/utils"
 	"github.com/XinFinOrg/XDPoSChain/contracts"
 	"github.com/XinFinOrg/XDPoSChain/core"
 	"github.com/XinFinOrg/XDPoSChain/core/state"
+	"github.com/XinFinOrg/XDPoSChain/core/tracing"
 	"github.com/XinFinOrg/XDPoSChain/core/types"
+	"github.com/XinFinOrg/XDPoSChain/core/vm"
 	"github.com/XinFinOrg/XDPoSChain/eth/util"
 	"github.com/XinFinOrg/XDPoSChain/log"
 	"github.com/XinFinOrg/XDPoSChain/params"
@@ -34,16 +38,32 @@ type RewardLog struct {
 	Reward *big.Int `json:"reward"`
 }
 
+// resolvePreUpgradeLimitPenaltyEpoch keeps the legacy pre-upgrade comeback
+// window pinned to the historical V2 constant.
+func resolvePreUpgradeLimitPenaltyEpoch() int {
+	return common.LimitPenaltyEpochV2
+}
+
+// resolvePostUpgradeLimitPenaltyEpoch preserves the legacy post-upgrade
+// fallback of one epoch when the config does not override it.
+func resolvePostUpgradeLimitPenaltyEpoch(currentConfig *params.V2Config) int {
+	limitPenaltyEpoch := 1
+	if currentConfig != nil && currentConfig.LimitPenaltyEpoch > 0 {
+		limitPenaltyEpoch = currentConfig.LimitPenaltyEpoch
+	}
+	return limitPenaltyEpoch
+}
+
 func AttachConsensusV2Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConfig *params.ChainConfig) {
 	// Hook scans for bad masternodes and decide to penalty them
-	adaptor.EngineV2.HookPenalty = func(chain consensus.ChainReader, number *big.Int, currentHash common.Hash, candidates []common.Address) ([]common.Address, error) {
+	adaptor.EngineV2.HookPenalty = func(chain consensus.ChainReader, number *big.Int, parentHash common.Hash, candidates []common.Address) ([]common.Address, error) {
 		start := time.Now()
 		listBlockHash := []common.Hash{}
 		// get list block hash & stats total created block
 		statMiners := make(map[common.Address]int)
-		listBlockHash = append(listBlockHash, currentHash)
+		listBlockHash = append(listBlockHash, parentHash)
 		parentNumber := number.Uint64() - 1
-		parentHash := currentHash
+		currentHash := parentHash
 
 		var round types.Round
 		// check and wait the latest block is already in the disk
@@ -60,17 +80,21 @@ func AttachConsensusV2Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 				round = r
 				break
 			}
-			log.Info("[V2 Hook Penalty] parentHeader is nil, wait block to be writen in disk", "parentNumber", parentNumber)
+			log.Info("[V2 Hook Penalty] parentHeader is nil, wait block to be written in disk", "parentNumber", parentNumber)
 			time.Sleep(time.Second) // 1s
 
 			if timeout > 30 { // wait over 30s
-				log.Error("[V2 Hook Penalty] parentHeader is nil, wait too long not writen in to disk", "parentNumber", parentNumber)
+				log.Error("[V2 Hook Penalty] parentHeader is nil, wait too long not written in to disk", "parentNumber", parentNumber)
 				return []common.Address{}, errors.New("parentHeader is nil")
 			}
 		}
 
 		for i := uint64(1); ; i++ {
 			parentHeader := chain.GetHeader(parentHash, parentNumber)
+			if parentHeader == nil {
+				log.Error("[HookPenalty] fail to get parent header")
+				return []common.Address{}, fmt.Errorf("hook penalty fail to get parent header at number: %v, hash: %v", parentNumber, parentHash)
+			}
 			isEpochSwitch, _, err := adaptor.EngineV2.IsEpochSwitch(parentHeader)
 			if err != nil {
 				log.Error("[HookPenalty] isEpochSwitch", "err", err)
@@ -91,7 +115,8 @@ func AttachConsensusV2Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 			listBlockHash = append(listBlockHash, parentHash)
 		}
 
-		currentConfig := chain.Config().XDPoS.V2.Config(uint64(round))
+		currentConfig := adaptor.EngineV2.Config(uint64(round))
+
 		// add list not miner to penalties
 		preMasternodes := adaptor.EngineV2.GetMasternodesByHash(chain, currentHash)
 		penalties := []common.Address{}
@@ -116,10 +141,11 @@ func AttachConsensusV2Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 		// start to calc comeback at v2 block + limitPenaltyEpochV2 to avoid reading v1 blocks
 
 		if !chain.Config().IsTIPUpgradePenalty(number) {
-			comebackHeight := (common.LimitPenaltyEpochV2+1)*chain.Config().XDPoS.Epoch + chain.Config().XDPoS.V2.SwitchBlock.Uint64()
+			limitPenaltyEpoch := resolvePreUpgradeLimitPenaltyEpoch()
+			comebackHeight := uint64(limitPenaltyEpoch+1)*chain.Config().XDPoS.Epoch + chain.Config().XDPoS.V2.SwitchBlock.Uint64()
 			penComebacks := []common.Address{}
 			if number.Uint64() > comebackHeight {
-				pens := adaptor.EngineV2.GetPreviousPenaltyByHash(chain, currentHash, common.LimitPenaltyEpochV2)
+				pens := adaptor.EngineV2.GetPreviousPenaltyByHash(chain, currentHash, limitPenaltyEpoch)
 				for _, p := range pens {
 					for _, addr := range candidates {
 						if p == addr {
@@ -148,8 +174,10 @@ func AttachConsensusV2Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 					signingTxs, ok := adaptor.GetCachedSigningTxs(bhash)
 					if !ok {
 						block := chain.GetBlock(bhash, blockNumber)
-						txs := block.Transactions()
-						signingTxs = adaptor.CacheSigningTxs(bhash, txs)
+						if block != nil {
+							txs := block.Transactions()
+							signingTxs = adaptor.CacheSigningTxs(bhash, txs)
+						}
 					}
 					// Check signer signed?
 					for _, tx := range signingTxs {
@@ -181,13 +209,14 @@ func AttachConsensusV2Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 				}
 			}
 		} else { // after penalty upgrade
-			comebackHeight := (uint64(currentConfig.LimitPenaltyEpoch)+1)*chain.Config().XDPoS.Epoch + chain.Config().XDPoS.V2.SwitchBlock.Uint64()
+			limitPenaltyEpoch := resolvePostUpgradeLimitPenaltyEpoch(currentConfig)
+			comebackHeight := uint64(limitPenaltyEpoch)*chain.Config().XDPoS.Epoch + chain.Config().XDPoS.V2.SwitchBlock.Uint64()
 			if number.Uint64() > comebackHeight {
 				// penParolees record those who stayed enough epoch of LimitPenaltyEpoch
 				penParoleeMap := map[common.Address]int{}
 				// lastPenalty record the last epoch penalties
 				lastPenalty := []common.Address{}
-				for i := 0; i <= currentConfig.LimitPenaltyEpoch; i++ {
+				for i := 0; i < limitPenaltyEpoch; i++ {
 					pens := adaptor.EngineV2.GetPreviousPenaltyByHash(chain, currentHash, i)
 					for _, p := range pens {
 						penParoleeMap[p]++
@@ -215,8 +244,10 @@ func AttachConsensusV2Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 					signingTxs, ok := adaptor.GetCachedSigningTxs(bhash)
 					if !ok {
 						block := chain.GetBlock(bhash, blockNumber)
-						txs := block.Transactions()
-						signingTxs = adaptor.CacheSigningTxs(bhash, txs)
+						if block != nil {
+							txs := block.Transactions()
+							signingTxs = adaptor.CacheSigningTxs(bhash, txs)
+						}
 					}
 					// Check signer signed?
 					for _, tx := range signingTxs {
@@ -229,7 +260,7 @@ func AttachConsensusV2Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 				}
 				// check addr in lastPenalty, and if they does not meet condition, add them to penalty
 				for _, p := range lastPenalty {
-					if penParoleeMap[p] == currentConfig.LimitPenaltyEpoch+1 {
+					if penParoleeMap[p] == limitPenaltyEpoch {
 						// check if this node signs enough
 						if txSignerMap[p] >= currentConfig.MinimumSigningTx {
 							continue
@@ -249,9 +280,9 @@ func AttachConsensusV2Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 	}
 
 	// Hook calculates reward for masternodes
-	adaptor.EngineV2.HookReward = func(chain consensus.ChainReader, stateBlock *state.StateDB, parentState *state.StateDB, header *types.Header) (map[string]interface{}, error) {
+	adaptor.EngineV2.HookReward = func(chain consensus.ChainReader, stateBlock vm.StateDB, parentState *state.StateDB, header *types.Header) (map[string]interface{}, error) {
 		number := header.Number.Uint64()
-		foundationWalletAddr := chain.Config().XDPoS.FoudationWalletAddr
+		foundationWalletAddr := chain.Config().XDPoS.FoundationWalletAddr
 		if foundationWalletAddr == (common.Address{}) {
 			log.Error("Foundation Wallet Address is empty", "error", foundationWalletAddr)
 			return nil, errors.New("foundation wallet address is empty")
@@ -269,9 +300,11 @@ func AttachConsensusV2Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 			log.Error("[HookReward] Fail to get round", "error", err)
 			return nil, err
 		}
-		currentConfig := chain.Config().XDPoS.V2.Config(uint64(round))
-		// Get signers/signing tx count
-		signers, err := GetSigningTxCount(adaptor, chain, header, parentState, currentConfig)
+
+		currentConfig := adaptor.EngineV2.Config(uint64(round))
+
+		// Get signers/signing tx count, and burned tokens in one epoch
+		signers, burnedInOneEpoch, err := GetSigningTxCount(adaptor, chain, header, parentState, currentConfig)
 
 		log.Debug("Time Get Signers", "block", header.Number.Uint64(), "time", common.PrettyDuration(time.Since(start)))
 		if err != nil {
@@ -292,14 +325,14 @@ func AttachConsensusV2Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 			// Add reward for coin holders.
 			rewardResults := make(map[common.Address]interface{})
 			for signer, calcReward := range rewardSigners {
-				rewards, err := contracts.CalculateRewardForHolders(foundationWalletAddr, parentState, signer, calcReward, number)
+				rewards, err := contracts.CalculateRewardForHolders(chain.Config(), foundationWalletAddr, parentState, signer, calcReward, header.Number)
 				if err != nil {
 					log.Error("[HookReward] Fail to calculate reward for holders.", "error", err)
 					return nil, err
 				}
 				if len(rewards) > 0 {
 					for holder, reward := range rewards {
-						stateBlock.AddBalance(holder, reward)
+						stateBlock.AddBalance(holder, reward, tracing.BalanceIncreaseRewardMineBlock)
 					}
 				}
 				rewardResults[signer] = rewards
@@ -330,14 +363,14 @@ func AttachConsensusV2Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 				// Add reward for coin holders.
 				rewardResults := make(map[common.Address]interface{})
 				for signer, calcReward := range rewardSigners {
-					rewards, err := contracts.CalculateRewardForHolders(foundationWalletAddr, parentState, signer, calcReward, number)
+					rewards, err := contracts.CalculateRewardForHolders(chain.Config(), foundationWalletAddr, parentState, signer, calcReward, header.Number)
 					if err != nil {
 						log.Error("[HookReward] Fail to calculate reward for holders.", "error", err)
 						return nil, err
 					}
 					if len(rewards) > 0 {
 						for holder, reward := range rewards {
-							stateBlock.AddBalance(holder, reward)
+							stateBlock.AddBalance(holder, reward, tracing.BalanceIncreaseRewardMineBlock)
 							rewardSum.Add(rewardSum, reward)
 						}
 					}
@@ -346,24 +379,45 @@ func AttachConsensusV2Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 				rewardsMap[rwt.key] = rewardResults
 			}
 			// record the total reward into state db
-			totalMinted := state.GetTotalMinted(stateBlock).Big()
-			lastEpochNum := state.GetLastEpochNum(stateBlock)
-			if lastEpochNum.IsZero() {
-				// if `lastEpochNum` is zero, the total minted has not included tokens before TIPUpgradeReward
-				// calculate the tokens before TIPUpgradeReward and set to totalMinted
-				// for now no-do
+			totalMinted := new(big.Int)
+			totalBurned := new(big.Int)
+
+			nonce := stateBlock.GetNonce(common.MintedRecordAddressBinary)
+			if nonce == 0 {
+				// initialize MintedRecordAddress
+				stateBlock.PutMintedRecordOnsetEpoch(common.Uint64ToHash(epochNum))
+				stateBlock.PutMintedRecordOnsetBlock(common.Uint64ToHash(number))
+			} else {
+				epochNumIter := epochNum
+				for epochNumIter > 0 {
+					epochNumIter--
+					totalMinted = stateBlock.GetPostMinted(epochNumIter).Big()
+					totalBurned = stateBlock.GetPostBurned(epochNumIter).Big()
+					if totalMinted.Sign() != 0 || totalBurned.Sign() != 0 {
+						// if previous epoch has non-zero total minted or non-zero total burned, break the loop
+						break
+					}
+				}
 			}
 			totalMinted.Add(totalMinted, rewardSum)
-			bigPower256 := new(big.Int).Lsh(big.NewInt(1), 256)
-			bigMaxU256 := new(big.Int).Sub(bigPower256, big.NewInt(1))
 			// if overflow, set to maxU256 and log a warning
-			if totalMinted.Cmp(bigMaxU256) >= 0 {
-				totalMinted.Set(bigMaxU256)
+			if totalMinted.Cmp(math.MaxBig256) > 0 {
+				totalMinted.Set(math.MaxBig256)
 				log.Warn("[HookReward] total minted overflow max u256")
 			}
 			log.Debug("[HookReward] total minted in hook", "value", totalMinted)
-			state.PutTotalMinted(stateBlock, common.BigToHash(totalMinted))
-			state.PutLastEpochNum(stateBlock, common.Uint64ToHash(epochNum))
+			stateBlock.PutPostMinted(epochNum, common.BigToHash(totalMinted))
+			stateBlock.PutPostRewardBlock(epochNum, common.Uint64ToHash(number))
+			// Record total burned into statedb
+			totalBurned.Add(totalBurned, burnedInOneEpoch)
+			// if overflow, set to maxU256 and log a warning
+			if totalBurned.Cmp(math.MaxBig256) > 0 {
+				totalBurned.Set(math.MaxBig256)
+				log.Warn("[HookReward] total burned overflow max u256")
+			}
+			stateBlock.PutPostBurned(epochNum, common.BigToHash(totalBurned))
+			// Increment nonce so that statedb does not treat it as empty account
+			stateBlock.IncrementMintedRecordNonce()
 		}
 		log.Debug("Time Calculated HookReward ", "block", header.Number.Uint64(), "time", common.PrettyDuration(time.Since(start)))
 		return rewardsMap, nil
@@ -371,7 +425,7 @@ func AttachConsensusV2Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 }
 
 // get signing transaction sender count
-func GetSigningTxCount(c *XDPoS.XDPoS, chain consensus.ChainReader, header *types.Header, parentState *state.StateDB, currentConfig *params.V2Config) (map[Beneficiary]map[common.Address]*RewardLog, error) {
+func GetSigningTxCount(c *XDPoS.XDPoS, chain consensus.ChainReader, header *types.Header, parentState *state.StateDB, currentConfig *params.V2Config) (map[Beneficiary]map[common.Address]*RewardLog, *big.Int, error) {
 	// header should be a new epoch switch block
 	number := header.Number.Uint64()
 	rewardEpochCount := 2
@@ -383,9 +437,11 @@ func GetSigningTxCount(c *XDPoS.XDPoS, chain consensus.ChainReader, header *type
 
 	mapBlkHash := map[uint64]common.Hash{}
 
+	burnedInOneEpoch := new(big.Int)
+
 	// prevent overflow
 	if number == 0 {
-		return signers, nil
+		return signers, burnedInOneEpoch, nil
 	}
 
 	data := make(map[common.Hash][]common.Address)
@@ -396,10 +452,19 @@ func GetSigningTxCount(c *XDPoS.XDPoS, chain consensus.ChainReader, header *type
 
 	h := header
 	for i := number - 1; ; i-- {
-		h = chain.GetHeader(h.ParentHash, i)
+		parentHash := h.ParentHash
+		h = chain.GetHeader(parentHash, i)
+		if h == nil {
+			log.Error("[GetSigningTxCount] fail to get header", "number", i, "hash", parentHash)
+			return nil, burnedInOneEpoch, fmt.Errorf("fail to get header in GetSigningTxCount at number: %v, hash: %v", i, parentHash)
+		}
+		if epochCount == 0 && h.BaseFee != nil {
+			// add burned for the first epoch during loop
+			burnedInOneEpoch.Add(burnedInOneEpoch, new(big.Int).Mul(h.BaseFee, new(big.Int).SetUint64(h.GasUsed)))
+		}
 		isEpochSwitch, _, err := c.IsEpochSwitch(h)
 		if err != nil {
-			return nil, err
+			return nil, burnedInOneEpoch, err
 		}
 		if isEpochSwitch && i != chain.Config().XDPoS.V2.SwitchBlock.Uint64()+1 {
 			epochCount += 1
@@ -411,17 +476,17 @@ func GetSigningTxCount(c *XDPoS.XDPoS, chain consensus.ChainReader, header *type
 				nodesToKeep[MasterNodeBeneficiary] = c.GetMasternodesFromCheckpointHeader(h)
 				// in reward upgrade, add protector and observer nodes
 				if chain.Config().IsTIPUpgradeReward(header.Number) {
-					candidates := state.GetCandidates(parentState)
+					candidates := parentState.GetCandidates()
 					var ms []utils.Masternode
 					for _, candidate := range candidates {
 						// ignore "0x0000000000000000000000000000000000000000"
 						if !candidate.IsZero() {
-							v := state.GetCandidateCap(parentState, candidate)
+							v := parentState.GetCandidateCap(candidate)
 							ms = append(ms, utils.Masternode{Address: candidate, Stake: v})
 						}
 					}
-					sort.Slice(ms, func(i, j int) bool {
-						return ms[i].Stake.Cmp(ms[j].Stake) >= 0
+					slices.SortStableFunc(ms, func(a, b utils.Masternode) int {
+						return b.Stake.Cmp(a.Stake)
 					})
 					// find penalty and filter them out
 					penalties := common.ExtractAddressFromBytes(h.Penalties)
@@ -454,10 +519,12 @@ func GetSigningTxCount(c *XDPoS.XDPoS, chain consensus.ChainReader, header *type
 		mapBlkHash[i] = h.Hash()
 		signingTxs, ok := c.GetCachedSigningTxs(h.Hash())
 		if !ok {
-			log.Debug("Failed get from cached", "hash", h.Hash().String(), "number", i)
+			log.Debug("Failed get from cached", "hash", h.Hash(), "number", i)
 			block := chain.GetBlock(h.Hash(), i)
-			txs := block.Transactions()
-			signingTxs = c.CacheSigningTxs(h.Hash(), txs)
+			if block != nil {
+				txs := block.Transactions()
+				signingTxs = c.CacheSigningTxs(h.Hash(), txs)
+			}
 		}
 		for _, tx := range signingTxs {
 			blkHash := common.BytesToHash(tx.Data()[len(tx.Data())-32:])
@@ -466,7 +533,7 @@ func GetSigningTxCount(c *XDPoS.XDPoS, chain consensus.ChainReader, header *type
 		}
 		// prevent overflow
 		if i == 0 {
-			return signers, nil
+			return signers, burnedInOneEpoch, nil
 		}
 	}
 
@@ -511,7 +578,7 @@ func GetSigningTxCount(c *XDPoS.XDPoS, chain consensus.ChainReader, header *type
 
 	log.Info("Calculate reward at checkpoint", "startBlock", startBlockNumber, "endBlock", endBlockNumber)
 
-	return signers, nil
+	return signers, burnedInOneEpoch, nil
 }
 
 // Calculate reward for signers.

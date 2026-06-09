@@ -30,13 +30,15 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/core"
 	"github.com/XinFinOrg/XDPoSChain/core/rawdb"
 	"github.com/XinFinOrg/XDPoSChain/core/state"
+	"github.com/XinFinOrg/XDPoSChain/core/tracing"
 	"github.com/XinFinOrg/XDPoSChain/core/types"
 	"github.com/XinFinOrg/XDPoSChain/core/vm"
 	"github.com/XinFinOrg/XDPoSChain/crypto"
+	"github.com/XinFinOrg/XDPoSChain/crypto/keccak"
 	"github.com/XinFinOrg/XDPoSChain/ethdb"
 	"github.com/XinFinOrg/XDPoSChain/params"
 	"github.com/XinFinOrg/XDPoSChain/rlp"
-	"golang.org/x/crypto/sha3"
+	"github.com/holiman/uint256"
 )
 
 // StateTest checks transaction processing without block context.
@@ -106,6 +108,7 @@ type stTransaction struct {
 	GasLimit             []uint64            `json:"gasLimit"`
 	Value                []string            `json:"value"`
 	PrivateKey           []byte              `json:"secretKey"`
+	AuthorizationList    []*stAuthorization  `json:"authorizationList,omitempty"`
 }
 
 type stTransactionMarshaling struct {
@@ -115,6 +118,27 @@ type stTransactionMarshaling struct {
 	Nonce                math.HexOrDecimal64
 	GasLimit             []math.HexOrDecimal64
 	PrivateKey           hexutil.Bytes
+}
+
+//go:generate go run github.com/fjl/gencodec -type stAuthorization -field-override stAuthorizationMarshaling -out gen_stauthorization.go
+
+// Authorization is an authorization from an account to deploy code at its address.
+type stAuthorization struct {
+	ChainID *big.Int       `json:"chainId" gencodec:"required"`
+	Address common.Address `json:"address" gencodec:"required"`
+	Nonce   uint64         `json:"nonce" gencodec:"required"`
+	V       uint8          `json:"v" gencodec:"required"`
+	R       *big.Int       `json:"r" gencodec:"required"`
+	S       *big.Int       `json:"s" gencodec:"required"`
+}
+
+// field type overrides for gencodec
+type stAuthorizationMarshaling struct {
+	ChainID *math.HexOrDecimal256
+	Nonce   math.HexOrDecimal64
+	V       math.HexOrDecimal64
+	R       *math.HexOrDecimal256
+	S       *math.HexOrDecimal256
 }
 
 // Subtests returns all valid subtests of the test.
@@ -130,11 +154,18 @@ func (t *StateTest) Subtests() []StateSubtest {
 
 // Run executes a specific subtest.
 func (t *StateTest) Run(subtest StateSubtest, vmconfig vm.Config) (*state.StateDB, error) {
+	statedb, _, err := t.RunWithGas(subtest, vmconfig)
+	return statedb, err
+}
+
+// RunWithGas executes a specific subtest and returns the resulting state along
+// with the gas used by message execution.
+func (t *StateTest) RunWithGas(subtest StateSubtest, vmconfig vm.Config) (*state.StateDB, uint64, error) {
 	config, ok := Forks[subtest.Fork]
 	if !ok {
-		return nil, UnsupportedForkError{subtest.Fork}
+		return nil, 0, UnsupportedForkError{subtest.Fork}
 	}
-	block := t.genesis(config).ToBlock(nil)
+	block := t.genesis(config).ToBlock()
 	db := rawdb.NewMemoryDatabase()
 	statedb := MakePreState(db, t.json.Pre)
 
@@ -148,17 +179,16 @@ func (t *StateTest) Run(subtest StateSubtest, vmconfig vm.Config) (*state.StateD
 		}
 	}
 	post := t.json.Post[subtest.Fork][subtest.Index]
-	msg, err := t.json.Tx.toMessage(post, block.Number(), baseFee)
+	msg, err := t.json.Tx.toMessage(post, baseFee)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	// Prepare the EVM.
-	txContext := core.NewEVMTxContext(msg)
 	context := core.NewEVMBlockContext(block.Header(), nil, &t.json.Env.Coinbase)
 	context.GetHash = vmTestBlockHash
 	context.BaseFee = baseFee
-	evm := vm.NewEVM(context, txContext, statedb, nil, config, vmconfig)
+	evm := vm.NewEVM(context, statedb, nil, config, vmconfig)
 
 	// Execute the message.
 	snapshot := statedb.Snapshot()
@@ -166,19 +196,30 @@ func (t *StateTest) Run(subtest StateSubtest, vmconfig vm.Config) (*state.StateD
 	gaspool.AddGas(block.GasLimit())
 
 	coinbase := &t.json.Env.Coinbase
-	if _, err := core.ApplyMessage(evm, msg, gaspool, *coinbase); err != nil {
+	result, err := core.ApplyMessage(evm, msg, gaspool, *coinbase)
+	if err != nil {
 		statedb.RevertToSnapshot(snapshot)
 	}
 	if logs := rlpHash(statedb.Logs()); logs != common.Hash(post.Logs) {
-		return statedb, fmt.Errorf("post state logs hash mismatch: got %x, want %x", logs, post.Logs)
+		return statedb, 0, fmt.Errorf("post state logs hash mismatch: got %x, want %x", logs, post.Logs)
 	}
 
 	// Commit block
-	root, _ := statedb.Commit(config.IsEIP158(block.Number()))
+	root, _ := statedb.Commit(block.NumberU64(), config.IsEIP158(block.Number()))
 	if root != common.Hash(post.Root) {
-		return statedb, fmt.Errorf("post state root mismatch: got %x, want %x", root, post.Root)
+		return statedb, 0, fmt.Errorf("post state root mismatch: got %x, want %x", root, post.Root)
 	}
-	return statedb, nil
+	// Re-init the post-state instance for further operation
+	statedb, err2 := state.New(root, statedb.Database())
+	if err2 != nil {
+		return nil, 0, err2
+	}
+	var gasUsed uint64
+	if result != nil {
+		gasUsed = result.UsedGas
+	}
+	// If we got an error from ApplyMessage, but post-state is correct, clear err (unless internal failure)
+	return statedb, gasUsed, nil
 }
 
 func (t *StateTest) gasLimit(subtest StateSubtest) uint64 {
@@ -190,14 +231,14 @@ func MakePreState(db ethdb.Database, accounts types.GenesisAlloc) *state.StateDB
 	statedb, _ := state.New(types.EmptyRootHash, sdb)
 	for addr, a := range accounts {
 		statedb.SetCode(addr, a.Code)
-		statedb.SetNonce(addr, a.Nonce)
-		statedb.SetBalance(addr, a.Balance)
+		statedb.SetNonce(addr, a.Nonce, tracing.NonceChangeGenesis)
+		statedb.SetBalance(addr, a.Balance, tracing.BalanceChangeUnspecified)
 		for k, v := range a.Storage {
 			statedb.SetState(addr, k, v)
 		}
 	}
 	// Commit and re-open to start with a clean state.
-	root, _ := statedb.Commit(false)
+	root, _ := statedb.Commit(0, false)
 	statedb, _ = state.New(root, sdb)
 	return statedb
 }
@@ -214,7 +255,7 @@ func (t *StateTest) genesis(config *params.ChainConfig) *core.Genesis {
 	}
 }
 
-func (tx *stTransaction) toMessage(ps stPostState, number *big.Int, baseFee *big.Int) (core.Message, error) {
+func (tx *stTransaction) toMessage(ps stPostState, baseFee *big.Int) (*core.Message, error) {
 	// Derive sender from private key if present.
 	var from common.Address
 	if len(tx.PrivateKey) > 0 {
@@ -283,13 +324,41 @@ func (tx *stTransaction) toMessage(ps stPostState, number *big.Int, baseFee *big
 	if gasPrice == nil {
 		return nil, errors.New("no gas price provided")
 	}
+	var authList []types.SetCodeAuthorization
+	if tx.AuthorizationList != nil {
+		authList = make([]types.SetCodeAuthorization, len(tx.AuthorizationList))
+		for i, auth := range tx.AuthorizationList {
+			authList[i] = types.SetCodeAuthorization{
+				ChainID: *uint256.MustFromBig(auth.ChainID),
+				Address: auth.Address,
+				Nonce:   auth.Nonce,
+				V:       auth.V,
+				R:       *uint256.MustFromBig(auth.R),
+				S:       *uint256.MustFromBig(auth.S),
+			}
+		}
+	}
 
-	msg := types.NewMessage(from, to, tx.Nonce, value, gasLimit, tx.GasPrice, tx.MaxFeePerGas, tx.MaxPriorityFeePerGas, data, accessList, false, nil, number)
+	msg := &core.Message{
+		From:                  from,
+		To:                    to,
+		Nonce:                 tx.Nonce,
+		Value:                 value,
+		GasLimit:              gasLimit,
+		GasPrice:              tx.GasPrice,
+		GasFeeCap:             tx.MaxFeePerGas,
+		GasTipCap:             tx.MaxPriorityFeePerGas,
+		Data:                  data,
+		AccessList:            accessList,
+		SetCodeAuthorizations: authList,
+		SkipNonceChecks:       false,
+		SkipTransactionChecks: false,
+	}
 	return msg, nil
 }
 
 func rlpHash(x interface{}) (h common.Hash) {
-	hw := sha3.NewLegacyKeccak256()
+	hw := keccak.NewLegacyKeccak256()
 	rlp.Encode(hw, x)
 	hw.Sum(h[:0])
 	return h

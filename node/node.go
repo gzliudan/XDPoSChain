@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 
@@ -37,7 +38,7 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/log"
 	"github.com/XinFinOrg/XDPoSChain/p2p"
 	"github.com/XinFinOrg/XDPoSChain/rpc"
-	"github.com/prometheus/prometheus/util/flock"
+	"github.com/gofrs/flock"
 )
 
 // Node is a container on which services can be registered.
@@ -49,9 +50,9 @@ type Node struct {
 	keyDir     string // key store directory
 	keyDirTemp bool   // If true, key directory will be removed by Stop
 
-	ephemKeystore string         // if non-empty, the key directory that will be removed by Stop
-	dirLock       flock.Releaser // prevents concurrent use of instance directory
-	stop          chan struct{}  // Channel to wait for termination notifications
+	ephemKeystore string        // if non-empty, the key directory that will be removed by Stop
+	dirLock       *flock.Flock  // prevents concurrent use of instance directory
+	stop          chan struct{} // Channel to wait for termination notifications
 
 	server        *p2p.Server // Currently running P2P networking layer
 	startStopLock sync.Mutex  // Start/Stop are protected by an additional lock
@@ -288,16 +289,6 @@ func (n *Node) openEndpoints() error {
 	return err
 }
 
-// containsLifecycle checks if 'lfs' contains 'l'.
-func containsLifecycle(lfs []Lifecycle, l Lifecycle) bool {
-	for _, obj := range lfs {
-		if obj == l {
-			return true
-		}
-	}
-	return false
-}
-
 // stopServices terminates running services, RPC and p2p networking.
 // It is the inverse of Start.
 func (n *Node) stopServices(running []Lifecycle) error {
@@ -331,20 +322,20 @@ func (n *Node) openDataDir() error {
 	}
 	// Lock the instance directory to prevent concurrent use by another instance as well as
 	// accidental use of the instance directory as a database.
-	release, _, err := flock.New(filepath.Join(instdir, "LOCK"))
-	if err != nil {
-		return convertFileLockError(err)
+	n.dirLock = flock.New(filepath.Join(instdir, "LOCK"))
+
+	if locked, err := n.dirLock.TryLock(); err != nil {
+		return err
+	} else if !locked {
+		return ErrDatadirUsed
 	}
-	n.dirLock = release
 	return nil
 }
 
 func (n *Node) closeDataDir() {
 	// Release instance directory lock.
-	if n.dirLock != nil {
-		if err := n.dirLock.Release(); err != nil {
-			n.log.Error("Can't release datadir lock", "err", err)
-		}
+	if n.dirLock != nil && n.dirLock.Locked() {
+		n.dirLock.Unlock()
 		n.dirLock = nil
 	}
 }
@@ -387,33 +378,20 @@ func (n *Node) obtainJWTSecret(cliParam string) ([]byte, error) {
 // startup. It's not meant to be called at any time afterwards as it makes certain
 // assumptions about the state of the node.
 func (n *Node) startRPC() error {
-	// Filter out personal api
-	var apis []rpc.API
-	for _, api := range n.rpcAPIs {
-		if api.Namespace == "personal" {
-			if n.config.EnablePersonal {
-				log.Warn("Deprecated personal namespace activated")
-			} else {
-				continue
-			}
-		}
-		apis = append(apis, api)
-	}
-	if err := n.startInProc(apis); err != nil {
+	openAPIs, authAPIs, localAPIs, hasAuthenticated := n.getAPIs()
+
+	if err := n.startInProc(localAPIs); err != nil {
 		return err
 	}
 
 	// Configure IPC.
 	if n.ipc.endpoint != "" {
-		if err := n.ipc.start(apis); err != nil {
+		if err := n.ipc.start(localAPIs); err != nil {
 			return err
 		}
 	}
 
-	var (
-		servers           []*httpServer
-		openAPIs, allAPIs = n.getAPIs()
-	)
+	var servers []*httpServer
 
 	rpcConfig := rpcEndpointConfig{
 		batchItemLimit:         n.config.BatchRequestLimit,
@@ -466,7 +444,7 @@ func (n *Node) startRPC() error {
 			batchResponseSizeLimit: engineAPIBatchResponseSizeLimit,
 			httpBodyLimit:          engineAPIBodyLimit,
 		}
-		err := server.enableRPC(allAPIs, httpConfig{
+		err := server.enableRPC(authAPIs, httpConfig{
 			CorsAllowedOrigins: DefaultAuthCors,
 			Vhosts:             n.config.AuthVirtualHosts,
 			Modules:            DefaultAuthModules,
@@ -483,7 +461,7 @@ func (n *Node) startRPC() error {
 		if err := server.setListenAddr(n.config.AuthAddr, port); err != nil {
 			return err
 		}
-		if err := server.enableWS(allAPIs, wsConfig{
+		if err := server.enableWS(authAPIs, wsConfig{
 			Modules:           DefaultAuthModules,
 			Origins:           DefaultAuthOrigins,
 			prefix:            DefaultAuthPrefix,
@@ -509,7 +487,7 @@ func (n *Node) startRPC() error {
 		}
 	}
 	// Configure authenticated API
-	if len(openAPIs) != len(allAPIs) {
+	if hasAuthenticated {
 		jwtSecret, err := n.obtainJWTSecret(n.config.JWTSecret)
 		if err != nil {
 			return err
@@ -575,7 +553,7 @@ func (n *Node) RegisterLifecycle(lifecycle Lifecycle) {
 	if n.state != initializingState {
 		panic("can't register lifecycle on running/stopped node")
 	}
-	if containsLifecycle(n.lifecycles, lifecycle) {
+	if slices.Contains(n.lifecycles, lifecycle) {
 		panic(fmt.Sprintf("attempt to register lifecycle %T more than once", lifecycle))
 	}
 	n.lifecycles = append(n.lifecycles, lifecycle)
@@ -603,15 +581,25 @@ func (n *Node) RegisterAPIs(apis []rpc.API) {
 	n.rpcAPIs = append(n.rpcAPIs, apis...)
 }
 
-// getAPIs return two sets of APIs, both the ones that do not require
-// authentication, and the complete set
-func (n *Node) getAPIs() (unauthenticated, all []rpc.API) {
+// getAPIs splits the registered APIs by transport.
+// Open APIs are exposed on unauthenticated HTTP/WS.
+// Auth APIs are exposed on authenticated HTTP/WS.
+// Local APIs are exposed on in-process and IPC transports.
+func (n *Node) getAPIs() (open, auth, local []rpc.API, hasAuthenticated bool) {
 	for _, api := range n.rpcAPIs {
+		local = append(local, api)
+		if api.Local {
+			continue
+		}
+		if api.Authenticated {
+			hasAuthenticated = true
+		}
+		auth = append(auth, api)
 		if !api.Authenticated {
-			unauthenticated = append(unauthenticated, api)
+			open = append(open, api)
 		}
 	}
-	return unauthenticated, n.rpcAPIs
+	return open, auth, local, hasAuthenticated
 }
 
 // RegisterHandler mounts a handler on the given path on the canonical HTTP server.

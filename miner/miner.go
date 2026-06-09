@@ -19,16 +19,19 @@ package miner
 
 import (
 	"fmt"
+	"math/big"
 	"sync/atomic"
 
 	"github.com/XinFinOrg/XDPoSChain/XDCx"
 	"github.com/XinFinOrg/XDPoSChain/XDCxlending"
 	"github.com/XinFinOrg/XDPoSChain/accounts"
 	"github.com/XinFinOrg/XDPoSChain/common"
+	"github.com/XinFinOrg/XDPoSChain/common/hexutil"
 	"github.com/XinFinOrg/XDPoSChain/consensus"
 	"github.com/XinFinOrg/XDPoSChain/core"
 	"github.com/XinFinOrg/XDPoSChain/core/state"
 	"github.com/XinFinOrg/XDPoSChain/core/txpool"
+	"github.com/XinFinOrg/XDPoSChain/core/txpool/legacypool"
 	"github.com/XinFinOrg/XDPoSChain/core/types"
 	"github.com/XinFinOrg/XDPoSChain/eth/downloader"
 	"github.com/XinFinOrg/XDPoSChain/ethdb"
@@ -44,9 +47,23 @@ type Backend interface {
 	TxPool() *txpool.TxPool
 	ChainDb() ethdb.Database
 	GetXDCX() *XDCx.XDCX
-	OrderPool() *txpool.OrderPool
-	LendingPool() *txpool.LendingPool
+	OrderPool() *legacypool.OrderPool
+	LendingPool() *legacypool.LendingPool
 	GetXDCXLending() *XDCxlending.Lending
+}
+
+// Config is the configuration parameters of mining.
+type Config struct {
+	Etherbase common.Address `toml:",omitempty"` // Public address for block mining rewards
+	ExtraData hexutil.Bytes  `toml:",omitempty"` // Block extra data set by the miner
+	GasCeil   uint64         // Target gas ceiling for mined blocks.
+	GasPrice  *big.Int       // Minimum gas price for mining a transaction
+}
+
+// DefaultConfig contains default settings for miner.
+var DefaultConfig = Config{
+	GasCeil:  params.XDCGenesisGasLimit,
+	GasPrice: big.NewInt(1),
 }
 
 // Miner creates blocks and searches for proof-of-work values.
@@ -64,12 +81,12 @@ type Miner struct {
 	shouldStart int32 // should start indicates whether we should start after sync
 }
 
-func New(eth Backend, config *params.ChainConfig, mux *event.TypeMux, engine consensus.Engine, announceTxs bool) *Miner {
+func New(eth Backend, config *Config, chainConfig *params.ChainConfig, mux *event.TypeMux, engine consensus.Engine, announceTxs bool) *Miner {
 	miner := &Miner{
 		eth:      eth,
 		mux:      mux,
 		engine:   engine,
-		worker:   newWorker(config, engine, common.Address{}, eth, mux, announceTxs),
+		worker:   newWorker(config, chainConfig, engine, eth, mux, announceTxs),
 		canStart: 1,
 	}
 	miner.Register(NewCpuAgent(eth.BlockChain(), engine))
@@ -145,15 +162,7 @@ func (m *Miner) HashRate() (tot int64) {
 	if pow, ok := m.engine.(consensus.PoW); ok {
 		tot += int64(pow.Hashrate())
 	}
-	// do we care this might race? is it worth we're rewriting some
-	// aspects of the worker/locking up agents so we can get an accurate
-	// hashrate?
-	for agent := range m.worker.agents {
-		if _, ok := agent.(*CpuAgent); !ok {
-			tot += agent.GetHashRate()
-		}
-	}
-	return
+	return tot + m.worker.getHashrate()
 }
 
 func (m *Miner) SetExtra(extra []byte) error {
@@ -162,6 +171,10 @@ func (m *Miner) SetExtra(extra []byte) error {
 	}
 	m.worker.setExtra(extra)
 	return nil
+}
+
+func (miner *Miner) SetGasTip(tip *big.Int) error {
+	return miner.worker.setGasTip(tip)
 }
 
 // Pending returns the currently pending block and associated state.

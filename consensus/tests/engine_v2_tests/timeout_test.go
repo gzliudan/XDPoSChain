@@ -17,6 +17,7 @@ import (
 )
 
 func TestCountdownTimeoutToSendTimeoutMessage(t *testing.T) {
+	skipLongInShortMode(t)
 	blockchain, _, _, _, _, _ := PrepareXDCTestBlockChainForV2Engine(t, 901, params.TestXDPoSMockChainConfig, nil)
 	engineV2 := blockchain.Engine().(*XDPoS.XDPoS).EngineV2
 
@@ -29,6 +30,7 @@ func TestCountdownTimeoutToSendTimeoutMessage(t *testing.T) {
 }
 
 func TestCountdownTimeoutNotToSendTimeoutMessageIfNotInMasternodeList(t *testing.T) {
+	skipLongInShortMode(t)
 	blockchain, _, _, _, _, _ := PrepareXDCTestBlockChainForV2Engine(t, 901, params.TestXDPoSMockChainConfig, nil)
 
 	engineV2 := blockchain.Engine().(*XDPoS.XDPoS).EngineV2
@@ -47,6 +49,7 @@ func TestCountdownTimeoutNotToSendTimeoutMessageIfNotInMasternodeList(t *testing
 }
 
 func TestSyncInfoAfterReachTimeoutSyncThreadhold(t *testing.T) {
+	skipLongInShortMode(t)
 	blockchain, _, _, _, _, _ := PrepareXDCTestBlockChainForV2Engine(t, 901, params.TestXDPoSMockChainConfig, nil)
 	engineV2 := blockchain.Engine().(*XDPoS.XDPoS).EngineV2
 	engineV2.SetNewRoundFaker(blockchain, 1, true)
@@ -85,6 +88,7 @@ func TestSyncInfoAfterReachTimeoutSyncThreadhold(t *testing.T) {
 }
 
 func TestTimeoutPeriodAndThreadholdConfigChange(t *testing.T) {
+	skipLongInShortMode(t)
 	blockchain, _, currentBlock, signer, signFn, _ := PrepareXDCTestBlockChainForV2Engine(t, 1799, params.TestXDPoSMockChainConfig, nil)
 	engineV2 := blockchain.Engine().(*XDPoS.XDPoS).EngineV2
 	// engineV2.SetNewRoundFaker(blockchain, 1, true)
@@ -111,7 +115,7 @@ func TestTimeoutPeriodAndThreadholdConfigChange(t *testing.T) {
 	blockCoinBase := "0x111000000000000000000000000000000123"
 	currentBlock = CreateBlock(blockchain, params.TestXDPoSMockChainConfig, currentBlock, blockNum, 900, blockCoinBase, signer, signFn, nil, nil, "")
 	currentBlockHeader := currentBlock.Header()
-	currentBlockHeader.Time = big.NewInt(time.Now().Unix())
+	currentBlockHeader.Time = uint64(time.Now().Unix())
 	err := blockchain.InsertBlock(currentBlock)
 	assert.Nil(t, err)
 
@@ -139,58 +143,61 @@ func TestTimeoutPeriodAndThreadholdConfigChange(t *testing.T) {
 }
 
 // Timeout handler
-func TestTimeoutMessageHandlerSuccessfullyGenerateTCandSyncInfo(t *testing.T) {
-	blockchain, _, _, _, _, _ := PrepareXDCTestBlockChainForV2Engine(t, 905, params.TestXDPoSMockChainConfig, nil)
+func TestTimeoutMessageHandlerSuccessfullyGenerateTCandSyncInfoAfterReachingThreshold(t *testing.T) {
+	// skipLongInShortMode(t)
+	blockchain, _, _, signer, signFn, _ := PrepareXDCTestBlockChainForV2Engine(t, 905, params.TestXDPoSMockChainConfig, nil)
 	engineV2 := blockchain.Engine().(*XDPoS.XDPoS).EngineV2
 
-	// Set round to 1
 	engineV2.SetNewRoundFaker(blockchain, types.Round(5), false)
-	// Create two timeout message which will not reach timeout pool threshold
-	timeoutMsg := &types.Timeout{
-		Round:     types.Round(5),
-		Signature: []byte{1},
-		GapNumber: 450,
-	}
 
-	err := engineV2.TimeoutHandler(blockchain, timeoutMsg)
+	timeoutSigningHash := types.TimeoutSigHash(&types.TimeoutForSign{
+		Round:     types.Round(5),
+		GapNumber: 450,
+	})
+
+	sigSigner, err := signFn(accounts.Account{Address: signer}, timeoutSigningHash.Bytes())
+	assert.Nil(t, err)
+	sigAcc1 := SignHashByPK(acc1Key, timeoutSigningHash.Bytes())
+	sigAcc2 := SignHashByPK(acc2Key, timeoutSigningHash.Bytes())
+	sigAcc3 := SignHashByPK(acc3Key, timeoutSigningHash.Bytes())
+
+	// TimeoutHandler bypasses VerifyTimeoutMessage, so the signer field is set
+	// manually here to mirror what the BFT entry path would set.
+	timeoutMsg := &types.Timeout{Round: types.Round(5), Signature: sigSigner, GapNumber: 450}
+	timeoutMsg.SetSigner(signer)
+	err = engineV2.TimeoutHandler(blockchain, timeoutMsg)
 	assert.Nil(t, err)
 	currentRound, _, _, _, _, _ := engineV2.GetPropertiesFaker()
 	assert.Equal(t, types.Round(5), currentRound)
-	timeoutMsg = &types.Timeout{
-		Round:     types.Round(5),
-		Signature: []byte{2},
-		GapNumber: 450,
-	}
+
+	timeoutMsg = &types.Timeout{Round: types.Round(5), Signature: sigAcc1, GapNumber: 450}
+	timeoutMsg.SetSigner(acc1Addr)
 	err = engineV2.TimeoutHandler(blockchain, timeoutMsg)
 	assert.Nil(t, err)
-	timeoutMsg = &types.Timeout{
-		Round:     types.Round(5),
-		Signature: []byte{3},
-		GapNumber: 450,
-	}
+
+	timeoutMsg = &types.Timeout{Round: types.Round(5), Signature: sigAcc2, GapNumber: 450}
+	timeoutMsg.SetSigner(acc2Addr)
 	err = engineV2.TimeoutHandler(blockchain, timeoutMsg)
 	assert.Nil(t, err)
 	currentRound, _, _, _, _, _ = engineV2.GetPropertiesFaker()
 	assert.Equal(t, types.Round(5), currentRound)
 
 	// Send a timeout with different gap number, it shall not trigger timeout pool hook
-	timeoutMsg = &types.Timeout{
+	otherGapHash := types.TimeoutSigHash(&types.TimeoutForSign{
 		Round:     types.Round(5),
-		Signature: []byte{4},
 		GapNumber: 1350,
-	}
+	})
+	sigOtherGap := SignHashByPK(acc3Key, otherGapHash.Bytes())
+	timeoutMsg = &types.Timeout{Round: types.Round(5), Signature: sigOtherGap, GapNumber: 1350}
+	timeoutMsg.SetSigner(acc3Addr)
 	err = engineV2.TimeoutHandler(blockchain, timeoutMsg)
 	assert.Nil(t, err)
 	currentRound, _, _, _, _, _ = engineV2.GetPropertiesFaker()
 	assert.Equal(t, types.Round(5), currentRound)
 
 	// Create a timeout message that should trigger timeout pool hook
-	timeoutMsg = &types.Timeout{
-		Round:     types.Round(5),
-		Signature: []byte{5},
-		GapNumber: 450,
-	}
-
+	timeoutMsg = &types.Timeout{Round: types.Round(5), Signature: sigAcc3, GapNumber: 450}
+	timeoutMsg.SetSigner(acc3Addr)
 	err = engineV2.TimeoutHandler(blockchain, timeoutMsg)
 	assert.Nil(t, err)
 
@@ -208,9 +215,9 @@ func TestTimeoutMessageHandlerSuccessfullyGenerateTCandSyncInfo(t *testing.T) {
 	assert.NotNil(t, tc)
 	assert.Equal(t, tc.Round, types.Round(5))
 	assert.Equal(t, uint64(450), tc.GapNumber)
-	// The signatures shall not include the byte{3} from a different gap number
-	sigatures := []types.Signature{[]byte{1}, []byte{2}, []byte{3}, []byte{5}}
-	assert.ElementsMatch(t, tc.Signatures, sigatures)
+	// The signatures shall not include the different-gap signature
+	expectedSigs := []types.Signature{sigSigner, sigAcc1, sigAcc2, sigAcc3}
+	assert.ElementsMatch(t, tc.Signatures, expectedSigs)
 	assert.Equal(t, types.Round(6), currentRound)
 }
 
@@ -276,6 +283,7 @@ func TestShouldVerifyTimeoutMessageForFirstV2Block(t *testing.T) {
 }
 
 func TestShouldVerifyTimeoutMessage(t *testing.T) {
+	skipLongInShortMode(t)
 	blockchain, _, _, _, _, _ := PrepareXDCTestBlockChainForV2Engine(t, 2251, params.TestXDPoSMockChainConfig, nil)
 	engineV2 := blockchain.Engine().(*XDPoS.XDPoS).EngineV2
 
@@ -295,6 +303,7 @@ func TestShouldVerifyTimeoutMessage(t *testing.T) {
 }
 
 func TestTimeoutPoolKeyGoodHygiene(t *testing.T) {
+	skipLongInShortMode(t)
 	blockchain, _, _, signer, signFn, _ := PrepareXDCTestBlockChainForV2Engine(t, 905, params.TestXDPoSMockChainConfig, nil)
 	engineV2 := blockchain.Engine().(*XDPoS.XDPoS).EngineV2
 
@@ -355,4 +364,65 @@ func TestTimeoutPoolKeyGoodHygiene(t *testing.T) {
 			assert.Fail(t, "Did not clean up the timeout pool")
 		}
 	}
+}
+
+func TestGetTCEpochInfo(t *testing.T) {
+	skipLongInShortMode(t)
+	// First epoch, round 1, switch block 901
+	// Second epoch, round 901, block 1800
+	blockchain, _, _, _, _, _ := PrepareXDCTestBlockChainForV2Engine(t, 1805, params.TestXDPoSMockChainConfig, nil)
+	engineV2 := blockchain.Engine().(*XDPoS.XDPoS).EngineV2
+
+	// Test invalid round zero
+	epochInfo, err := engineV2.GetTCEpochInfoFaker(blockchain, types.Round(0))
+	assert.NotNil(t, err)
+	assert.Nil(t, epochInfo)
+
+	// Test first round
+	epochInfo, err = engineV2.GetTCEpochInfoFaker(blockchain, types.Round(1))
+	assert.Nil(t, err)
+	assert.NotNil(t, epochInfo)
+	assert.Equal(t, big.NewInt(901), epochInfo.EpochSwitchBlockInfo.Number)
+	assert.Equal(t, types.Round(1), epochInfo.EpochSwitchBlockInfo.Round)
+	assert.True(t, len(epochInfo.Masternodes) > 0, "should have masternodes")
+
+	// Test one round before epochSwitch
+	epochInfo, err = engineV2.GetTCEpochInfoFaker(blockchain, types.Round(899))
+	assert.Nil(t, err)
+	assert.NotNil(t, epochInfo)
+	assert.Equal(t, big.NewInt(901), epochInfo.EpochSwitchBlockInfo.Number)
+	assert.Equal(t, types.Round(1), epochInfo.EpochSwitchBlockInfo.Round)
+	assert.True(t, len(epochInfo.Masternodes) > 0, "should have masternodes")
+
+	// Test round exactly on epochSwitch
+	epochInfo, err = engineV2.GetTCEpochInfoFaker(blockchain, types.Round(900))
+	assert.Nil(t, err)
+	assert.NotNil(t, epochInfo)
+	assert.Equal(t, big.NewInt(1800), epochInfo.EpochSwitchBlockInfo.Number)
+	assert.Equal(t, types.Round(900), epochInfo.EpochSwitchBlockInfo.Round)
+	assert.True(t, len(epochInfo.Masternodes) > 0, "should have masternodes")
+
+	// Test round in second epoch
+	epochInfo, err = engineV2.GetTCEpochInfoFaker(blockchain, types.Round(903))
+	assert.Nil(t, err)
+	assert.NotNil(t, epochInfo)
+	assert.Equal(t, big.NewInt(1800), epochInfo.EpochSwitchBlockInfo.Number)
+	assert.Equal(t, types.Round(900), epochInfo.EpochSwitchBlockInfo.Round)
+	assert.True(t, len(epochInfo.Masternodes) > 0, "should have masternodes")
+
+	// Test after few timeout rounds
+	epochInfo, err = engineV2.GetTCEpochInfoFaker(blockchain, types.Round(920))
+	assert.Nil(t, err)
+	assert.NotNil(t, epochInfo)
+	assert.Equal(t, big.NewInt(1800), epochInfo.EpochSwitchBlockInfo.Number)
+	assert.Equal(t, types.Round(900), epochInfo.EpochSwitchBlockInfo.Round)
+	assert.True(t, len(epochInfo.Masternodes) > 0, "should have masternodes")
+
+	// Test far away round
+	epochInfo, err = engineV2.GetTCEpochInfoFaker(blockchain, types.Round(10000))
+	assert.Nil(t, err)
+	assert.NotNil(t, epochInfo)
+	assert.Equal(t, big.NewInt(1800), epochInfo.EpochSwitchBlockInfo.Number)
+	assert.Equal(t, types.Round(900), epochInfo.EpochSwitchBlockInfo.Round)
+	assert.True(t, len(epochInfo.Masternodes) > 0, "should have masternodes")
 }

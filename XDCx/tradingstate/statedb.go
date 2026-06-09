@@ -424,13 +424,14 @@ func (t *TradingStateDB) updateStateExchangeObject(stateObject *tradingExchanges
 	t.setError(t.trie.TryUpdate(addr[:], data))
 }
 
-// Retrieve a state object given my the address. Returns nil if not found.
+// Retrieve a state object given by the address. Returns nil if not found.
 func (t *TradingStateDB) getStateExchangeObject(addr common.Hash) (stateObject *tradingExchanges) {
 	// Prefer 'live' objects.
 	if obj := t.stateExhangeObjects[addr]; obj != nil {
 		return obj
 	}
 	// Load the object from the database.
+	// TODO(daniel): use trie.TryGetAccount, ref PR #25458
 	enc, err := t.trie.TryGet(addr[:])
 	if len(enc) == 0 {
 		t.setError(err)
@@ -589,7 +590,7 @@ func (t *TradingStateDB) Commit() (root common.Hash, err error) {
 		}
 	}
 	// Write trie changes.
-	root, err = t.trie.Commit(func(_ [][]byte, _ []byte, leaf []byte, parent common.Hash) error {
+	root, err = t.trie.Commit(func(_ [][]byte, _ []byte, leaf []byte, parent common.Hash, _ []byte) error {
 		var exchange tradingExchangeObject
 		if err := rlp.DecodeBytes(leaf, &exchange); err != nil {
 			return nil

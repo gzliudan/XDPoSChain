@@ -62,19 +62,6 @@ type RingSignature struct {
 	SerializedRing []byte //temporary memory stored the raw ring ct used in case of verifying ringCT with message verification
 }
 
-func (p *PrivateSendVerifier) verify() bool {
-	return false
-}
-
-func (p *PrivateSendVerifier) deserialize() {
-
-}
-
-// helper function, returns type of v
-func typeof(v interface{}) string {
-	return fmt.Sprintf("%T", v)
-}
-
 func isOdd(a *big.Int) bool {
 	return a.Bit(0) == 1
 }
@@ -102,7 +89,7 @@ func DeserializeCompressed(curve elliptic.Curve, b []byte) *ecdsa.PublicKey {
 	// but this was replaced by the algorithms referenced in
 	// https://bitcointalk.org/index.php?topic=162805.msg1712294#msg1712294
 	PPlus1Div4 := new(big.Int).Add(curve.Params().P, big.NewInt(1))
-	PPlus1Div4 = PPlus1Div4.Div(PPlus1Div4, big.NewInt(4))
+	PPlus1Div4.Rsh(PPlus1Div4, 2)
 	y := new(big.Int).Exp(x3, PPlus1Div4, curve.Params().P)
 	ybit := b[0]%2 == 1
 	if ybit != isOdd(y) {
@@ -111,7 +98,11 @@ func DeserializeCompressed(curve elliptic.Curve, b []byte) *ecdsa.PublicKey {
 	if ybit != isOdd(y) {
 		return nil
 	}
-	return &ecdsa.PublicKey{curve, x, y}
+	return &ecdsa.PublicKey{
+		Curve: curve,
+		X:     x,
+		Y:     y,
+	}
 }
 
 // bytes returns the public key ring as a byte slice.
@@ -191,7 +182,6 @@ func computeSignatureSize(numRing int, ringSize int) int {
 	if term < 0 || term < numRing || term < ringSize {
 		return -1
 	}
-
 	return 8 + 8 + 32 + 32 + numRing*ringSize*32 + numRing*ringSize*33 + numRing*33
 }
 
@@ -426,13 +416,21 @@ func Sign(m [32]byte, rings []Ring, privkeys []*ecdsa.PrivateKey, s int) (*RingS
 		// start at secret index s/PI
 		// compute L_s = u*G
 		l_x, l_y := curve.ScalarBaseMult(PadTo32Bytes(alpha[i].Bytes()))
-		L[i][s] = &ecdsa.PublicKey{curve, l_x, l_y}
+		L[i][s] = &ecdsa.PublicKey{
+			Curve: curve,
+			X:     l_x,
+			Y:     l_y,
+		}
 		lT := append(PadTo32Bytes(l_x.Bytes()), PadTo32Bytes(l_y.Bytes())...)
 		l = append(l, lT...)
 		// compute R_s = u*H_p(P[s])
 		h_x, h_y := HashPoint(pubkeys[i])
 		r_x, r_y := curve.ScalarMult(h_x, h_y, PadTo32Bytes(alpha[i].Bytes()))
-		R[i][s] = &ecdsa.PublicKey{curve, r_x, r_y}
+		R[i][s] = &ecdsa.PublicKey{
+			Curve: curve,
+			X:     r_x,
+			Y:     r_y,
+		}
 		rT := append(PadTo32Bytes(r_x.Bytes()), PadTo32Bytes(r_y.Bytes())...)
 		l = append(l, rT...)
 	}
@@ -458,7 +456,12 @@ func Sign(m [32]byte, rings []Ring, privkeys []*ecdsa.PrivateKey, s int) (*RingS
 				return nil, errors.New("could not create ring signature")
 			}
 			l_x, l_y := curve.Add(sx, sy, px, py)
-			L[j][idx] = &ecdsa.PublicKey{curve, l_x, l_y}
+			L[j][idx] = &ecdsa.PublicKey{
+				Curve: curve,
+				X:     l_x,
+				Y:     l_y,
+			}
+
 			lT := append(PadTo32Bytes(l_x.Bytes()), PadTo32Bytes(l_y.Bytes())...)
 			l = append(l, lT...)
 
@@ -470,7 +473,12 @@ func Sign(m [32]byte, rings []Ring, privkeys []*ecdsa.PrivateKey, s int) (*RingS
 				return nil, errors.New("could not create ring signature")
 			}
 			r_x, r_y := curve.Add(sx, sy, px, py)
-			R[j][idx] = &ecdsa.PublicKey{curve, r_x, r_y}
+			R[j][idx] = &ecdsa.PublicKey{
+				Curve: curve,
+				X:     r_x,
+				Y:     r_y,
+			}
+
 			rT := append(PadTo32Bytes(r_x.Bytes()), PadTo32Bytes(r_y.Bytes())...)
 			l = append(l, rT...)
 		}

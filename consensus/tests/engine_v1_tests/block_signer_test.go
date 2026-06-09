@@ -94,7 +94,6 @@ func TestNotChangeSingerListIfNothingProposedOrVoted(t *testing.T) {
 
 // Should call updateM1 at gap block, and update the snapshot if there are SM transactions involved
 func TestUpdateSignerListIfVotedBeforeGap(t *testing.T) {
-
 	blockchain, backend, parentBlock, signer, signFn := PrepareXDCTestBlockChain(t, GAP-2, params.TestXDPoSMockChainConfig)
 	// Insert first Block 449
 	t.Logf("Inserting block with propose at 449...")
@@ -168,7 +167,6 @@ func TestUpdateSignerListIfVotedBeforeGap(t *testing.T) {
 
 // Should call updateM1 before gap block, and update the snapshot if there are SM transactions involved
 func TestCallUpdateM1WithSmartContractTranscation(t *testing.T) {
-
 	blockchain, backend, currentBlock, signer, signFn := PrepareXDCTestBlockChain(t, GAP-1, params.TestXDPoSMockChainConfig)
 	// Insert first Block 450 A
 	t.Logf("Inserting block with propose at 450 A...")
@@ -205,10 +203,9 @@ func TestCallUpdateM1WithSmartContractTranscation(t *testing.T) {
 
 // Should call updateM1 and update snapshot when a forked block(at gap block number) is inserted back into main chain (Edge case)
 func TestCallUpdateM1WhenForkedBlockBackToMainChain(t *testing.T) {
-
 	blockchain, backend, currentBlock, signer, signFn := PrepareXDCTestBlockChain(t, GAP-1, params.TestXDPoSMockChainConfig)
 	// Check initial signer, by default, acc3 is in the signerList
-	signers, err := GetSnapshotSigner(blockchain, blockchain.CurrentBlock().Header())
+	signers, err := GetSnapshotSigner(blockchain, blockchain.CurrentBlock())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -286,7 +283,7 @@ func TestCallUpdateM1WhenForkedBlockBackToMainChain(t *testing.T) {
 	// Should not run the `updateM1` for forked chain, hence account3 still exit
 	if signers[acc3Addr.Hex()] != true {
 		debugMessage(backend, signers, t)
-		t.Fatalf("account 3 should sit in the signer list as previos block result")
+		t.Fatalf("account 3 should sit in the signer list as previous block result")
 	}
 	if (signers[acc1Addr.Hex()] == true) || (signers[acc2Addr.Hex()] == true) {
 		debugMessage(backend, signers, t)
@@ -340,7 +337,7 @@ func TestCallUpdateM1WhenForkedBlockBackToMainChain(t *testing.T) {
 		t.Fatalf("acc1,3should NOT sit in the signer list")
 	}
 
-	signers, err = GetSnapshotSigner(blockchain, blockchain.CurrentBlock().Header())
+	signers, err = GetSnapshotSigner(blockchain, blockchain.CurrentBlock())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -356,16 +353,14 @@ func TestCallUpdateM1WhenForkedBlockBackToMainChain(t *testing.T) {
 }
 
 func TestStatesShouldBeUpdatedWhenForkedBlockBecameMainChainAtGapBlock(t *testing.T) {
-
 	blockchain, backend, parentBlock, signer, signFn := PrepareXDCTestBlockChain(t, GAP-1, params.TestXDPoSMockChainConfig)
-
 	state, err := blockchain.State()
 	if err != nil {
 		t.Fatalf("Failed while trying to get blockchain state")
 	}
 	t.Logf("Account %v have balance of: %v", acc1Addr.String(), state.GetBalance(acc1Addr))
 	// Check initial signer
-	signers, err := GetSnapshotSigner(blockchain, blockchain.CurrentBlock().Header())
+	signers, err := GetSnapshotSigner(blockchain, blockchain.CurrentBlock())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -457,7 +452,7 @@ func TestStatesShouldBeUpdatedWhenForkedBlockBecameMainChainAtGapBlock(t *testin
 	// Should not run the `updateM1` for forked chain, hence account3 still exit
 	if signers[acc3Addr.Hex()] != true {
 		debugMessage(backend, signers, t)
-		t.Fatalf("account 3 should sit in the signer list as previos block result")
+		t.Fatalf("account 3 should sit in the signer list as previous block result")
 	}
 
 	//Insert block 451 parent is 451 B
@@ -498,7 +493,7 @@ func TestStatesShouldBeUpdatedWhenForkedBlockBecameMainChainAtGapBlock(t *testin
 		t.Fatalf("account 2 should sit in the signer list")
 	}
 
-	signers, err = GetSnapshotSigner(blockchain, blockchain.CurrentBlock().Header())
+	signers, err = GetSnapshotSigner(blockchain, blockchain.CurrentBlock())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -521,7 +516,7 @@ func TestStatesShouldBeUpdatedWhenForkedBlockBecameMainChainAtGapBlock(t *testin
 func TestVoteShouldNotBeAffectedByFork(t *testing.T) {
 	blockchain, backend, parentBlock, signer, signFn := PrepareXDCTestBlockChain(t, GAP-1, params.TestXDPoSMockChainConfig)
 	// Check initial signer, by default, acc3 is in the signerList
-	signers, err := GetSnapshotSigner(blockchain, blockchain.CurrentBlock().Header())
+	signers, err := GetSnapshotSigner(blockchain, blockchain.CurrentBlock())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -641,6 +636,6 @@ func TestVoteShouldNotBeAffectedByFork(t *testing.T) {
 	// Should run the `updateM1` for forked chain, but it should not be affected by the voted block 451A which is not on the mainchain anymore
 	if signers[acc3Addr.Hex()] != true {
 		debugMessage(backend, signers, t)
-		t.Fatalf("account 3 should sit in the signer list as previos block result")
+		t.Fatalf("account 3 should sit in the signer list as previous block result")
 	}
 }

@@ -19,17 +19,200 @@ package rawdb
 import (
 	"bytes"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
+	"math/rand/v2"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/XinFinOrg/XDPoSChain/common"
 	"github.com/XinFinOrg/XDPoSChain/core/types"
+	"github.com/XinFinOrg/XDPoSChain/crypto"
+	"github.com/XinFinOrg/XDPoSChain/crypto/keccak"
 	"github.com/XinFinOrg/XDPoSChain/params"
 	"github.com/XinFinOrg/XDPoSChain/rlp"
-	"golang.org/x/crypto/sha3"
 )
+
+type errorReader struct {
+	hasResult bool
+	hasErr    error
+	getErr    error
+	value     []byte
+}
+
+// Has returns the configured Has result for metadata read tests.
+func (r *errorReader) Has(key []byte) (bool, error) {
+	return r.hasResult, r.hasErr
+}
+
+// Get returns the configured Get result for metadata read tests.
+func (r *errorReader) Get(key []byte) ([]byte, error) {
+	if r.getErr != nil {
+		return nil, r.getErr
+	}
+	return r.value, nil
+}
+
+// TestReadChainConfigGetError tests read chain config get error.
+func TestReadChainConfigGetError(t *testing.T) {
+	hash := common.HexToHash("0x1")
+	wantErr := errors.New("boom")
+	_, err := ReadChainConfig(&errorReader{getErr: wantErr, hasResult: true}, hash)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("expected wrapped get error, got %v", err)
+	}
+}
+
+// TestReadChainConfigNotFound tests read chain config not found.
+func TestReadChainConfigNotFound(t *testing.T) {
+	hash := common.HexToHash("0x2")
+	_, err := ReadChainConfig(&errorReader{getErr: errors.New("missing"), hasResult: false}, hash)
+	if !errors.Is(err, ErrChainConfigNotFound) {
+		t.Fatalf("expected ErrChainConfigNotFound, got %v", err)
+	}
+}
+
+// TestReadOptionalBlobNotFound tests metadata reads use the generic metadata sentinel.
+func TestReadOptionalBlobNotFound(t *testing.T) {
+	_, err := readOptionalBlob(&errorReader{getErr: errors.New("missing"), hasResult: false}, []byte("key"))
+	if !errors.Is(err, ErrMetadataNotFound) {
+		t.Fatalf("expected ErrMetadataNotFound, got %v", err)
+	}
+}
+
+// TestReadChainConfigJSONGetError tests read chain config json get error.
+func TestReadChainConfigJSONGetError(t *testing.T) {
+	hash := common.HexToHash("0x3")
+	wantErr := errors.New("boom")
+	_, err := ReadChainConfigJSON(&errorReader{getErr: wantErr, hasResult: true}, hash)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("expected wrapped get error, got %v", err)
+	}
+}
+
+// TestReadChainConfigJSONNotFound tests missing chain config json uses the chain config sentinel.
+func TestReadChainConfigJSONNotFound(t *testing.T) {
+	hash := common.HexToHash("0x31")
+	_, err := ReadChainConfigJSON(&errorReader{getErr: errors.New("missing"), hasResult: false}, hash)
+	if !errors.Is(err, ErrChainConfigNotFound) {
+		t.Fatalf("expected ErrChainConfigNotFound, got %v", err)
+	}
+}
+
+// TestReadChainConfigOverrideGetError tests override marker read error propagation.
+func TestReadChainConfigOverrideGetError(t *testing.T) {
+	hash := common.HexToHash("0x4")
+	wantErr := errors.New("boom")
+	marker, err := ReadChainConfigOverride(&errorReader{getErr: wantErr, hasResult: true}, hash)
+	if marker {
+		t.Fatal("expected override marker to be false on read error")
+	}
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("expected wrapped get error, got %v", err)
+	}
+}
+
+// TestReadChainConfigOverrideNotFound tests missing override marker handling.
+func TestReadChainConfigOverrideNotFound(t *testing.T) {
+	hash := common.HexToHash("0x5")
+	marker, err := ReadChainConfigOverride(&errorReader{getErr: errors.New("missing"), hasResult: false}, hash)
+	if err != nil {
+		t.Fatalf("expected nil error for missing marker, got %v", err)
+	}
+	if marker {
+		t.Fatal("expected missing marker to read as false")
+	}
+}
+
+// TestReadChainConfigOverrideVersionedPayload tests the current override marker payload.
+func TestReadChainConfigOverrideVersionedPayload(t *testing.T) {
+	hash := common.HexToHash("0x6")
+	marker, err := ReadChainConfigOverride(&errorReader{hasResult: true, value: []byte{1, 1}}, hash)
+	if err != nil {
+		t.Fatalf("expected nil error for valid marker payload, got %v", err)
+	}
+	if !marker {
+		t.Fatal("expected valid marker payload to read as true")
+	}
+}
+
+// TestReadChainConfigOverrideRejectsMalformedPayload tests malformed marker payload handling.
+func TestReadChainConfigOverrideRejectsMalformedPayload(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   []byte
+		wantErr string
+	}{
+		{name: "short payload", value: []byte{1}, wantErr: "invalid chain config override marker payload"},
+		{name: "disabled flag", value: []byte{1, 0}, wantErr: "invalid chain config override marker payload"},
+		{name: "unknown version", value: []byte{2, 1}, wantErr: "unsupported chain config override marker version"},
+	}
+
+	hash := common.HexToHash("0x7")
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			marker, err := ReadChainConfigOverride(&errorReader{hasResult: true, value: test.value}, hash)
+			if marker {
+				t.Fatal("expected malformed marker payload to read as false")
+			}
+			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("expected error containing %q, got %v", test.wantErr, err)
+			}
+		})
+	}
+}
+
+// TestReadChainConfigOverrideIgnoresLegacyMarker tests legacy marker keys are no longer read.
+func TestReadChainConfigOverrideIgnoresLegacyMarker(t *testing.T) {
+	db := NewMemoryDatabase()
+	hash := common.HexToHash("0x8")
+	legacyKey := append([]byte("ethereum-config-override-"), hash.Bytes()...)
+	if err := db.Put(legacyKey, []byte{1}); err != nil {
+		t.Fatalf("failed to write legacy marker: %v", err)
+	}
+
+	marker, err := ReadChainConfigOverride(db, hash)
+	if err != nil {
+		t.Fatalf("expected nil error for ignored legacy marker, got %v", err)
+	}
+	if marker {
+		t.Fatal("expected legacy marker to be ignored")
+	}
+}
+
+func TestWriteChainConfigOmitsInferredZeroValueFields(t *testing.T) {
+	db := NewMemoryDatabase()
+	hash := common.HexToHash("0x9")
+	cfg := (&params.ChainConfig{
+		ChainID:        big.NewInt(51),
+		DAOForkBlock:   big.NewInt(0),
+		DAOForkSupport: false,
+		Ethash:         new(params.EthashConfig),
+	}).CloneForBackfill()
+
+	WriteChainConfig(db, hash, cfg)
+
+	rawCfg, err := ReadChainConfigJSON(db, hash)
+	if err != nil {
+		t.Fatalf("failed to read stored chain config JSON: %v", err)
+	}
+	var storedKeys map[string]json.RawMessage
+	if err := json.Unmarshal(rawCfg, &storedKeys); err != nil {
+		t.Fatalf("failed to inspect stored chain config JSON: %v", err)
+	}
+	if _, ok := storedKeys["daoForkSupport"]; ok {
+		t.Fatalf("expected inferred false daoForkSupport to remain omitted, have %s", rawCfg)
+	}
+	if _, ok := storedKeys["daoForkBlock"]; !ok {
+		t.Fatalf("expected explicit daoForkBlock to remain present, have %s", rawCfg)
+	}
+	if _, ok := storedKeys["ethash"]; !ok {
+		t.Fatalf("expected ethash config to be persisted, have %s", rawCfg)
+	}
+}
 
 type fullLogRLP struct {
 	Address     common.Address
@@ -74,10 +257,7 @@ func TestHeaderStorage(t *testing.T) {
 	if entry := ReadHeaderRLP(db, header.Hash(), header.Number.Uint64()); entry == nil {
 		t.Fatalf("Stored header RLP not found")
 	} else {
-		hasher := sha3.NewLegacyKeccak256()
-		hasher.Write(entry)
-
-		if hash := common.BytesToHash(hasher.Sum(nil)); hash != header.Hash() {
+		if hash := crypto.Keccak256Hash(entry); hash != header.Hash() {
 			t.Fatalf("Retrieved RLP header mismatch: have %v, want %v", entry, header)
 		}
 	}
@@ -95,8 +275,10 @@ func TestBodyStorage(t *testing.T) {
 	// Create a test body to move around the database and make sure it's really new
 	body := &types.Body{Uncles: []*types.Header{{Extra: []byte("test header")}}}
 
-	hasher := sha3.NewLegacyKeccak256()
-	rlp.Encode(hasher, body)
+	hasher := keccak.NewLegacyKeccak256()
+	if err := rlp.Encode(hasher, body); err != nil {
+		t.Fatalf("rlp.Encode fail: %v", err)
+	}
 	hash := common.BytesToHash(hasher.Sum(nil))
 
 	if entry := ReadBody(db, hash, 0); entry != nil {
@@ -106,16 +288,13 @@ func TestBodyStorage(t *testing.T) {
 	WriteBody(db, hash, 0, body)
 	if entry := ReadBody(db, hash, 0); entry == nil {
 		t.Fatalf("Stored body not found")
-	} else if types.DeriveSha(types.Transactions(entry.Transactions), newHasher()) != types.DeriveSha(types.Transactions(body.Transactions), newHasher()) || types.CalcUncleHash(entry.Uncles) != types.CalcUncleHash(body.Uncles) {
+	} else if types.DeriveSha(types.Transactions(entry.Transactions), newTestHasher()) != types.DeriveSha(types.Transactions(body.Transactions), newTestHasher()) || types.CalcUncleHash(entry.Uncles) != types.CalcUncleHash(body.Uncles) {
 		t.Fatalf("Retrieved body mismatch: have %v, want %v", entry, body)
 	}
 	if entry := ReadBodyRLP(db, hash, 0); entry == nil {
 		t.Fatalf("Stored body RLP not found")
 	} else {
-		hasher := sha3.NewLegacyKeccak256()
-		hasher.Write(entry)
-
-		if calc := common.BytesToHash(hasher.Sum(nil)); calc != hash {
+		if calc := crypto.Keccak256Hash(entry); calc != hash {
 			t.Fatalf("Retrieved RLP body mismatch: have %v, want %v", entry, body)
 		}
 	}
@@ -160,7 +339,7 @@ func TestBlockStorage(t *testing.T) {
 	}
 	if entry := ReadBody(db, block.Hash(), block.NumberU64()); entry == nil {
 		t.Fatalf("Stored body not found")
-	} else if types.DeriveSha(types.Transactions(entry.Transactions), newHasher()) != types.DeriveSha(block.Transactions(), newHasher()) || types.CalcUncleHash(entry.Uncles) != types.CalcUncleHash(block.Uncles()) {
+	} else if types.DeriveSha(types.Transactions(entry.Transactions), newTestHasher()) != types.DeriveSha(types.Transactions(block.Transactions()), newTestHasher()) || types.CalcUncleHash(entry.Uncles) != types.CalcUncleHash(block.Uncles()) {
 		t.Fatalf("Retrieved body mismatch: have %v, want %v", entry, block.Body())
 	}
 	// Delete the block and verify the execution
@@ -206,6 +385,75 @@ func TestPartialBlockStorage(t *testing.T) {
 		t.Fatalf("Stored block not found")
 	} else if entry.Hash() != block.Hash() {
 		t.Fatalf("Retrieved block mismatch: have %v, want %v", entry, block)
+	}
+}
+
+// Tests block storage and retrieval operations.
+func TestBadBlockStorage(t *testing.T) {
+	db := NewMemoryDatabase()
+
+	// Create a test block to move around the database and make sure it's really new
+	block := types.NewBlockWithHeader(&types.Header{
+		Number:      big.NewInt(1),
+		Extra:       []byte("bad block"),
+		UncleHash:   types.EmptyUncleHash,
+		TxHash:      types.EmptyTxsHash,
+		ReceiptHash: types.EmptyReceiptsHash,
+	})
+	if entry := ReadBadBlock(db, block.Hash()); entry != nil {
+		t.Fatalf("Non existent block returned: %v", entry)
+	}
+	// Write and verify the block in the database
+	WriteBadBlock(db, block)
+	if entry := ReadBadBlock(db, block.Hash()); entry == nil {
+		t.Fatalf("Stored block not found")
+	} else if entry.Hash() != block.Hash() {
+		t.Fatalf("Retrieved block mismatch: have %v, want %v", entry, block)
+	}
+	// Write one more bad block
+	blockTwo := types.NewBlockWithHeader(&types.Header{
+		Number:      big.NewInt(2),
+		Extra:       []byte("bad block two"),
+		UncleHash:   types.EmptyUncleHash,
+		TxHash:      types.EmptyTxsHash,
+		ReceiptHash: types.EmptyReceiptsHash,
+	})
+	WriteBadBlock(db, blockTwo)
+
+	// Write the block one again, should be filtered out.
+	WriteBadBlock(db, block)
+	badBlocks := ReadAllBadBlocks(db)
+	if len(badBlocks) != 2 {
+		t.Fatalf("Failed to load all bad blocks")
+	}
+
+	// Write a bunch of bad blocks, all the blocks are should sorted
+	// in reverse order. The extra blocks should be truncated.
+	for _, n := range rand.Perm(100) {
+		block := types.NewBlockWithHeader(&types.Header{
+			Number:      big.NewInt(int64(n)),
+			Extra:       []byte("bad block"),
+			UncleHash:   types.EmptyUncleHash,
+			TxHash:      types.EmptyTxsHash,
+			ReceiptHash: types.EmptyReceiptsHash,
+		})
+		WriteBadBlock(db, block)
+	}
+	badBlocks = ReadAllBadBlocks(db)
+	if len(badBlocks) != badBlockToKeep {
+		t.Fatalf("The number of persised bad blocks in incorrect %d", len(badBlocks))
+	}
+	for i := 0; i < len(badBlocks)-1; i++ {
+		if badBlocks[i].NumberU64() < badBlocks[i+1].NumberU64() {
+			t.Fatalf("The bad blocks are not sorted #[%d](%d) < #[%d](%d)", i, badBlocks[i].NumberU64(), i+1, badBlocks[i+1].NumberU64())
+		}
+	}
+
+	// Delete all bad blocks
+	DeleteBadBlocks(db)
+	badBlocks = ReadAllBadBlocks(db)
+	if len(badBlocks) != 0 {
+		t.Fatalf("Failed to delete bad blocks")
 	}
 }
 
@@ -338,10 +586,10 @@ func TestBlockReceiptStorage(t *testing.T) {
 	// Insert the receipt slice into the database and check presence
 	WriteReceipts(db, hash, 0, receipts)
 	if rs := ReadReceipts(db, hash, 0, params.TestChainConfig); len(rs) == 0 {
-		t.Fatalf("no receipts returned")
+		t.Fatal("no receipts returned")
 	} else {
 		if err := checkReceiptsRLP(rs, receipts); err != nil {
-			t.Fatalf("fail to checkReceiptsRLP %v", err)
+			t.Fatal(err)
 		}
 	}
 	// Delete the body and ensure that the receipts are no longer returned (metadata can't be recomputed)
@@ -351,7 +599,7 @@ func TestBlockReceiptStorage(t *testing.T) {
 	}
 	// Ensure that receipts without metadata can be returned without the block body too
 	if err := checkReceiptsRLP(ReadRawReceipts(db, hash, 0), receipts); err != nil {
-		t.Fatalf("fail to checkReceiptsRLP %v", err)
+		t.Fatal(err)
 	}
 	// Sanity check that body alone without the receipt is a full purge
 	WriteBody(db, hash, 0, body)
@@ -462,6 +710,7 @@ func TestReadLogs(t *testing.T) {
 	}
 }
 
+// TestDeriveLogFields tests derive log fields.
 func TestDeriveLogFields(t *testing.T) {
 	// Create a few transactions to have receipts for
 	to2 := common.HexToAddress("0x2")
@@ -541,6 +790,7 @@ func TestDeriveLogFields(t *testing.T) {
 	}
 }
 
+// BenchmarkDecodeRLPLogs benchmarks decode rlp logs.
 func BenchmarkDecodeRLPLogs(b *testing.B) {
 	// Encoded receipts from block 0x14ee094309fbe8f70b65f45ebcc08fb33f126942d97464aad5eb91cfd1e2d269
 	buf, err := os.ReadFile("testdata/stored_receipts.bin")

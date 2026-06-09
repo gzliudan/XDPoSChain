@@ -23,22 +23,31 @@ var (
 	subKey, _ = crypto.HexToECDSA("5bb98c5f937d176aa399ea6e6541f4db8f8db5a4ee1a8b56fb8beb41f2d755e3")
 	subAddr   = crypto.PubkeyToAddress(subKey.PublicKey) //0x21292d56E2a8De3cC4672dB039AAA27f9190B1f6
 
-	token = common.HexToAddress("0000000000000000000000000000000000000089")
-
-	delay    = big.NewInt(30 * 48)
 	minApply = big.NewInt(0).Mul(big.NewInt(1000), big.NewInt(100000000000000000)) // 100 XDC
 )
 
+// TestFeeTxWithTRC21Token tests fee tx with trc 21 token.
 func TestFeeTxWithTRC21Token(t *testing.T) {
+	oldTRC21GasPriceBefore := new(big.Int).Set(common.TRC21GasPriceBefore)
+	defer func() {
+		common.TRC21GasPriceBefore = oldTRC21GasPriceBefore
+	}()
+	common.TRC21GasPriceBefore = big.NewInt(1)
+	chainConfig := params.TestXDPoSMockChainConfig.Clone()
+	chainConfig.TRC21IssuerSMC = crypto.CreateAddress(mainAddr, 0)
+
 	// init genesis
 	contractBackend := backends.NewXDCSimulatedBackend(
 		types.GenesisAlloc{
 			mainAddr: {Balance: big.NewInt(0).Mul(big.NewInt(10000000000000), big.NewInt(10000000000000))},
 		},
 		42000000,
-		params.TestXDPoSMockChainConfig,
+		chainConfig,
 	)
-	transactOpts := bind.NewKeyedTransactor(mainKey)
+	transactOpts, err := bind.NewKeyedTransactorWithChainID(mainKey, chainConfig.ChainID)
+	if err != nil {
+		t.Fatal("can't create transactor: ", err)
+	}
 
 	// deploy payer swap SMC
 	trc21IssuerAddr, trc21Issuer, err := DeployTRC21Issuer(transactOpts, contractBackend, minApply)
@@ -47,8 +56,6 @@ func TestFeeTxWithTRC21Token(t *testing.T) {
 	}
 	contractBackend.Commit()
 
-	// set contract address to config
-	common.TRC21IssuerSMC = trc21IssuerAddr
 	cap := big.NewInt(0).Mul(big.NewInt(10000000), big.NewInt(10000000000000))
 	TRC21fee := big.NewInt(100)
 
@@ -91,7 +98,7 @@ func TestFeeTxWithTRC21Token(t *testing.T) {
 	if err != nil {
 		t.Fatal("can't transaction's receipt ", err, "hash", tx.Hash())
 	}
-	fee := common.GetGasFee(receipt.Logs[0].BlockNumber, receipt.GasUsed)
+	fee := params.GetGasFee(receipt.Logs[0].BlockNumber, receipt.GasUsed, params.TestXDPoSMockChainConfig)
 	remainFee := big.NewInt(0).Sub(minApply, fee)
 
 	// check balance trc21 again
@@ -115,7 +122,10 @@ func TestFeeTxWithTRC21Token(t *testing.T) {
 	}
 
 	// access to address which received token trc21 but dont have XDC
-	key1TransactOpts := bind.NewKeyedTransactor(airdropKey)
+	key1TransactOpts, err := bind.NewKeyedTransactorWithChainID(airdropKey, params.TestXDPoSMockChainConfig.ChainID)
+	if err != nil {
+		t.Fatal("can't create airdrop transactor: ", err)
+	}
 	key1Trc20, _ := NewTRC21(key1TransactOpts, trc21TokenAddr, contractBackend)
 
 	transferAmount := big.NewInt(100000)
@@ -143,7 +153,7 @@ func TestFeeTxWithTRC21Token(t *testing.T) {
 	if err != nil {
 		t.Fatal("can't transaction's receipt ", err, "hash", tx.Hash())
 	}
-	fee = common.GetGasFee(receipt.Logs[0].BlockNumber, receipt.GasUsed)
+	fee = params.GetGasFee(receipt.Logs[0].BlockNumber, receipt.GasUsed, params.TestXDPoSMockChainConfig)
 	remainFee = big.NewInt(0).Sub(remainFee, fee)
 	// check balance fee
 	balanceIssuerFee, err = trc21Issuer.GetTokenCapacity(trc21TokenAddr)

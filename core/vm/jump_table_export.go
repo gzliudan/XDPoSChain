@@ -20,10 +20,14 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/params"
 )
 
-// LookupInstructionSet returns the instructionset for the fork configured by
+// LookupInstructionSet returns the instruction set for the fork configured by
 // the rules.
 func LookupInstructionSet(rules params.Rules) (JumpTable, error) {
 	switch {
+	case rules.IsOsaka:
+		return newOsakaInstructionSet(), nil
+	case rules.IsPrague:
+		return newPragueInstructionSet(), nil
 	case rules.IsCancun:
 		return newCancunInstructionSet(), nil
 	case rules.IsEIP1559:
@@ -52,7 +56,7 @@ func LookupInstructionSet(rules params.Rules) (JumpTable, error) {
 	return newFrontierInstructionSet(), nil
 }
 
-// Stack returns the mininum and maximum stack requirements.
+// Stack returns the minimum and maximum stack requirements.
 func (op *operation) Stack() (int, int) {
 	return op.minStack, op.maxStack
 }

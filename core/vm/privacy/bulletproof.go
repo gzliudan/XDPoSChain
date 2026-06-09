@@ -16,7 +16,7 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/log"
 
 	"github.com/XinFinOrg/XDPoSChain/crypto"
-	"github.com/btcsuite/btcd/btcec"
+	"github.com/btcsuite/btcd/btcec/v2"
 )
 
 type Bulletproof struct {
@@ -35,7 +35,11 @@ type ECPoint struct {
 }
 
 func (p *ECPoint) toECPubKey() *ecdsa.PublicKey {
-	return &ecdsa.PublicKey{curve, p.X, p.Y}
+	return &ecdsa.PublicKey{
+		Curve: curve,
+		X:     p.X,
+		Y:     p.Y,
+	}
 }
 
 func toECPoint(key *ecdsa.PublicKey) *ECPoint {
@@ -755,7 +759,7 @@ func (ipp *InnerProdArg) Serialize() []byte {
 	spa = serializePointArray(ipp.R, false)
 	proof = append(proof, spa[:]...)
 
-	if ipp.A.Cmp(big.NewInt(0)) < 0 {
+	if ipp.A.Sign() < 0 {
 		ipp.A.Mod(ipp.A, EC.N)
 	}
 	sp := PadTo32Bytes(ipp.A.Bytes())
@@ -833,7 +837,7 @@ func (mrp *MultiRangeProof) Serialize() []byte {
 	sp = PadTo32Bytes(mrp.Tau.Bytes())
 	proof = append(proof, sp[:]...)
 
-	if mrp.Th.Cmp(big.NewInt(0)) < 0 {
+	if mrp.Th.Sign() < 0 {
 		mrp.Th.Mod(mrp.Th, EC.N)
 	}
 	sp = PadTo32Bytes(mrp.Th.Bytes())
@@ -919,7 +923,6 @@ func (mrp *MultiRangeProof) Deserialize(proof []byte) error {
 	offset += 32
 
 	mrp.Cx = new(big.Int).SetBytes(proof[offset : offset+32])
-	offset += 32
 
 	return nil
 }
@@ -975,7 +978,7 @@ func MRPProve(values []*big.Int) (MultiRangeProof, error) {
 
 	for j := range values {
 		v := values[j]
-		if v.Cmp(big.NewInt(0)) == -1 {
+		if v.Sign() == -1 {
 			return MultiRangeProof{}, errors.New("value is below range! Not proving")
 		}
 
@@ -1282,22 +1285,21 @@ func NewECPrimeGroupKey(n int) CryptoParams {
 			potentialXValue[i+1] = elem
 		}
 
-		gen2, err := btcec.ParsePubKey(potentialXValue, btcec.S256())
+		gen2, err := btcec.ParsePubKey(potentialXValue)
 		if err == nil {
 			if confirmed == 2*n { // once we've generated all g and h values then assign this to u
-				u = ECPoint{gen2.X, gen2.Y}
+				u = ECPoint{gen2.X(), gen2.Y()}
 				//fmt.Println("Got that U value")
 			} else if confirmed == 2*n+1 {
-				cg = ECPoint{gen2.X, gen2.Y}
-
+				cg = ECPoint{gen2.X(), gen2.Y()}
 			} else if confirmed == 2*n+2 {
-				ch = ECPoint{gen2.X, gen2.Y}
+				ch = ECPoint{gen2.X(), gen2.Y()}
 			} else {
 				if confirmed%2 == 0 {
-					gen1Vals[confirmed/2] = ECPoint{gen2.X, gen2.Y}
+					gen1Vals[confirmed/2] = ECPoint{gen2.X(), gen2.Y()}
 					//fmt.Println("new G Value")
 				} else {
-					gen2Vals[confirmed/2] = ECPoint{gen2.X, gen2.Y}
+					gen2Vals[confirmed/2] = ECPoint{gen2.X(), gen2.Y()}
 					//fmt.Println("new H value")
 				}
 			}

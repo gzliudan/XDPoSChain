@@ -92,15 +92,15 @@ func NewOracle(backend OracleBackend, params Config, startPrice *big.Int) *Oracl
 		log.Warn("Sanitizing invalid gasprice oracle sample percentile", "provided", params.Percentile, "updated", percent)
 	}
 	maxPrice := params.MaxPrice
-	if maxPrice == nil || maxPrice.Int64() <= 0 {
+	if maxPrice == nil || maxPrice.Sign() <= 0 {
 		maxPrice = DefaultMaxPrice
 		log.Warn("Sanitizing invalid gasprice oracle price cap", "provided", params.MaxPrice, "updated", maxPrice)
 	}
 	ignorePrice := params.IgnorePrice
-	if ignorePrice == nil || ignorePrice.Int64() <= 0 {
+	if ignorePrice == nil || ignorePrice.Sign() <= 0 {
 		ignorePrice = DefaultIgnorePrice
 		log.Warn("Sanitizing invalid gasprice oracle ignore price", "provided", params.IgnorePrice, "updated", ignorePrice)
-	} else if ignorePrice.Int64() > 0 {
+	} else if ignorePrice.Sign() > 0 {
 		log.Info("Gasprice oracle is ignoring threshold set", "threshold", ignorePrice)
 	}
 	maxHeaderHistory := params.MaxHeaderHistory
@@ -119,16 +119,23 @@ func NewOracle(backend OracleBackend, params Config, startPrice *big.Int) *Oracl
 
 	cache := lru.NewCache[cacheKey, processedFees](2048)
 	headEvent := make(chan core.ChainHeadEvent, 1)
-	backend.SubscribeChainHeadEvent(headEvent)
-	go func() {
-		var lastHead common.Hash
-		for ev := range headEvent {
-			if ev.Block.ParentHash() != lastHead {
-				cache.Purge()
+	sub := backend.SubscribeChainHeadEvent(headEvent)
+	if sub != nil { // the gasprice testBackend doesn't support subscribing to head events
+		go func() {
+			var lastHead common.Hash
+			for {
+				select {
+				case ev := <-headEvent:
+					if ev.Block.ParentHash() != lastHead {
+						cache.Purge()
+					}
+					lastHead = ev.Block.Hash()
+				case <-sub.Err():
+					return
+				}
 			}
-			lastHead = ev.Block.Hash()
-		}
-	}()
+		}()
+	}
 
 	return &Oracle{
 		backend:          backend,
@@ -195,7 +202,7 @@ func (oracle *Oracle) SuggestTipCap(ctx context.Context) (*big.Int, error) {
 		// - All the transactions included are sent by the miner itself.
 		// In these cases, use half of the latest calculated price for samping.
 		if len(res.values) == 0 {
-			res.values = []*big.Int{new(big.Int).Div(lastPrice, common.Big2)}
+			res.values = []*big.Int{new(big.Int).Rsh(lastPrice, 1)}
 		}
 		// Besides, in order to collect enough data for sampling, if nothing
 		// meaningful returned, try to query more blocks. But the maximum
@@ -219,7 +226,7 @@ func (oracle *Oracle) SuggestTipCap(ctx context.Context) (*big.Int, error) {
 
 	// Check min gas price for non-eip1559 block
 	if head.BaseFee == nil {
-		minGasPrice := common.GetMinGasPrice(head.Number)
+		minGasPrice := params.GetMinGasPrice(head.Number, oracle.backend.ChainConfig())
 		if price.Cmp(minGasPrice) < 0 {
 			price = new(big.Int).Set(minGasPrice)
 		}

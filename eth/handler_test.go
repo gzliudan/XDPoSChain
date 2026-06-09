@@ -69,6 +69,8 @@ func TestProtocolCompatibility(t *testing.T) {
 
 // Tests that block headers can be retrieved from a remote chain based on user queries.
 func TestGetBlockHeaders62(t *testing.T) { testGetBlockHeaders(t, 62) }
+
+// TestGetBlockHeaders63 tests get block headers 63.
 func TestGetBlockHeaders63(t *testing.T) { testGetBlockHeaders(t, 63) }
 
 func testGetBlockHeaders(t *testing.T, protocol int) {
@@ -132,20 +134,20 @@ func testGetBlockHeaders(t *testing.T, protocol int) {
 			&getBlockHeadersData{Origin: hashOrNumber{Number: 0}, Amount: 1},
 			[]common.Hash{pm.blockchain.GetBlockByNumber(0).Hash()},
 		}, {
-			&getBlockHeadersData{Origin: hashOrNumber{Number: pm.blockchain.CurrentBlock().NumberU64()}, Amount: 1},
+			&getBlockHeadersData{Origin: hashOrNumber{Number: pm.blockchain.CurrentBlock().Number.Uint64()}, Amount: 1},
 			[]common.Hash{pm.blockchain.CurrentBlock().Hash()},
 		},
 		// Ensure protocol limits are honored
 		{
-			&getBlockHeadersData{Origin: hashOrNumber{Number: pm.blockchain.CurrentBlock().NumberU64() - 1}, Amount: limit + 10, Reverse: true},
+			&getBlockHeadersData{Origin: hashOrNumber{Number: pm.blockchain.CurrentBlock().Number.Uint64() - 1}, Amount: limit + 10, Reverse: true},
 			pm.blockchain.GetBlockHashesFromHash(pm.blockchain.CurrentBlock().Hash(), limit),
 		},
 		// Check that requesting more than available is handled gracefully
 		{
-			&getBlockHeadersData{Origin: hashOrNumber{Number: pm.blockchain.CurrentBlock().NumberU64() - 4}, Skip: 3, Amount: 3},
+			&getBlockHeadersData{Origin: hashOrNumber{Number: pm.blockchain.CurrentBlock().Number.Uint64() - 4}, Skip: 3, Amount: 3},
 			[]common.Hash{
-				pm.blockchain.GetBlockByNumber(pm.blockchain.CurrentBlock().NumberU64() - 4).Hash(),
-				pm.blockchain.GetBlockByNumber(pm.blockchain.CurrentBlock().NumberU64()).Hash(),
+				pm.blockchain.GetBlockByNumber(pm.blockchain.CurrentBlock().Number.Uint64() - 4).Hash(),
+				pm.blockchain.GetBlockByNumber(pm.blockchain.CurrentBlock().Number.Uint64()).Hash(),
 			},
 		}, {
 			&getBlockHeadersData{Origin: hashOrNumber{Number: 4}, Skip: 3, Amount: 3, Reverse: true},
@@ -156,10 +158,10 @@ func testGetBlockHeaders(t *testing.T, protocol int) {
 		},
 		// Check that requesting more than available is handled gracefully, even if mid skip
 		{
-			&getBlockHeadersData{Origin: hashOrNumber{Number: pm.blockchain.CurrentBlock().NumberU64() - 4}, Skip: 2, Amount: 3},
+			&getBlockHeadersData{Origin: hashOrNumber{Number: pm.blockchain.CurrentBlock().Number.Uint64() - 4}, Skip: 2, Amount: 3},
 			[]common.Hash{
-				pm.blockchain.GetBlockByNumber(pm.blockchain.CurrentBlock().NumberU64() - 4).Hash(),
-				pm.blockchain.GetBlockByNumber(pm.blockchain.CurrentBlock().NumberU64() - 1).Hash(),
+				pm.blockchain.GetBlockByNumber(pm.blockchain.CurrentBlock().Number.Uint64() - 4).Hash(),
+				pm.blockchain.GetBlockByNumber(pm.blockchain.CurrentBlock().Number.Uint64() - 1).Hash(),
 			},
 		}, {
 			&getBlockHeadersData{Origin: hashOrNumber{Number: 4}, Skip: 2, Amount: 3, Reverse: true},
@@ -196,7 +198,7 @@ func testGetBlockHeaders(t *testing.T, protocol int) {
 			&getBlockHeadersData{Origin: hashOrNumber{Hash: unknown}, Amount: 1},
 			[]common.Hash{},
 		}, {
-			&getBlockHeadersData{Origin: hashOrNumber{Number: pm.blockchain.CurrentBlock().NumberU64() + 1}, Amount: 1},
+			&getBlockHeadersData{Origin: hashOrNumber{Number: pm.blockchain.CurrentBlock().Number.Uint64() + 1}, Amount: 1},
 			[]common.Hash{},
 		},
 	}
@@ -228,6 +230,8 @@ func testGetBlockHeaders(t *testing.T, protocol int) {
 
 // Tests that block contents can be retrieved from a remote chain based on their hashes.
 func TestGetBlockBodies62(t *testing.T) { testGetBlockBodies(t, 62) }
+
+// TestGetBlockBodies63 tests get block bodies 63.
 func TestGetBlockBodies63(t *testing.T) { testGetBlockBodies(t, 63) }
 
 func testGetBlockBodies(t *testing.T, protocol int) {
@@ -270,7 +274,7 @@ func testGetBlockBodies(t *testing.T, protocol int) {
 
 		for j := 0; j < tt.random; j++ {
 			for {
-				num := rand.Int63n(int64(pm.blockchain.CurrentBlock().NumberU64()))
+				num := rand.Int63n(int64(pm.blockchain.CurrentBlock().Number.Uint64()))
 				if !seen[num] {
 					seen[num] = true
 
@@ -311,16 +315,20 @@ func testGetNodeData(t *testing.T, protocol int) {
 	signer := types.HomesteadSigner{}
 	// Create a chain generator with some simple transactions (blatantly stolen from @fjl/chain_markets_test)
 	generator := func(i int, block *core.BlockGen) {
+		fee := block.BaseFee()
+		if fee == nil {
+			fee = big.NewInt(params.InitialBaseFee)
+		}
 		switch i {
 		case 0:
 			// In block 1, the test bank sends account #1 some ether.
-			tx, _ := types.SignTx(types.NewTransaction(block.TxNonce(testBank), acc1Addr, big.NewInt(10000), params.TxGas, nil, nil), signer, testBankKey)
+			tx, _ := types.SignTx(types.NewTransaction(block.TxNonce(testBank), acc1Addr, new(big.Int).SetUint64(1_000_000_000_000_000_000), params.TxGas, fee, nil), signer, testBankKey)
 			block.AddTx(tx)
 		case 1:
 			// In block 2, the test bank sends some more ether to account #1.
 			// acc1Addr passes it on to account #2.
-			tx1, _ := types.SignTx(types.NewTransaction(block.TxNonce(testBank), acc1Addr, big.NewInt(1000), params.TxGas, nil, nil), signer, testBankKey)
-			tx2, _ := types.SignTx(types.NewTransaction(block.TxNonce(acc1Addr), acc2Addr, big.NewInt(1000), params.TxGas, nil, nil), signer, acc1Key)
+			tx1, _ := types.SignTx(types.NewTransaction(block.TxNonce(testBank), acc1Addr, new(big.Int).SetUint64(1_000_000_000_000_000_000), params.TxGas, fee, nil), signer, testBankKey)
+			tx2, _ := types.SignTx(types.NewTransaction(block.TxNonce(acc1Addr), acc2Addr, new(big.Int).SetUint64(1_000_000_000_000_000_000), params.TxGas, fee, nil), signer, acc1Key)
 			block.AddTx(tx1)
 			block.AddTx(tx2)
 		case 2:
@@ -374,7 +382,7 @@ func testGetNodeData(t *testing.T, protocol int) {
 		statedb.Put(hashes[i].Bytes(), data[i])
 	}
 	accounts := []common.Address{testBank, acc1Addr, acc2Addr}
-	for i := uint64(0); i <= pm.blockchain.CurrentBlock().NumberU64(); i++ {
+	for i := uint64(0); i <= pm.blockchain.CurrentBlock().Number.Uint64(); i++ {
 		trie, _ := state.New(pm.blockchain.GetBlockByNumber(i).Root(), state.NewDatabase(statedb))
 
 		for j, acc := range accounts {
@@ -405,16 +413,20 @@ func testGetReceipt(t *testing.T, protocol int) {
 	signer := types.HomesteadSigner{}
 	// Create a chain generator with some simple transactions (blatantly stolen from @fjl/chain_markets_test)
 	generator := func(i int, block *core.BlockGen) {
+		fee := block.BaseFee()
+		if fee == nil {
+			fee = big.NewInt(params.InitialBaseFee)
+		}
 		switch i {
 		case 0:
 			// In block 1, the test bank sends account #1 some ether.
-			tx, _ := types.SignTx(types.NewTransaction(block.TxNonce(testBank), acc1Addr, big.NewInt(10000), params.TxGas, nil, nil), signer, testBankKey)
+			tx, _ := types.SignTx(types.NewTransaction(block.TxNonce(testBank), acc1Addr, new(big.Int).SetUint64(1_000_000_000_000_000_000), params.TxGas, fee, nil), signer, testBankKey)
 			block.AddTx(tx)
 		case 1:
 			// In block 2, the test bank sends some more ether to account #1.
 			// acc1Addr passes it on to account #2.
-			tx1, _ := types.SignTx(types.NewTransaction(block.TxNonce(testBank), acc1Addr, big.NewInt(1000), params.TxGas, nil, nil), signer, testBankKey)
-			tx2, _ := types.SignTx(types.NewTransaction(block.TxNonce(acc1Addr), acc2Addr, big.NewInt(1000), params.TxGas, nil, nil), signer, acc1Key)
+			tx1, _ := types.SignTx(types.NewTransaction(block.TxNonce(testBank), acc1Addr, new(big.Int).SetUint64(1_000_000_000_000_000_000), params.TxGas, fee, nil), signer, testBankKey)
+			tx2, _ := types.SignTx(types.NewTransaction(block.TxNonce(acc1Addr), acc2Addr, new(big.Int).SetUint64(1_000_000_000_000_000_000), params.TxGas, fee, nil), signer, acc1Key)
 			block.AddTx(tx1)
 			block.AddTx(tx2)
 		case 2:
@@ -438,7 +450,7 @@ func testGetReceipt(t *testing.T, protocol int) {
 
 	// Collect the hashes to request, and the response to expect
 	hashes, receipts := []common.Hash{}, []types.Receipts{}
-	for i := uint64(0); i <= pm.blockchain.CurrentBlock().NumberU64(); i++ {
+	for i := uint64(0); i <= pm.blockchain.CurrentBlock().Number.Uint64(); i++ {
 		block := pm.blockchain.GetBlockByNumber(i)
 
 		hashes = append(hashes, block.Hash())
@@ -454,11 +466,21 @@ func testGetReceipt(t *testing.T, protocol int) {
 // Tests that post eth protocol handshake, DAO fork-enabled clients also execute
 // a DAO "challenge" verifying each others' DAO fork headers to ensure they're on
 // compatible chains.
-func TestDAOChallengeNoVsNo(t *testing.T)       { testDAOChallenge(t, false, false, false) }
-func TestDAOChallengeNoVsPro(t *testing.T)      { testDAOChallenge(t, false, true, false) }
-func TestDAOChallengeProVsNo(t *testing.T)      { testDAOChallenge(t, true, false, false) }
-func TestDAOChallengeProVsPro(t *testing.T)     { testDAOChallenge(t, true, true, false) }
-func TestDAOChallengeNoVsTimeout(t *testing.T)  { testDAOChallenge(t, false, false, true) }
+func TestDAOChallengeNoVsNo(t *testing.T) { testDAOChallenge(t, false, false, false) }
+
+// TestDAOChallengeNoVsPro tests dao challenge no vs pro.
+func TestDAOChallengeNoVsPro(t *testing.T) { testDAOChallenge(t, false, true, false) }
+
+// TestDAOChallengeProVsNo tests dao challenge pro vs no.
+func TestDAOChallengeProVsNo(t *testing.T) { testDAOChallenge(t, true, false, false) }
+
+// TestDAOChallengeProVsPro tests dao challenge pro vs pro.
+func TestDAOChallengeProVsPro(t *testing.T) { testDAOChallenge(t, true, true, false) }
+
+// TestDAOChallengeNoVsTimeout tests dao challenge no vs timeout.
+func TestDAOChallengeNoVsTimeout(t *testing.T) { testDAOChallenge(t, false, false, true) }
+
+// TestDAOChallengeProVsTimeout tests dao challenge pro vs timeout.
 func TestDAOChallengeProVsTimeout(t *testing.T) { testDAOChallenge(t, true, true, true) }
 
 func testDAOChallenge(t *testing.T, localForked, remoteForked bool, timeout bool) {
@@ -469,15 +491,15 @@ func testDAOChallenge(t *testing.T, localForked, remoteForked bool, timeout bool
 	}
 	// Create a DAO aware protocol manager
 	var (
-		evmux         = new(event.TypeMux)
-		pow           = ethash.NewFaker()
-		db            = rawdb.NewMemoryDatabase()
-		config        = &params.ChainConfig{DAOForkBlock: big.NewInt(1), DAOForkSupport: localForked}
-		gspec         = &core.Genesis{Config: config}
-		genesis       = gspec.MustCommit(db)
-		blockchain, _ = core.NewBlockChain(db, nil, config, pow, vm.Config{})
+		evmux = new(event.TypeMux)
+		pow   = ethash.NewFaker()
+		db    = rawdb.NewMemoryDatabase()
+		gspec = &core.Genesis{
+			Config: daoChallengeChainConfig(localForked),
+		}
+		blockchain, _ = core.NewBlockChain(db, nil, gspec, pow, vm.Config{})
 	)
-	pm, err := NewProtocolManager(config, downloader.FullSync, ethconfig.Defaults.NetworkId, evmux, new(testTxPool), pow, blockchain, db)
+	pm, err := NewProtocolManager(gspec.Config, downloader.FullSync, ethconfig.Defaults.NetworkId, evmux, new(testTxPool), pow, blockchain, db)
 	if err != nil {
 		t.Fatalf("failed to start test protocol manager: %v", err)
 	}
@@ -489,7 +511,7 @@ func testDAOChallenge(t *testing.T, localForked, remoteForked bool, timeout bool
 	defer peer.close()
 
 	challenge := &getBlockHeadersData{
-		Origin:  hashOrNumber{Number: config.DAOForkBlock.Uint64()},
+		Origin:  hashOrNumber{Number: gspec.Config.DAOForkBlock.Uint64()},
 		Amount:  1,
 		Skip:    0,
 		Reverse: false,
@@ -499,9 +521,13 @@ func testDAOChallenge(t *testing.T, localForked, remoteForked bool, timeout bool
 	}
 	// Create a block to reply to the challenge if no timeout is simulated
 	if !timeout {
-		blocks, _ := core.GenerateChain(&params.ChainConfig{}, genesis, ethash.NewFaker(), db, 1, func(i int, block *core.BlockGen) {
+		_, blocks, _ := core.GenerateChainWithGenesis(gspec, ethash.NewFaker(), 1, func(i int, block *core.BlockGen) {
 			if remoteForked {
 				block.SetExtra(params.DAOForkBlockExtra)
+			} else {
+				// Override the auto-injected DAO extra-data from GenerateChain when
+				// the local config supports the fork but the remote peer should not.
+				block.SetExtra([]byte{})
 			}
 		})
 		if err := p2p.Send(peer.app, BlockHeadersMsg, []*types.Header{blocks[0].Header()}); err != nil {
@@ -522,4 +548,48 @@ func testDAOChallenge(t *testing.T, localForked, remoteForked bool, timeout bool
 			t.Fatalf("peer count mismatch: have %d, want %d", peers, 0)
 		}
 	}
+}
+
+// daoChallengeChainConfig builds a chain config that activates the DAO fork
+// challenge while pushing later forks into the future.
+func daoChallengeChainConfig(daoForkSupport bool) *params.ChainConfig {
+	config := params.TestChainConfig.Clone()
+	futureForkBlock := big.NewInt(1_000_000_000)
+
+	config.ChainID = big.NewInt(1337)
+	config.DAOForkBlock = big.NewInt(1)
+	config.DAOForkSupport = daoForkSupport
+	config.EIP150Block = new(big.Int).Set(futureForkBlock)
+	config.EIP155Block = new(big.Int).Set(futureForkBlock)
+	config.EIP158Block = new(big.Int).Set(futureForkBlock)
+	config.ByzantiumBlock = new(big.Int).Set(futureForkBlock)
+	config.ConstantinopleBlock = new(big.Int).Set(futureForkBlock)
+	config.PetersburgBlock = new(big.Int).Set(futureForkBlock)
+	config.IstanbulBlock = new(big.Int).Set(futureForkBlock)
+	config.TIPSigningBlock = new(big.Int).Set(futureForkBlock)
+	config.TIPRandomizeBlock = new(big.Int).Set(futureForkBlock)
+	config.TIPIncreaseMasternodesBlock = new(big.Int).Set(futureForkBlock)
+	config.DenylistBlock = new(big.Int).Set(futureForkBlock)
+	config.TIPNoHalvingMNRewardBlock = new(big.Int).Set(futureForkBlock)
+	config.TIPXDCXBlock = new(big.Int).Set(futureForkBlock)
+	config.TIPXDCXLendingBlock = new(big.Int).Set(futureForkBlock)
+	config.TIPXDCXCancellationFeeBlock = new(big.Int).Set(futureForkBlock)
+	config.TIPTRC21FeeBlock = new(big.Int).Set(futureForkBlock)
+	config.Gas50xBlock = new(big.Int).Set(futureForkBlock)
+	config.BerlinBlock = new(big.Int).Set(futureForkBlock)
+	config.LondonBlock = new(big.Int).Set(futureForkBlock)
+	config.MergeBlock = new(big.Int).Set(futureForkBlock)
+	config.ShanghaiBlock = new(big.Int).Set(futureForkBlock)
+	config.TIPXDCXMinerDisableBlock = new(big.Int).Set(futureForkBlock)
+	config.TIPXDCXReceiverDisableBlock = new(big.Int).Set(futureForkBlock)
+	config.EIP1559Block = new(big.Int).Set(futureForkBlock)
+	config.CancunBlock = new(big.Int).Set(futureForkBlock)
+	config.PragueBlock = new(big.Int).Set(futureForkBlock)
+	config.OsakaBlock = new(big.Int).Set(futureForkBlock)
+	config.DynamicGasLimitBlock = new(big.Int).Set(futureForkBlock)
+	config.TIPUpgradeRewardBlock = new(big.Int).Set(futureForkBlock)
+	config.TIPUpgradePenaltyBlock = new(big.Int).Set(futureForkBlock)
+	config.TIPEpochHalvingBlock = new(big.Int).Set(futureForkBlock)
+
+	return config
 }

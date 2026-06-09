@@ -19,7 +19,6 @@ package core
 import (
 	"sync/atomic"
 
-	"github.com/XinFinOrg/XDPoSChain/common"
 	"github.com/XinFinOrg/XDPoSChain/consensus"
 	"github.com/XinFinOrg/XDPoSChain/core/state"
 	"github.com/XinFinOrg/XDPoSChain/core/types"
@@ -53,7 +52,7 @@ func (p *statePrefetcher) Prefetch(block *types.Block, statedb *state.StateDB, c
 		header       = block.Header()
 		gaspool      = new(GasPool).AddGas(block.GasLimit())
 		blockContext = NewEVMBlockContext(header, p.bc, nil)
-		evm          = vm.NewEVM(blockContext, vm.TxContext{}, statedb, nil, p.config, cfg)
+		evm          = vm.NewEVM(blockContext, statedb, nil, p.config, cfg)
 		signer       = types.MakeSigner(p.config, header.Number)
 	)
 	// Iterate over and process the individual transactions
@@ -64,12 +63,16 @@ func (p *statePrefetcher) Prefetch(block *types.Block, statedb *state.StateDB, c
 			return
 		}
 		// Convert the transaction into an executable message and pre-cache its sender
-		msg, err := tx.AsMessage(signer, nil, nil, header.BaseFee)
+		msg, err := TransactionToMessage(tx, signer, nil, nil, header.BaseFee, p.config)
 		if err != nil {
 			return // Also invalid block, bail out
 		}
 		statedb.SetTxContext(tx.Hash(), i)
-		if err := precacheTransaction(msg, p.config, gaspool, statedb, header, evm); err != nil {
+		coinbaseOwner := statedb.GetOwner(evm.Context.Coinbase)
+
+		// We attempt to apply a transaction. The goal is not to execute
+		// the transaction successfully, rather to warm up touched data slots.
+		if _, err := ApplyMessage(evm, msg, gaspool, coinbaseOwner); err != nil {
 			return // Ugh, something went horribly wrong, bail out
 		}
 		// If we're pre-byzantium, pre-load trie nodes for the intermediate root
@@ -81,15 +84,4 @@ func (p *statePrefetcher) Prefetch(block *types.Block, statedb *state.StateDB, c
 	if byzantium {
 		statedb.IntermediateRoot(true)
 	}
-}
-
-// precacheTransaction attempts to apply a transaction to the given state database
-// and uses the input parameters for its environment. The goal is not to execute
-// the transaction successfully, rather to warm up touched data slots.
-func precacheTransaction(msg types.Message, config *params.ChainConfig, gaspool *GasPool, statedb *state.StateDB, header *types.Header, evm *vm.EVM) error {
-	// Update the evm with the new transaction context.
-	evm.Reset(NewEVMTxContext(msg), statedb)
-	// Add addresses to access list if applicable
-	_, err := ApplyMessage(evm, msg, gaspool, common.Address{})
-	return err
 }

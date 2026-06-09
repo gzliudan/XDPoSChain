@@ -265,10 +265,6 @@ type preminedTestnet struct {
 	net       *Network
 }
 
-func (tn *preminedTestnet) sendFindnode(to *Node, target NodeID) {
-	panic("sendFindnode called")
-}
-
 func (tn *preminedTestnet) sendFindnodeHash(to *Node, target common.Hash) {
 	// current log distance is encoded in port number
 	// fmt.Println("findnode query at dist", toaddr.Port)
@@ -316,10 +312,6 @@ func (tn *preminedTestnet) sendNeighbours(to *Node, nodes []*Node) {
 	panic("sendNeighbours called")
 }
 
-func (tn *preminedTestnet) sendTopicQuery(to *Node, topic Topic) {
-	panic("sendTopicQuery called")
-}
-
 func (tn *preminedTestnet) sendTopicNodes(to *Node, queryHash common.Hash, nodes []*Node) {
 	panic("sendTopicNodes called")
 }
@@ -336,26 +328,26 @@ func (*preminedTestnet) localAddr() *net.UDPAddr {
 
 // mine generates a testnet struct literal with nodes at
 // various distances to the given target.
-func (n *preminedTestnet) mine(target NodeID) {
-	n.target = target
-	n.targetSha = crypto.Keccak256Hash(n.target[:])
+func (tn *preminedTestnet) mine(target NodeID) {
+	tn.target = target
+	tn.targetSha = crypto.Keccak256Hash(tn.target[:])
 	found := 0
 	for found < bucketSize*10 {
 		k := newkey()
 		id := PubkeyID(&k.PublicKey)
 		sha := crypto.Keccak256Hash(id[:])
-		ld := logdist(n.targetSha, sha)
-		if len(n.dists[ld]) < bucketSize {
-			n.dists[ld] = append(n.dists[ld], id)
+		ld := logdist(tn.targetSha, sha)
+		if len(tn.dists[ld]) < bucketSize {
+			tn.dists[ld] = append(tn.dists[ld], id)
 			fmt.Println("found ID with ld", ld)
 			found++
 		}
 	}
 	fmt.Println("&preminedTestnet{")
-	fmt.Printf("	target: %#v,\n", n.target)
-	fmt.Printf("	targetSha: %#v,\n", n.targetSha)
-	fmt.Printf("	dists: [%d][]NodeID{\n", len(n.dists))
-	for ld, ns := range n.dists {
+	fmt.Printf("	target: %#v,\n", tn.target)
+	fmt.Printf("	targetSha: %#v,\n", tn.targetSha)
+	fmt.Printf("	dists: [%d][]NodeID{\n", len(tn.dists))
+	for ld, ns := range tn.dists {
 		if len(ns) == 0 {
 			continue
 		}

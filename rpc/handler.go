@@ -501,6 +501,10 @@ func (h *handler) handleCall(cp *callProc, msg *jsonrpcMessage) *jsonrpcMessage 
 	if msg.isUnsubscribe() {
 		callb = h.unsubscribeCb
 	} else {
+		// Check method name length
+		if len(msg.Method) > maxMethodNameLength {
+			return msg.errorResponse(&invalidRequestError{fmt.Sprintf("method name too long: %d > %d", len(msg.Method), maxMethodNameLength)})
+		}
 		callb = h.reg.callback(msg.Method)
 	}
 	if callb == nil {
@@ -534,6 +538,11 @@ func (h *handler) handleCall(cp *callProc, msg *jsonrpcMessage) *jsonrpcMessage 
 func (h *handler) handleSubscribe(cp *callProc, msg *jsonrpcMessage) *jsonrpcMessage {
 	if !h.allowSubscribe {
 		return msg.errorResponse(ErrNotificationsUnsupported)
+	}
+
+	// Check method name length
+	if len(msg.Method) > maxMethodNameLength {
+		return msg.errorResponse(&invalidRequestError{fmt.Sprintf("subscription name too long: %d > %d", len(msg.Method), maxMethodNameLength)})
 	}
 
 	// Subscription method name is first argument.
@@ -603,8 +612,11 @@ type limitedBuffer struct {
 }
 
 func (buf *limitedBuffer) Write(data []byte) (int, error) {
-	avail := max(buf.limit, len(buf.output))
-	if len(data) < avail {
+	avail := buf.limit - len(buf.output)
+	if avail <= 0 {
+		return 0, errTruncatedOutput
+	}
+	if len(data) <= avail {
 		buf.output = append(buf.output, data...)
 		return len(data), nil
 	}

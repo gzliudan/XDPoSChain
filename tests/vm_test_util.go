@@ -33,12 +33,14 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/core/vm"
 	"github.com/XinFinOrg/XDPoSChain/crypto"
 	"github.com/XinFinOrg/XDPoSChain/params"
+	"github.com/holiman/uint256"
 )
 
 // VMTest checks EVM execution without block or transaction context.
 // See https://github.com/ethereum/tests/wiki/VM-Tests for the test format specification.
 type VMTest struct {
-	json vmJSON
+	json        vmJSON
+	chainConfig *params.ChainConfig
 }
 
 func (t *VMTest) UnmarshalJSON(data []byte) error {
@@ -120,19 +122,19 @@ func (t *VMTest) Run(vmconfig vm.Config) error {
 func (t *VMTest) exec(statedb *state.StateDB, vmconfig vm.Config) ([]byte, uint64, error) {
 	evm := t.newEVM(statedb, vmconfig)
 	e := t.json.Exec
-	return evm.Call(vm.AccountRef(e.Caller), e.Address, e.Data, e.GasLimit, e.Value)
+	return evm.Call(e.Caller, e.Address, e.Data, e.GasLimit, uint256.MustFromBig(e.Value))
 }
 
 func (t *VMTest) newEVM(statedb *state.StateDB, vmconfig vm.Config) *vm.EVM {
 	initialCall := true
-	canTransfer := func(db vm.StateDB, address common.Address, amount *big.Int) bool {
+	canTransfer := func(db vm.StateDB, address common.Address, amount *uint256.Int) bool {
 		if initialCall {
 			initialCall = false
 			return true
 		}
 		return core.CanTransfer(db, address, amount)
 	}
-	transfer := func(db vm.StateDB, sender, recipient common.Address, amount *big.Int) {}
+	transfer := func(db vm.StateDB, sender, recipient common.Address, amount *uint256.Int) {}
 	txContext := vm.TxContext{
 		Origin:   t.json.Exec.Origin,
 		GasPrice: t.json.Exec.GasPrice,
@@ -143,11 +145,17 @@ func (t *VMTest) newEVM(statedb *state.StateDB, vmconfig vm.Config) *vm.EVM {
 		GetHash:     vmTestBlockHash,
 		Coinbase:    t.json.Env.Coinbase,
 		BlockNumber: new(big.Int).SetUint64(t.json.Env.Number),
-		Time:        new(big.Int).SetUint64(t.json.Env.Timestamp),
+		Time:        t.json.Env.Timestamp,
 		GasLimit:    t.json.Env.GasLimit,
 		Difficulty:  t.json.Env.Difficulty,
 	}
-	return vm.NewEVM(context, txContext, statedb, nil, params.MainnetChainConfig, vmconfig)
+	chainConfig := t.chainConfig
+	if chainConfig == nil {
+		chainConfig = params.MainnetChainConfig
+	}
+	evm := vm.NewEVM(context, statedb, nil, chainConfig, vmconfig)
+	evm.SetTxContext(txContext)
+	return evm
 }
 
 func vmTestBlockHash(n uint64) common.Hash {

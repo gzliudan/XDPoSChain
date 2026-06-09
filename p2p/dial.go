@@ -195,7 +195,7 @@ func (s *dialstate) newTasks(nRunning int, peers map[discover.NodeID]*Peer, now 
 	for id, t := range s.static {
 		err := s.checkDial(t.dest, peers)
 		switch err {
-		case errNotWhitelisted, errSelf:
+		case errNotAllowlisted, errSelf:
 			log.Warn("Removing static dial candidate", "id", t.dest.ID, "addr", &net.TCPAddr{IP: t.dest.IP, Port: int(t.dest.TCP)}, "err", err)
 			delete(s.static, t.dest.ID)
 		case nil:
@@ -257,7 +257,7 @@ var (
 	errAlreadyDialing   = errors.New("already dialing")
 	errAlreadyConnected = errors.New("already connected")
 	errRecentlyDialed   = errors.New("recently dialed")
-	errNotWhitelisted   = errors.New("not contained in netrestrict whitelist")
+	errNotAllowlisted   = errors.New("not contained in netrestrict allowlist")
 )
 
 func (s *dialstate) checkDial(n *discover.Node, peers map[discover.NodeID]*Peer) error {
@@ -266,14 +266,14 @@ func (s *dialstate) checkDial(n *discover.Node, peers map[discover.NodeID]*Peer)
 	case dialing:
 		return errAlreadyDialing
 	case peers[n.ID] != nil:
-		exitsPeer := peers[n.ID]
-		if exitsPeer.PairPeer != nil {
+		existPeer := peers[n.ID]
+		if existPeer.PairPeer() != nil {
 			return errAlreadyConnected
 		}
 	case s.ntab != nil && n.ID == s.ntab.Self().ID:
 		return errSelf
 	case s.netrestrict != nil && !s.netrestrict.Contains(n.IP):
-		return errNotWhitelisted
+		return errNotAllowlisted
 	case s.hist.contains(n.ID):
 		return errRecentlyDialed
 	}
@@ -413,7 +413,6 @@ func (h dialHistory) min() pastDial {
 }
 func (h *dialHistory) add(id discover.NodeID, exp time.Time) {
 	heap.Push(h, pastDial{id, exp})
-
 }
 func (h *dialHistory) remove(id discover.NodeID) bool {
 	for i, v := range *h {

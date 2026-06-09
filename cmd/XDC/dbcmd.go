@@ -21,15 +21,17 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"time"
 
 	"github.com/XinFinOrg/XDPoSChain/cmd/utils"
 	"github.com/XinFinOrg/XDPoSChain/common"
 	"github.com/XinFinOrg/XDPoSChain/common/hexutil"
-	"github.com/XinFinOrg/XDPoSChain/console"
+	"github.com/XinFinOrg/XDPoSChain/console/prompt"
 	"github.com/XinFinOrg/XDPoSChain/core/rawdb"
 	"github.com/XinFinOrg/XDPoSChain/ethdb"
 	"github.com/XinFinOrg/XDPoSChain/log"
+	"github.com/XinFinOrg/XDPoSChain/trie"
 	"github.com/urfave/cli/v2"
 )
 
@@ -54,6 +56,7 @@ Remove blockchain and state databases`,
 			dbGetCmd,
 			dbDeleteCmd,
 			dbPutCmd,
+			dbGetSlotsCmd,
 		},
 	}
 	dbInspectCmd = &cli.Command{
@@ -119,6 +122,16 @@ WARNING: This is a low-level operation which may cause database corruption!`,
 		Description: `This command sets a given database key to the given value.
 WARNING: This is a low-level operation which may cause database corruption!`,
 	}
+	dbGetSlotsCmd = &cli.Command{
+		Action:    dbDumpTrie,
+		Name:      "dumptrie",
+		Usage:     "Show the storage key/values of a given storage trie",
+		ArgsUsage: "<hex-encoded state root> <hex-encoded account hash> <hex-encoded storage trie root> <hex-encoded start (optional)> <int max elements (optional)>",
+		Flags: slices.Concat([]cli.Flag{
+			utils.SyncModeFlag,
+		}, utils.NetworkFlags, utils.DatabaseFlags),
+		Description: "This command looks up the specified database key from the database.",
+	}
 )
 
 func removeDB(ctx *cli.Context) error {
@@ -153,7 +166,7 @@ func removeFolder(dir string) {
 // confirmAndRemoveDB prompts the user for a last confirmation and removes the
 // folder if accepted.
 func confirmAndRemoveDB(path string, kind string) {
-	confirm, err := console.Stdin.PromptConfirm(fmt.Sprintf("Remove %s (%s)?", kind, path))
+	confirm, err := prompt.Stdin.PromptConfirm(fmt.Sprintf("Remove %s (%s)?", kind, path))
 	switch {
 	case err != nil:
 		utils.Fatalf("%v", err)
@@ -327,4 +340,69 @@ func dbPut(ctx *cli.Context) error {
 		fmt.Printf("Previous value:\n%#x\n", data)
 	}
 	return db.Put(key, value)
+}
+
+// dbDumpTrie shows the key-value slots of a given storage trie
+func dbDumpTrie(ctx *cli.Context) error {
+	if ctx.NArg() < 3 {
+		return fmt.Errorf("required arguments: %v", ctx.Command.ArgsUsage)
+	}
+	stack, _ := makeConfigNode(ctx)
+	defer stack.Close()
+
+	db := utils.MakeChainDatabase(ctx, stack, true)
+	defer db.Close()
+
+	var (
+		state   []byte
+		storage []byte
+		account []byte
+		start   []byte
+		max     = int64(-1)
+		err     error
+	)
+	if state, err = hexutil.Decode(ctx.Args().Get(0)); err != nil {
+		log.Info("Could not decode the state root", "error", err)
+		return err
+	}
+	if account, err = hexutil.Decode(ctx.Args().Get(1)); err != nil {
+		log.Info("Could not decode the account hash", "error", err)
+		return err
+	}
+	if storage, err = hexutil.Decode(ctx.Args().Get(2)); err != nil {
+		log.Info("Could not decode the storage trie root", "error", err)
+		return err
+	}
+	if ctx.NArg() > 3 {
+		if start, err = hexutil.Decode(ctx.Args().Get(3)); err != nil {
+			log.Info("Could not decode the seek position", "error", err)
+			return err
+		}
+	}
+	if ctx.NArg() > 4 {
+		if max, err = strconv.ParseInt(ctx.Args().Get(4), 10, 64); err != nil {
+			log.Info("Could not decode the max count", "error", err)
+			return err
+		}
+	}
+	id := trie.StorageTrieID(common.BytesToHash(state), common.BytesToHash(account), common.BytesToHash(storage))
+	theTrie, err := trie.New(id, trie.NewDatabase(db))
+	if err != nil {
+		return err
+	}
+	trieIt, err := theTrie.NodeIterator(start)
+	if err != nil {
+		return err
+	}
+	var count int64
+	it := trie.NewIterator(trieIt)
+	for it.Next() {
+		if max > 0 && count == max {
+			fmt.Printf("Exiting after %d values\n", count)
+			break
+		}
+		fmt.Printf("  %d. key %#x: %#x\n", count, it.Key, it.Value)
+		count++
+	}
+	return it.Err
 }

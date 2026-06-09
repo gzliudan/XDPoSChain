@@ -10,8 +10,8 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/common"
 	"github.com/XinFinOrg/XDPoSChain/core/state"
 	"github.com/XinFinOrg/XDPoSChain/core/types"
+	"github.com/XinFinOrg/XDPoSChain/crypto/keccak"
 	"github.com/globalsign/mgo/bson"
-	"golang.org/x/crypto/sha3"
 )
 
 const (
@@ -177,7 +177,7 @@ func (l *LendingItem) SetBSON(raw bson.Raw) error {
 
 	if decoded.Signature != nil {
 		l.Signature = &Signature{
-			V: byte(decoded.Signature.V),
+			V: decoded.Signature.V,
 			R: common.HexToHash(decoded.Signature.R),
 			S: common.HexToHash(decoded.Signature.S),
 		}
@@ -308,7 +308,7 @@ func (l *LendingItem) VerifyLendingStatus() error {
 }
 
 func (l *LendingItem) ComputeHash() common.Hash {
-	sha := sha3.NewLegacyKeccak256()
+	sha := keccak.NewLegacyKeccak256()
 	if l.Status == LendingStatusNew {
 		sha.Write(l.Relayer.Bytes())
 		sha.Write(l.UserAddress.Bytes())
@@ -396,7 +396,6 @@ func VerifyBalance(isXDCXLendingFork bool, statedb *state.StateDB, lendingStateD
 			return fmt.Errorf("VerifyBalance: not enough balance to process payment for lendingTrade."+
 				"lendingTradeId: %v. Token: %s. ExpectedBalance: %s. ActualBalance: %s",
 				lendingTradeId, lendingTrade.LendingToken.Hex(), paymentBalance.String(), tokenBalance.String())
-
 		}
 	case Market, Limit:
 		switch side {
@@ -421,7 +420,6 @@ func VerifyBalance(isXDCXLendingFork bool, statedb *state.StateDB, lendingStateD
 					if defaultFeeInXDC.Cmp(common.RelayerLendingFee) <= 0 {
 						return ErrQuantityTradeTooSmall
 					}
-
 				}
 
 			case LendingStatusCancelled:

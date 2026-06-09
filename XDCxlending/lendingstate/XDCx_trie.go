@@ -19,11 +19,12 @@ package lendingstate
 import (
 	"fmt"
 
-	"github.com/XinFinOrg/XDPoSChain/ethdb"
-	"github.com/XinFinOrg/XDPoSChain/trie"
-
 	"github.com/XinFinOrg/XDPoSChain/common"
+	"github.com/XinFinOrg/XDPoSChain/core/types"
+	"github.com/XinFinOrg/XDPoSChain/ethdb"
 	"github.com/XinFinOrg/XDPoSChain/log"
+	"github.com/XinFinOrg/XDPoSChain/trie"
+	"github.com/XinFinOrg/XDPoSChain/trie/trienode"
 )
 
 // XDCXTrie wraps a trie with key hashing. In a secure trie, all
@@ -38,7 +39,6 @@ import (
 // XDCXTrie is not safe for concurrent use.
 type XDCXTrie struct {
 	trie             trie.Trie
-	hashKeyBuf       [common.HashLength]byte
 	secKeyCache      map[string][]byte
 	secKeyCacheOwner *XDCXTrie // Pointer to self, replace the key cache on mismatch
 }
@@ -58,7 +58,7 @@ func NewXDCXTrie(root common.Hash, db *trie.Database) (*XDCXTrie, error) {
 	if db == nil {
 		panic("trie.NewXDCXTrie called without a database")
 	}
-	trie, err := trie.New(root, db)
+	trie, err := trie.New(trie.TrieID(root), db)
 	if err != nil {
 		return nil, err
 	}
@@ -79,7 +79,7 @@ func (t *XDCXTrie) Get(key []byte) []byte {
 // The value bytes must not be modified by the caller.
 // If a node was not found in the database, a MissingNodeError is returned.
 func (t *XDCXTrie) TryGet(key []byte) ([]byte, error) {
-	return t.trie.TryGet(key)
+	return t.trie.Get(key)
 }
 
 // TryGetBestLeftKey returns the value of max left leaf
@@ -115,7 +115,7 @@ func (t *XDCXTrie) Update(key, value []byte) {
 //
 // If a node was not found in the database, a MissingNodeError is returned.
 func (t *XDCXTrie) TryUpdate(key, value []byte) error {
-	err := t.trie.TryUpdate(key, value)
+	err := t.trie.Update(key, value)
 	if err != nil {
 		return err
 	}
@@ -134,7 +134,7 @@ func (t *XDCXTrie) Delete(key []byte) {
 // If a node was not found in the database, a MissingNodeError is returned.
 func (t *XDCXTrie) TryDelete(key []byte) error {
 	delete(t.getSecKeyCache(), string(key))
-	return t.trie.TryDelete(key)
+	return t.trie.Delete(key)
 }
 
 // GetKey returns the sha3 preimage of a hashed key that was
@@ -143,7 +143,7 @@ func (t *XDCXTrie) GetKey(shaKey []byte) []byte {
 	if key, ok := t.getSecKeyCache()[string(shaKey)]; ok {
 		return key
 	}
-	return t.trie.Db.Preimage(common.BytesToHash(shaKey))
+	return t.trie.Preimage(common.BytesToHash(shaKey))
 }
 
 // Commit writes all nodes and the secure hash pre-images to the trie's database.
@@ -151,19 +151,26 @@ func (t *XDCXTrie) GetKey(shaKey []byte) []byte {
 //
 // Committing flushes nodes from memory. Subsequent Get calls will load nodes
 // from the database.
-func (t *XDCXTrie) Commit(onleaf trie.LeafCallback) (root common.Hash, err error) {
+func (t *XDCXTrie) Commit(onleaf trie.LeafCallback) (common.Hash, error) {
 	// Write all the pre-images to the actual disk database
 	if len(t.getSecKeyCache()) > 0 {
-		t.trie.Db.Lock.Lock()
-		for hk, key := range t.secKeyCache {
-			t.trie.Db.InsertPreimage(common.BytesToHash([]byte(hk)), key)
-		}
-		t.trie.Db.Lock.Unlock()
-
+		t.trie.InsertPreimage(t.secKeyCache)
 		t.secKeyCache = make(map[string][]byte)
 	}
 	// Commit the trie to its intermediate node database
-	return t.trie.Commit(onleaf)
+	// PR #1103 causes TestRevertStates and TestDumpState to fail,
+	// but we will not fix them since XDCx has been abandoned.
+	// TODO(daniel): The following code may be incorrect, ref PR #25320:
+	root, nodes, err := t.trie.Commit(false)
+	if err != nil {
+		return common.Hash{}, err
+	}
+	if nodes != nil {
+		if err := t.trie.UpdateDb(root, types.EmptyRootHash, 0, trienode.NewWithNodeSet(nodes), nil); err != nil {
+			return common.Hash{}, err
+		}
+	}
+	return root, nil
 }
 
 func (t *XDCXTrie) Hash() common.Hash {
@@ -178,8 +185,37 @@ func (t *XDCXTrie) Copy() *XDCXTrie {
 // NodeIterator returns an iterator that returns nodes of the underlying trie. Iteration
 // starts at the key after the given start key.
 func (t *XDCXTrie) NodeIterator(start []byte) trie.NodeIterator {
-	return t.trie.NodeIterator(start)
+	trieIt, err := t.trie.NodeIterator(start)
+	if err != nil {
+		log.Error(fmt.Sprintf("Unhandled trie error: %v", err))
+		return errNodeIterator{err: err}
+	}
+	return trieIt
 }
+
+// errNodeIterator is a safe, non-nil iterator that reports an error and yields no nodes.
+// It prevents nil dereferences when callers don't check for a nil iterator.
+type errNodeIterator struct {
+	err error
+}
+
+func (it errNodeIterator) Next(bool) bool { return false }
+func (it errNodeIterator) Error() error   { return it.err }
+func (it errNodeIterator) Hash() common.Hash {
+	return common.Hash{}
+}
+func (it errNodeIterator) Parent() common.Hash {
+	return common.Hash{}
+}
+func (it errNodeIterator) Path() []byte     { return nil }
+func (it errNodeIterator) NodeBlob() []byte { return nil }
+func (it errNodeIterator) Leaf() bool       { return false }
+func (it errNodeIterator) LeafKey() []byte  { return nil }
+func (it errNodeIterator) LeafBlob() []byte { return nil }
+func (it errNodeIterator) LeafProof() [][]byte {
+	return nil
+}
+func (it errNodeIterator) AddResolver(trie.NodeResolver) {}
 
 // hashKey returns the hash of key as an ephemeral buffer.
 // The caller must not hold onto the return value because it will become
@@ -212,5 +248,5 @@ func (t *XDCXTrie) getSecKeyCache() map[string][]byte {
 // nodes of the longest existing prefix of the key (at least the root node), ending
 // with the node that proves the absence of the key.
 func (t *XDCXTrie) Prove(key []byte, fromLevel uint, proofDb ethdb.KeyValueWriter) error {
-	return t.trie.Prove(key, fromLevel, proofDb)
+	return t.trie.Prove(key, proofDb)
 }

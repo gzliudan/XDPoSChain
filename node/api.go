@@ -65,6 +65,16 @@ func (api *adminAPI) AddPeer(url string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("invalid enode: %v", err)
 	}
+	// only accept the node which is in peer allowlist if the list is not empty
+	if len(server.AllowPeers) > 0 {
+		if _, ok := server.AllowPeers[node.ID]; !ok {
+			return false, fmt.Errorf("peer is not in allowlist: %v, ID: %s", url, node.ID)
+		}
+	}
+	// reject the node which is in peer blacklist
+	if _, ok := server.DenyPeers[node.ID]; ok {
+		return false, fmt.Errorf("peer is in blacklist: %v, ID: %s", url, node.ID)
+	}
 	server.AddPeer(node)
 	return true, nil
 }
@@ -95,6 +105,16 @@ func (api *adminAPI) AddTrustedPeer(url string) (bool, error) {
 	node, err := discover.ParseNode(url)
 	if err != nil {
 		return false, fmt.Errorf("invalid enode: %v", err)
+	}
+	// only accept the node which is in peer allowlist if the list is not empty
+	if len(server.AllowPeers) > 0 {
+		if _, ok := server.AllowPeers[node.ID]; !ok {
+			return false, fmt.Errorf("trusted peer is not in allowlist: %v, ID: %s", url, node.ID)
+		}
+	}
+	// reject the node which is in peer blacklist
+	if _, ok := server.DenyPeers[node.ID]; ok {
+		return false, fmt.Errorf("trusted peer is in blacklist: %v, ID: %s", url, node.ID)
 	}
 	server.AddTrustedPeer(node)
 	return true, nil
@@ -181,19 +201,19 @@ func (api *adminAPI) StartHTTP(host *string, port *int, cors *string, apis *stri
 	}
 	if cors != nil {
 		config.CorsAllowedOrigins = nil
-		for _, origin := range strings.Split(*cors, ",") {
+		for origin := range strings.SplitSeq(*cors, ",") {
 			config.CorsAllowedOrigins = append(config.CorsAllowedOrigins, strings.TrimSpace(origin))
 		}
 	}
 	if vhosts != nil {
 		config.Vhosts = nil
-		for _, vhost := range strings.Split(*host, ",") {
+		for vhost := range strings.SplitSeq(*vhosts, ",") {
 			config.Vhosts = append(config.Vhosts, strings.TrimSpace(vhost))
 		}
 	}
 	if apis != nil {
 		config.Modules = nil
-		for _, m := range strings.Split(*apis, ",") {
+		for m := range strings.SplitSeq(*apis, ",") {
 			config.Modules = append(config.Modules, strings.TrimSpace(m))
 		}
 	}
@@ -201,7 +221,8 @@ func (api *adminAPI) StartHTTP(host *string, port *int, cors *string, apis *stri
 	if err := api.node.http.setListenAddr(*host, *port); err != nil {
 		return false, err
 	}
-	if err := api.node.http.enableRPC(api.node.rpcAPIs, config); err != nil {
+	openApis, _, _, _ := api.node.getAPIs()
+	if err := api.node.http.enableRPC(openApis, config); err != nil {
 		return false, err
 	}
 	if err := api.node.http.start(); err != nil {
@@ -259,13 +280,13 @@ func (api *adminAPI) StartWS(host *string, port *int, allowedOrigins *string, ap
 
 	if apis != nil {
 		config.Modules = nil
-		for _, m := range strings.Split(*apis, ",") {
+		for m := range strings.SplitSeq(*apis, ",") {
 			config.Modules = append(config.Modules, strings.TrimSpace(m))
 		}
 	}
 	if allowedOrigins != nil {
 		config.Origins = nil
-		for _, origin := range strings.Split(*allowedOrigins, ",") {
+		for origin := range strings.SplitSeq(*allowedOrigins, ",") {
 			config.Origins = append(config.Origins, strings.TrimSpace(origin))
 		}
 	}
@@ -275,7 +296,7 @@ func (api *adminAPI) StartWS(host *string, port *int, allowedOrigins *string, ap
 	if err := server.setListenAddr(*host, *port); err != nil {
 		return false, err
 	}
-	openApis, _ := api.node.getAPIs()
+	openApis, _, _, _ := api.node.getAPIs()
 	if err := server.enableWS(openApis, config); err != nil {
 		return false, err
 	}

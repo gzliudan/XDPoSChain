@@ -365,7 +365,6 @@ func (s *Server) StopMocker(w http.ResponseWriter, req *http.Request) {
 
 // GetMockerList returns a list of available mockers
 func (s *Server) GetMockers(w http.ResponseWriter, req *http.Request) {
-
 	list := GetMockerList()
 	s.JSON(w, http.StatusOK, list)
 }
@@ -481,13 +480,13 @@ func (s *Server) StreamNetworkEvents(w http.ResponseWriter, req *http.Request) {
 // A message code of '*' or '-1' is considered a wildcard and matches any code.
 func NewMsgFilters(filterParam string) (MsgFilters, error) {
 	filters := make(MsgFilters)
-	for _, filter := range strings.Split(filterParam, "-") {
+	for filter := range strings.SplitSeq(filterParam, "-") {
 		proto, codes, found := strings.Cut(filter, ":")
 		if !found || proto == "" || codes == "" {
 			return nil, fmt.Errorf("invalid message filter: %s", filter)
 		}
 
-		for _, code := range strings.Split(codes, ",") {
+		for code := range strings.SplitSeq(codes, ",") {
 			if code == "*" || code == "-1" {
 				filters[MsgFilter{Proto: proto, Code: -1}] = struct{}{}
 				continue
@@ -560,7 +559,8 @@ func (s *Server) LoadSnapshot(w http.ResponseWriter, req *http.Request) {
 
 // CreateNode creates a node in the network using the given configuration
 func (s *Server) CreateNode(w http.ResponseWriter, req *http.Request) {
-	config := adapters.RandomNodeConfig()
+	config := &adapters.NodeConfig{}
+
 	err := json.NewDecoder(req.Body).Decode(config)
 	if err != nil && err != io.EOF {
 		http.Error(w, err.Error(), http.StatusBadRequest)

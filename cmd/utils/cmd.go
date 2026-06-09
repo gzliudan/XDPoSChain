@@ -37,6 +37,7 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/internal/debug"
 	"github.com/XinFinOrg/XDPoSChain/log"
 	"github.com/XinFinOrg/XDPoSChain/node"
+	"github.com/XinFinOrg/XDPoSChain/params"
 	"github.com/XinFinOrg/XDPoSChain/rlp"
 )
 
@@ -64,7 +65,32 @@ func Fatalf(format string, args ...interface{}) {
 	os.Exit(1)
 }
 
-func StartNode(stack *node.Node) {
+// FormatChainConfigError appends an operator-facing migration hint when strict
+// XDC fork-config validation rejects a legacy sparse config.
+func FormatChainConfigError(err error) string {
+	if err == nil {
+		return ""
+	}
+	message := err.Error()
+	if !errors.Is(err, params.ErrMissingForkSwitch) {
+		return message
+	}
+	for _, field := range []string{
+		"TIPTRC21FeeBlock",
+		"Gas50xBlock",
+		"TRC21IssuerSMC",
+		"XDCXListingSMC",
+		"RelayerRegistrationSMC",
+		"LendingRegistrationSMC",
+	} {
+		if strings.Contains(message, field) {
+			return message + ". Migration hint: ensure the persisted chain config or external genesis JSON includes TIPTRC21FeeBlock, Gas50xBlock, TRC21IssuerSMC, XDCXListingSMC, RelayerRegistrationSMC, and LendingRegistrationSMC. Older sparse custom XDPoS genesis files are auto-hydrated only when these keys are omitted."
+		}
+	}
+	return message
+}
+
+func StartNode(stack *node.Node, isConsole bool) {
 	if err := stack.Start(); err != nil {
 		Fatalf("Error starting protocol stack: %v", err)
 	}
@@ -72,17 +98,34 @@ func StartNode(stack *node.Node) {
 		sigc := make(chan os.Signal, 1)
 		signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM)
 		defer signal.Stop(sigc)
-		<-sigc
-		log.Info("Got interrupt, shutting down...")
-		go stack.Close()
-		for i := 10; i > 0; i-- {
-			<-sigc
-			if i > 1 {
-				log.Warn("Already shutting down, interrupt more to panic.", "times", i-1)
+
+		shutdown := func() {
+			log.Info("Got interrupt, shutting down...")
+			go stack.Close()
+			for i := 10; i > 0; i-- {
+				<-sigc
+				if i > 1 {
+					log.Warn("Already shutting down, interrupt more to panic.", "times", i-1)
+				}
 			}
+			debug.Exit() // ensure trace and CPU profile data is flushed.
+			debug.LoudPanic("boom")
 		}
-		debug.Exit() // ensure trace and CPU profile data is flushed.
-		debug.LoudPanic("boom")
+
+		if isConsole {
+			// In JS console mode, SIGINT is ignored because it's handled by the console.
+			// However, SIGTERM still shuts down the node.
+			for {
+				sig := <-sigc
+				if sig == syscall.SIGTERM {
+					shutdown()
+					return
+				}
+			}
+		} else {
+			<-sigc
+			shutdown()
+		}
 	}()
 }
 
@@ -173,7 +216,7 @@ func missingBlocks(chain *core.BlockChain, blocks []*types.Block) []*types.Block
 	head := chain.CurrentBlock()
 	for i, block := range blocks {
 		// If we're behind the chain head, only check block, state is available at head
-		if head.NumberU64() > block.NumberU64() {
+		if head.Number.Uint64() > block.NumberU64() {
 			if !chain.HasBlock(block.Hash(), block.NumberU64()) {
 				return blocks[i:]
 			}

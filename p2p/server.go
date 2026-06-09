@@ -18,9 +18,11 @@
 package p2p
 
 import (
+	"cmp"
 	"crypto/ecdsa"
 	"errors"
 	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -86,6 +88,12 @@ type Config struct {
 
 	// Name sets the node name of this server.
 	Name string `toml:"-"`
+
+	// Allowlist for peers
+	AllowPeers map[discover.NodeID]struct{}
+
+	// Denylist for peers.
+	DenyPeers map[discover.NodeID]struct{}
 
 	// BootstrapNodes are used to establish connectivity
 	// with the rest of the network.
@@ -269,7 +277,10 @@ func (c *conn) set(f connFlag, val bool) {
 	atomic.StoreInt32((*int32)(&c.flags), int32(flags))
 }
 
-// Peers returns all connected peers.
+// Peers returns the public view of connected remote nodes.
+//
+// The returned slice contains one entry per remote NodeID, so multiple physical
+// connections associated with the same node are represented by a single entry.
 func (srv *Server) Peers() []*Peer {
 	var ps []*Peer
 	select {
@@ -287,7 +298,11 @@ func (srv *Server) Peers() []*Peer {
 	return ps
 }
 
-// PeerCount returns the number of connected peers.
+// PeerCount returns the number of connected remote nodes.
+//
+// Multiple physical connections associated with the same remote NodeID
+// (for example pair peers) are counted once because the public peer view is
+// keyed by NodeID.
 func (srv *Server) PeerCount() int {
 	var count int
 	select {
@@ -302,7 +317,6 @@ func (srv *Server) PeerCount() int {
 // server is shut down. If the connection fails for any reason, the server will
 // attempt to reconnect the peer.
 func (srv *Server) AddPeer(node *discover.Node) {
-
 	select {
 	case srv.addstatic <- node:
 	case <-srv.quit:
@@ -317,8 +331,8 @@ func (srv *Server) RemovePeer(node *discover.Node) {
 	}
 }
 
-// AddTrustedPeer adds the given node to a reserved whitelist which allows the
-// node to always connect, even if the slot are full.
+// AddTrustedPeer adds the given node to a reserved allowlist which allows the
+// node to always connect, even if the slots are full.
 func (srv *Server) AddTrustedPeer(node *discover.Node) {
 	select {
 	case srv.addtrusted <- node:
@@ -575,6 +589,7 @@ func (srv *Server) run(dialstate dialer) {
 	defer srv.loopWG.Done()
 	var (
 		peers        = make(map[discover.NodeID]*Peer)
+		connCount    = 0
 		inboundCount = 0
 		trusted      = make(map[discover.NodeID]bool, len(srv.TrustedNodes))
 		taskdone     = make(chan task, maxActiveDialTasks)
@@ -695,14 +710,15 @@ running:
 					p.events = &srv.peerFeed
 				}
 				name := truncateName(c.name)
+				connCount++
 
 				go srv.runPeer(p)
 				if peers[c.id] != nil {
-					peers[c.id].PairPeer = p
-					srv.log.Debug("Adding p2p pair peer", "name", name, "addr", c.fd.RemoteAddr(), "peers", len(peers)+1)
+					peers[c.id].SetPairPeer(p)
+					srv.log.Debug("Adding p2p pair peer", "name", name, "addr", c.fd.RemoteAddr(), "connections", connCount)
 				} else {
 					peers[c.id] = p
-					srv.log.Debug("Adding p2p peer", "name", name, "addr", c.fd.RemoteAddr(), "peers", len(peers)+1)
+					srv.log.Debug("Adding p2p peer", "name", name, "addr", c.fd.RemoteAddr(), "connections", connCount)
 				}
 				if p.Inbound() {
 					inboundCount++
@@ -723,8 +739,8 @@ running:
 		case pd := <-srv.delpeer:
 			// A peer disconnected.
 			d := common.PrettyDuration(mclock.Now() - pd.created)
-			pd.log.Debug("Removing p2p peer", "duration", d, "peers", len(peers)-1, "req", pd.requested, "err", pd.err)
-			delete(peers, pd.ID())
+			connCount = removePeerTracking(peers, pd, connCount)
+			pd.log.Debug("Removing p2p peer", "duration", d, "connections", connCount, "req", pd.requested, "err", pd.err)
 			if pd.Inbound() {
 				inboundCount--
 			}
@@ -748,11 +764,22 @@ running:
 	// Wait for peers to shut down. Pending connections and tasks are
 	// not handled here and will terminate soon-ish because srv.quit
 	// is closed.
-	for len(peers) > 0 {
-		p := <-srv.delpeer
-		p.log.Trace("<-delpeer (spindown)", "remainingTasks", len(runningTasks))
-		delete(peers, p.ID())
+	for connCount > 0 {
+		pd := <-srv.delpeer
+		pd.log.Trace("<-delpeer (spindown)", "remainingTasks", len(runningTasks))
+		connCount = removePeerTracking(peers, pd, connCount)
 	}
+}
+
+func removePeerTracking(peers map[discover.NodeID]*Peer, pd peerDrop, connCount int) int {
+	if connCount > 0 {
+		connCount--
+	}
+	if current := peers[pd.ID()]; current == pd.Peer {
+		delete(peers, pd.ID())
+	} else if current != nil && current.ClearPairPeer(pd.Peer) {
+	}
+	return connCount
 }
 
 func (srv *Server) protoHandshakeChecks(peers map[discover.NodeID]*Peer, inboundCount int, c *conn) error {
@@ -773,7 +800,7 @@ func (srv *Server) encHandshakeChecks(peers map[discover.NodeID]*Peer, inboundCo
 		return DiscTooManyPeers
 	case peers[c.id] != nil:
 		exitPeer := peers[c.id]
-		if exitPeer.PairPeer != nil {
+		if exitPeer.PairPeer() != nil {
 			return DiscAlreadyConnected
 		}
 		return nil
@@ -841,7 +868,7 @@ func (srv *Server) listenLoop() {
 		// Reject connections that do not match NetRestrict.
 		if srv.NetRestrict != nil {
 			if tcp, ok := fd.RemoteAddr().(*net.TCPAddr); ok && !srv.NetRestrict.Contains(tcp.IP) {
-				srv.log.Debug("Rejected conn (not whitelisted in NetRestrict)", "addr", fd.RemoteAddr())
+				srv.log.Debug("Rejected conn (not allowlisted in NetRestrict)", "addr", fd.RemoteAddr())
 				fd.Close()
 				slots <- struct{}{}
 				continue
@@ -892,7 +919,17 @@ func (srv *Server) setupConn(c *conn, flags connFlag, dialDest *discover.Node) e
 		srv.log.Trace("Failed RLPx handshake", "addr", c.fd.RemoteAddr(), "conn", c.flags, "err", err)
 		return err
 	}
-	clog := srv.log.New("id", c.id, "addr", c.fd.RemoteAddr(), "conn", c.flags)
+	clog := srv.log.New("id", c.id.String(), "addr", c.fd.RemoteAddr(), "conn", c.flags)
+	if len(srv.AllowPeers) > 0 {
+		if _, ok := srv.AllowPeers[c.id]; !ok {
+			clog.Debug("Reject non-allowlisted peer")
+			return DiscNonAllowlistedPeer
+		}
+	}
+	if _, ok := srv.DenyPeers[c.id]; ok {
+		clog.Debug("Reject blacklisted peer")
+		return DiscDenylistedPeer
+	}
 	// For dialed connections, check that the remote public key matches.
 	if dialDest != nil && c.id != dialDest.ID {
 		clog.Trace("Dialed identity mismatch", "want", c, dialDest.ID)
@@ -921,7 +958,7 @@ func (srv *Server) setupConn(c *conn, flags connFlag, dialDest *discover.Node) e
 	}
 	// If the checks completed successfully, runPeer has now been
 	// launched by run.
-	clog.Trace("connection set up", "inbound", dialDest == nil)
+	clog.Debug("Setup connection")
 	return nil
 }
 
@@ -1030,12 +1067,9 @@ func (srv *Server) PeersInfo() []*PeerInfo {
 		}
 	}
 	// Sort the result array alphabetically by node identifier
-	for i := 0; i < len(infos); i++ {
-		for j := i + 1; j < len(infos); j++ {
-			if infos[i].ID > infos[j].ID {
-				infos[i], infos[j] = infos[j], infos[i]
-			}
-		}
-	}
+	slices.SortFunc(infos, func(a, b *PeerInfo) int {
+		return cmp.Compare(a.ID, b.ID)
+	})
+
 	return infos
 }

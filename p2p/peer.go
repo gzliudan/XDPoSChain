@@ -21,7 +21,7 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"sort"
+	"slices"
 	"sync"
 	"time"
 
@@ -31,6 +31,10 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/metrics"
 	"github.com/XinFinOrg/XDPoSChain/p2p/discover"
 	"github.com/XinFinOrg/XDPoSChain/rlp"
+)
+
+var (
+	ErrShuttingDown = errors.New("shutting down")
 )
 
 const (
@@ -49,8 +53,6 @@ const (
 	discMsg      = 0x01
 	pingMsg      = 0x02
 	pongMsg      = 0x03
-	getPeersMsg  = 0x04
-	peersMsg     = 0x05
 )
 
 // protoHandshake is the RLP structure of the protocol handshake.
@@ -111,8 +113,10 @@ type Peer struct {
 	disc     chan DiscReason
 
 	// events receives message send / receive events if set
-	events   *event.Feed
-	PairPeer *Peer
+	events *event.Feed
+
+	pairPeerMu sync.RWMutex
+	pairPeer   *Peer
 }
 
 // NewPeer returns a peer for testing purposes.
@@ -188,6 +192,30 @@ func (p *Peer) Log() log.Logger {
 	return p.log
 }
 
+func (p *Peer) PairPeer() *Peer {
+	p.pairPeerMu.RLock()
+	defer p.pairPeerMu.RUnlock()
+
+	return p.pairPeer
+}
+
+func (p *Peer) SetPairPeer(pair *Peer) {
+	p.pairPeerMu.Lock()
+	p.pairPeer = pair
+	p.pairPeerMu.Unlock()
+}
+
+func (p *Peer) ClearPairPeer(pair *Peer) bool {
+	p.pairPeerMu.Lock()
+	defer p.pairPeerMu.Unlock()
+
+	if p.pairPeer != pair {
+		return false
+	}
+	p.pairPeer = nil
+	return true
+}
+
 func (p *Peer) run() (remoteRequested bool, err error) {
 	var (
 		writeStart = make(chan struct{}, 1)
@@ -195,9 +223,8 @@ func (p *Peer) run() (remoteRequested bool, err error) {
 		readErr    = make(chan error, 1)
 		reason     DiscReason // sent to the peer
 	)
-	p.wg.Add(2)
-	go p.readLoop(readErr)
-	go p.pingLoop()
+	p.wg.Go(func() { p.readLoop(readErr) })
+	p.wg.Go(p.pingLoop)
 
 	// Start all protocol handlers.
 	writeStart <- struct{}{}
@@ -227,21 +254,20 @@ loop:
 			reason = discReasonForError(err)
 			break loop
 		case err = <-p.disc:
+			reason = discReasonForError(err)
 			break loop
 		}
 	}
 	close(p.closed)
 	p.rw.close(reason)
 	p.wg.Wait()
-	if p.PairPeer != nil {
-		go func() { p.PairPeer.Disconnect(DiscPairPeerStop) }()
+	if pairPeer := p.PairPeer(); pairPeer != nil {
+		go pairPeer.Disconnect(DiscPairPeerStop)
 	}
 	return remoteRequested, err
 }
 
 func (p *Peer) pingLoop() {
-	defer p.wg.Done()
-
 	ping := time.NewTimer(pingInterval)
 	defer ping.Stop()
 
@@ -264,7 +290,6 @@ func (p *Peer) pingLoop() {
 }
 
 func (p *Peer) readLoop(errc chan<- error) {
-	defer p.wg.Done()
 	for {
 		msg, err := p.rw.ReadMsg()
 		if err != nil {
@@ -329,7 +354,7 @@ func countMatchingProtocols(protocols []Protocol, caps []Cap) int {
 
 // matchProtocols creates structures for matching named subprotocols.
 func matchProtocols(protocols []Protocol, caps []Cap, rw MsgReadWriter) map[string]*protoRW {
-	sort.Sort(capsByNameAndVersion(caps))
+	slices.SortFunc(caps, Cap.Cmp)
 	offset := baseProtocolLength
 	result := make(map[string]*protoRW)
 
@@ -353,7 +378,6 @@ outer:
 }
 
 func (p *Peer) startProtocols(writeStart <-chan struct{}, writeErr chan<- error) {
-	p.wg.Add(len(p.running))
 	for _, proto := range p.running {
 		proto.closed = p.closed
 		proto.wstart = writeStart
@@ -363,8 +387,7 @@ func (p *Peer) startProtocols(writeStart <-chan struct{}, writeErr chan<- error)
 			rw = newMsgEventer(rw, p.events, p.ID(), proto.Name)
 		}
 		p.log.Trace(fmt.Sprintf("Starting protocol %s/%d", proto.Name, proto.Version))
-
-		go func() {
+		p.wg.Go(func() {
 			err := proto.Run(p, rw)
 			if err == nil {
 				p.log.Trace(fmt.Sprintf("Protocol %s/%d returned", proto.Name, proto.Version))
@@ -373,8 +396,7 @@ func (p *Peer) startProtocols(writeStart <-chan struct{}, writeErr chan<- error)
 				p.log.Trace(fmt.Sprintf("Protocol %s/%d failed", proto.Name, proto.Version), "err", err)
 			}
 			p.protoErr <- err
-			p.wg.Done()
-		}()
+		})
 	}
 }
 
@@ -416,7 +438,7 @@ func (rw *protoRW) WriteMsg(msg Msg) (err error) {
 		// as well but we don't want to rely on that.
 		rw.werr <- err
 	case <-rw.closed:
-		err = errors.New("shutting down")
+		err = ErrShuttingDown
 	}
 	return err
 }

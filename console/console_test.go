@@ -19,21 +19,26 @@ package console
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/XinFinOrg/XDPoSChain/XDCx"
 	"github.com/XinFinOrg/XDPoSChain/XDCxlending"
-
 	"github.com/XinFinOrg/XDPoSChain/common"
-	"github.com/XinFinOrg/XDPoSChain/consensus/ethash"
+	"github.com/XinFinOrg/XDPoSChain/common/hexutil"
+	"github.com/XinFinOrg/XDPoSChain/console/prompt"
 	"github.com/XinFinOrg/XDPoSChain/core"
 	"github.com/XinFinOrg/XDPoSChain/eth"
 	"github.com/XinFinOrg/XDPoSChain/eth/ethconfig"
 	"github.com/XinFinOrg/XDPoSChain/internal/jsre"
+	"github.com/XinFinOrg/XDPoSChain/miner"
 	"github.com/XinFinOrg/XDPoSChain/node"
+	"github.com/XinFinOrg/XDPoSChain/rpc"
+	"github.com/dop251/goja"
 )
 
 const (
@@ -65,13 +70,15 @@ func (p *hookedPrompter) PromptInput(prompt string) (string, error) {
 func (p *hookedPrompter) PromptPassword(prompt string) (string, error) {
 	return "", errors.New("not implemented")
 }
+
 func (p *hookedPrompter) PromptConfirm(prompt string) (bool, error) {
 	return false, errors.New("not implemented")
 }
-func (p *hookedPrompter) SetHistory(history []string)              {}
-func (p *hookedPrompter) AppendHistory(command string)             {}
-func (p *hookedPrompter) ClearHistory()                            {}
-func (p *hookedPrompter) SetWordCompleter(completer WordCompleter) {}
+
+func (p *hookedPrompter) SetHistory(history []string)                     {}
+func (p *hookedPrompter) AppendHistory(command string)                    {}
+func (p *hookedPrompter) ClearHistory()                                   {}
+func (p *hookedPrompter) SetWordCompleter(completer prompt.WordCompleter) {}
 
 // tester is a console test environment for the console tests to operate on.
 type tester struct {
@@ -95,10 +102,9 @@ func newTester(t *testing.T, confOverride func(*ethconfig.Config)) *tester {
 		t.Fatalf("failed to create node: %v", err)
 	}
 	ethConf := &ethconfig.Config{
-		Genesis:   core.DeveloperGenesisBlock(15, common.Address{}),
-		Etherbase: common.HexToAddress(testAddress),
-		Ethash: ethash.Config{
-			PowMode: ethash.ModeTest,
+		Genesis: core.DeveloperGenesisBlock(15, common.Address{}),
+		Miner: miner.Config{
+			Etherbase: common.HexToAddress(testAddress),
 		},
 	}
 	if confOverride != nil {
@@ -113,16 +119,21 @@ func newTester(t *testing.T, confOverride func(*ethconfig.Config)) *tester {
 		t.Fatalf("failed to start test stack: %v", err)
 	}
 	client := stack.Attach()
+	t.Cleanup(func() {
+		client.Close()
+	})
+
 	prompter := &hookedPrompter{scheduler: make(chan string)}
 	printer := new(bytes.Buffer)
 
 	console, err := New(Config{
-		DataDir:  stack.DataDir(),
-		DocRoot:  "testdata",
-		Client:   client,
-		Prompter: prompter,
-		Printer:  printer,
-		Preload:  []string{"preload.js"},
+		DataDir:        stack.DataDir(),
+		DocRoot:        "testdata",
+		Client:         client,
+		LocalTransport: true,
+		Prompter:       prompter,
+		Printer:        printer,
+		Preload:        []string{"preload.js"},
 	})
 	if err != nil {
 		t.Fatalf("failed to create JavaScript console: %v", err)
@@ -150,6 +161,32 @@ func (env *tester) Close(t *testing.T) {
 	os.RemoveAll(env.workspace)
 }
 
+// Tests that the node lists the correct welcome message, notably that it contains
+// the instance name, block number, data directory and supported console modules.
+func TestWelcome(t *testing.T) {
+	tester := newTester(t, nil)
+	defer tester.Close(t)
+
+	tester.console.Welcome()
+
+	output := tester.output.String()
+	if want := "Welcome"; !strings.Contains(output, want) {
+		t.Fatalf("console output missing welcome message: have\n%s\nwant also %s", output, want)
+	}
+	if want := fmt.Sprintf("instance: %s", testInstance); !strings.Contains(output, want) {
+		t.Fatalf("console output missing instance: have\n%s\nwant also %s", output, want)
+	}
+	if want := "at block: 0"; !strings.Contains(output, want) {
+		t.Fatalf("console output missing sync status: have\n%s\nwant also %s", output, want)
+	}
+	if want := fmt.Sprintf("datadir: %s", tester.workspace); !strings.Contains(output, want) {
+		t.Fatalf("console output missing datadir: have\n%s\nwant also %s", output, want)
+	}
+	if want := "modules: "; !strings.Contains(output, want) {
+		t.Fatalf("console output missing modules: have\n%s\nwant also %s", output, want)
+	}
+}
+
 // Tests that JavaScript statement evaluation works as intended.
 func TestEvaluate(t *testing.T) {
 	tester := newTester(t, nil)
@@ -158,6 +195,167 @@ func TestEvaluate(t *testing.T) {
 	tester.console.Evaluate("2 + 2")
 	if output := tester.output.String(); !strings.Contains(output, "4") {
 		t.Fatalf("statement evaluation failed: have %s, want %s", output, "4")
+	}
+}
+
+type debugPrintAndSetHeadRPC struct{}
+
+func (debugPrintAndSetHeadRPC) PrintBlock(uint64) (string, error) {
+	return "ok", nil
+}
+
+func (debugPrintAndSetHeadRPC) SetHead(hexutil.Uint64) error {
+	return nil
+}
+
+func TestConsoleHidesUnavailableDebugSetHead(t *testing.T) {
+	t.Run("hidden on remote transport", func(t *testing.T) {
+		console := newRPCConsole(t, debugPrintAndSetHeadRPC{}, false)
+		defer stopConsole(t, console)
+		assertDebugSetHeadVisible(t, console, false)
+		assertDebugSetHeadCompletion(t, console, false)
+		assertDebugSetHeadEnumerated(t, console, false)
+		assertDebugSetHeadPrettyPrinted(t, console, false)
+	})
+
+	t.Run("kept on local transport", func(t *testing.T) {
+		console := newRPCConsole(t, debugPrintAndSetHeadRPC{}, true)
+		defer stopConsole(t, console)
+		assertDebugSetHeadVisible(t, console, true)
+		assertDebugSetHeadCompletion(t, console, true)
+		assertDebugSetHeadEnumerated(t, console, true)
+		assertDebugSetHeadPrettyPrinted(t, console, true)
+	})
+}
+
+func newRPCConsole(t *testing.T, debugService interface{}, localTransport bool) *Console {
+	t.Helper()
+
+	server := rpc.NewServer()
+	if err := server.RegisterName("debug", debugService); err != nil {
+		t.Fatalf("failed to register debug service: %v", err)
+	}
+	client := rpc.DialInProc(server)
+	t.Cleanup(func() {
+		client.Close()
+	})
+
+	console, err := New(Config{
+		DataDir:        t.TempDir(),
+		DocRoot:        "testdata",
+		Client:         client,
+		LocalTransport: localTransport,
+		Printer:        new(bytes.Buffer),
+	})
+	if err != nil {
+		t.Fatalf("failed to create console: %v", err)
+	}
+	return console
+}
+
+func stopConsole(t *testing.T, console *Console) {
+	t.Helper()
+	if err := console.Stop(false); err != nil {
+		t.Fatalf("failed to stop console: %v", err)
+	}
+}
+
+func assertDebugSetHeadVisible(t *testing.T, console *Console, want bool) {
+	t.Helper()
+
+	console.jsre.Do(func(vm *goja.Runtime) {
+		debug := getObject(vm, "debug")
+		if debug == nil {
+			t.Fatal("debug object is not available")
+		}
+		got := !goja.IsUndefined(debug.Get("setHead"))
+		if got != want {
+			t.Fatalf("unexpected debug.setHead visibility: got %v want %v", got, want)
+		}
+	})
+}
+
+func assertDebugSetHeadCompletion(t *testing.T, console *Console, want bool) {
+	t.Helper()
+
+	tests := []struct {
+		input string
+		want  []string
+	}{
+		{input: "debug.setH", want: []string{"debug.setHead", "debug.setHead(", "debug.setHead."}},
+		{input: "debug.setHead", want: []string{"debug.setHead", "debug.setHead(", "debug.setHead."}},
+		{input: "web3.debug.setH", want: []string{"web3.debug.setHead", "web3.debug.setHead(", "web3.debug.setHead."}},
+		{input: "web3.debug.setHead", want: []string{"web3.debug.setHead", "web3.debug.setHead(", "web3.debug.setHead."}},
+	}
+	for _, test := range tests {
+		_, completions, _ := console.AutoCompleteInput(test.input, len(test.input))
+		got := false
+		for _, completion := range completions {
+			if slices.Contains(test.want, completion) {
+				got = true
+				break
+			}
+		}
+		if got != want {
+			t.Fatalf("unexpected debug.setHead completion visibility for %q: got %v want %v (completions=%v)", test.input, got, want, completions)
+		}
+	}
+}
+
+func assertDebugSetHeadEnumerated(t *testing.T, console *Console, want bool) {
+	t.Helper()
+
+	console.jsre.Do(func(vm *goja.Runtime) {
+		keys := getObject(vm, "Object")
+		if keys == nil {
+			t.Fatal("Object is not available")
+		}
+		keysFunc, ok := goja.AssertFunction(keys.Get("keys"))
+		if !ok {
+			t.Fatal("Object.keys is not available")
+		}
+		debug := getObject(vm, "debug")
+		if debug == nil {
+			t.Fatal("debug object is not available")
+		}
+		rv, err := keysFunc(goja.Undefined(), debug)
+		if err != nil {
+			t.Fatalf("Object.keys(debug) failed: %v", err)
+		}
+		got := false
+		switch keys := rv.Export().(type) {
+		case []any:
+			for _, key := range keys {
+				if key.(string) == "setHead" {
+					got = true
+					break
+				}
+			}
+		case []string:
+			if slices.Contains(keys, "setHead") {
+				got = true
+			}
+		default:
+			t.Fatalf("Object.keys(debug) returned unexpected type %T", keys)
+		}
+		if got != want {
+			t.Fatalf("unexpected debug.setHead enumeration visibility: got %v want %v", got, want)
+		}
+	})
+}
+
+func assertDebugSetHeadPrettyPrinted(t *testing.T, console *Console, want bool) {
+	t.Helper()
+
+	printer, ok := console.printer.(*bytes.Buffer)
+	if !ok {
+		t.Fatal("console printer is not a bytes.Buffer")
+	}
+	printer.Reset()
+	console.Evaluate("debug")
+	got := strings.Contains(printer.String(), "setHead")
+	if got != want {
+		t.Fatalf("unexpected debug.setHead pretty-print visibility: got %v want %v output=%q", got, want, printer.String())
 	}
 }
 
@@ -203,19 +401,6 @@ func TestPreload(t *testing.T) {
 	}
 }
 
-// Tests that JavaScript scripts can be executes from the configured asset path.
-func TestExecute(t *testing.T) {
-	tester := newTester(t, nil)
-	defer tester.Close(t)
-
-	tester.console.Execute("exec.js")
-
-	tester.console.Evaluate("execed")
-	if output := tester.output.String(); !strings.Contains(output, "some-executed-string") {
-		t.Fatalf("execed variable missing: have %s, want %s", output, "some-executed-string")
-	}
-}
-
 // Tests that the JavaScript objects returned by statement executions are properly
 // pretty printed instead of just displaing "[object]".
 func TestPrettyPrint(t *testing.T) {
@@ -254,7 +439,7 @@ func TestPrettyError(t *testing.T) {
 	defer tester.Close(t)
 	tester.console.Evaluate("throw 'hello'")
 
-	want := jsre.ErrorColor("hello") + "\n\tat <eval>:1:7(1)\n\n"
+	want := jsre.ErrorColor("hello") + "\n\tat <eval>:1:1(1)\n\n"
 	if output := tester.output.String(); output != want {
 		t.Fatalf("pretty error mismatch: have %s, want %s", output, want)
 	}

@@ -25,11 +25,12 @@ import (
 	"math/big"
 	"reflect"
 	"testing"
-	"time"
 
 	"github.com/XinFinOrg/XDPoSChain/common"
 	"github.com/XinFinOrg/XDPoSChain/crypto"
+	"github.com/XinFinOrg/XDPoSChain/params"
 	"github.com/XinFinOrg/XDPoSChain/rlp"
+	"github.com/holiman/uint256"
 )
 
 // The values in those tests are from the Transaction Tests
@@ -72,6 +73,7 @@ var (
 	)
 )
 
+// TestDecodeEmptyTypedTx tests decode empty typed tx.
 func TestDecodeEmptyTypedTx(t *testing.T) {
 	input := []byte{0x80}
 	var tx Transaction
@@ -81,6 +83,7 @@ func TestDecodeEmptyTypedTx(t *testing.T) {
 	}
 }
 
+// TestTransactionSigHash tests transaction sig hash.
 func TestTransactionSigHash(t *testing.T) {
 	var homestead HomesteadSigner
 	if homestead.Hash(emptyTx) != common.HexToHash("c775b99e7ad12f50d819fcd602390467e28141316969f4b57f0626f74fe3b386") {
@@ -91,6 +94,7 @@ func TestTransactionSigHash(t *testing.T) {
 	}
 }
 
+// TestTransactionEncode tests transaction encode.
 func TestTransactionEncode(t *testing.T) {
 	txb, err := rlp.EncodeToBytes(rightvrsTx)
 	if err != nil {
@@ -102,6 +106,7 @@ func TestTransactionEncode(t *testing.T) {
 	}
 }
 
+// TestEIP2718TransactionSigHash tests eip 2718 transaction sig hash.
 func TestEIP2718TransactionSigHash(t *testing.T) {
 	s := NewEIP2930Signer(big.NewInt(1))
 	if s.Hash(emptyEip2718Tx) != common.HexToHash("49b486f0ec0a60dfbbca2d30cb07c9e8ffb2a2ff41f29a1ab6737475f6ff69f3") {
@@ -188,6 +193,7 @@ func TestEIP2930Signer(t *testing.T) {
 	}
 }
 
+// TestEIP2718TransactionEncode tests eip 2718 transaction encode.
 func TestEIP2718TransactionEncode(t *testing.T) {
 	// RLP representation
 	{
@@ -226,6 +232,7 @@ func defaultTestKey() (*ecdsa.PrivateKey, common.Address) {
 	return key, addr
 }
 
+// TestRecipientEmpty tests recipient empty.
 func TestRecipientEmpty(t *testing.T) {
 	_, addr := defaultTestKey()
 	tx, err := decodeTx(common.Hex2Bytes("f8498080808080011ca09b16de9d5bdee2cf56c28d16275a4da68cd30273e2525f3959f5d62557489921a0372ebd8fb3345f7db7b5a86d42e24d36e983e259b0664ceb8c227ec9af572f3d"))
@@ -242,6 +249,7 @@ func TestRecipientEmpty(t *testing.T) {
 	}
 }
 
+// TestRecipientNormal tests recipient normal.
 func TestRecipientNormal(t *testing.T) {
 	_, addr := defaultTestKey()
 
@@ -260,76 +268,7 @@ func TestRecipientNormal(t *testing.T) {
 	}
 }
 
-// Tests that transactions can be correctly sorted according to their price in
-// decreasing order, but at the same time with increasing nonces when issued by
-// the same account.
-func TestTransactionPriceNonceSort(t *testing.T) {
-	// Generate a batch of accounts to start with
-	keys := make([]*ecdsa.PrivateKey, 25)
-	for i := 0; i < len(keys); i++ {
-		keys[i], _ = crypto.GenerateKey()
-	}
-
-	signer := HomesteadSigner{}
-	// Generate a batch of transactions with overlapping values, but shifted nonces
-	groups := map[common.Address]Transactions{}
-	for start, key := range keys {
-		addr := crypto.PubkeyToAddress(key.PublicKey)
-		for i := 0; i < 25; i++ {
-			tx, _ := SignTx(NewTransaction(uint64(start+i), common.Address{}, big.NewInt(100), 100, big.NewInt(int64(start+i)), nil), signer, key)
-			groups[addr] = append(groups[addr], tx)
-		}
-	}
-	// Sort the transactions and cross check the nonce ordering
-	txset, _ := NewTransactionsByPriceAndNonce(signer, groups, nil, map[common.Address]*big.Int{})
-
-	txs := Transactions{}
-	for tx := txset.Peek(); tx != nil; tx = txset.Peek() {
-		txs = append(txs, tx)
-		txset.Shift()
-	}
-	if len(txs) != 25*25 {
-		t.Errorf("expected %d transactions, found %d", 25*25, len(txs))
-	}
-	for i, txi := range txs {
-		fromi, _ := Sender(signer, txi)
-
-		// Make sure the nonce order is valid
-		for j, txj := range txs[i+1:] {
-			fromj, _ := Sender(signer, txj)
-
-			if fromi == fromj && txi.Nonce() > txj.Nonce() {
-				t.Errorf("invalid nonce ordering: tx #%d (A=%x N=%v) < tx #%d (A=%x N=%v)", i, fromi[:4], txi.Nonce(), i+j, fromj[:4], txj.Nonce())
-			}
-		}
-		// Find the previous and next nonce of this account
-		prev, next := i-1, i+1
-		for j := i - 1; j >= 0; j-- {
-			if fromj, _ := Sender(signer, txs[j]); fromi == fromj {
-				prev = j
-				break
-			}
-		}
-		for j := i + 1; j < len(txs); j++ {
-			if fromj, _ := Sender(signer, txs[j]); fromi == fromj {
-				next = j
-				break
-			}
-		}
-		// Make sure that in between the neighbor nonces, the transaction is correctly positioned price wise
-		for j := prev + 1; j < next; j++ {
-			fromj, _ := Sender(signer, txs[j])
-			if j < i && txs[j].GasPrice().Cmp(txi.GasPrice()) < 0 {
-				t.Errorf("invalid gasprice ordering: tx #%d (A=%x P=%v) < tx #%d (A=%x P=%v)", j, fromj[:4], txs[j].GasPrice(), i, fromi[:4], txi.GasPrice())
-			}
-			if j > i && txs[j].GasPrice().Cmp(txi.GasPrice()) > 0 {
-				t.Errorf("invalid gasprice ordering: tx #%d (A=%x P=%v) > tx #%d (A=%x P=%v)", j, fromj[:4], txs[j].GasPrice(), i, fromi[:4], txi.GasPrice())
-			}
-		}
-	}
-}
-
-// TestTransactionJSON tests serializing/de-serializing to/from JSON.
+// TestTransactionJSON tests transaction json.
 func TestTransactionJSON(t *testing.T) {
 	key, err := crypto.GenerateKey()
 	if err != nil {
@@ -371,55 +310,7 @@ func TestTransactionJSON(t *testing.T) {
 	}
 }
 
-// Tests that if multiple transactions have the same price, the ones seen earlier
-// are prioritized to avoid network spam attacks aiming for a specific ordering.
-func TestTransactionTimeSort(t *testing.T) {
-	// Generate a batch of accounts to start with
-	keys := make([]*ecdsa.PrivateKey, 5)
-	for i := 0; i < len(keys); i++ {
-		keys[i], _ = crypto.GenerateKey()
-	}
-	signer := HomesteadSigner{}
-
-	// Generate a batch of transactions with overlapping prices, but different creation times
-	groups := map[common.Address]Transactions{}
-	for start, key := range keys {
-		addr := crypto.PubkeyToAddress(key.PublicKey)
-
-		tx, _ := SignTx(NewTransaction(0, common.Address{}, big.NewInt(100), 100, big.NewInt(1), nil), signer, key)
-		tx.time = time.Unix(0, int64(len(keys)-start))
-
-		groups[addr] = append(groups[addr], tx)
-	}
-	// Sort the transactions and cross check the nonce ordering
-	txset, _ := NewTransactionsByPriceAndNonce(signer, groups, nil, map[common.Address]*big.Int{})
-
-	txs := Transactions{}
-	for tx := txset.Peek(); tx != nil; tx = txset.Peek() {
-		txs = append(txs, tx)
-		txset.Shift()
-	}
-	if len(txs) != len(keys) {
-		t.Errorf("expected %d transactions, found %d", len(keys), len(txs))
-	}
-	for i, txi := range txs {
-		fromi, _ := Sender(signer, txi)
-		if i+1 < len(txs) {
-			next := txs[i+1]
-			fromNext, _ := Sender(signer, next)
-
-			if txi.GasPrice().Cmp(next.GasPrice()) < 0 {
-				t.Errorf("invalid gasprice ordering: tx #%d (A=%x P=%v) < tx #%d (A=%x P=%v)", i, fromi[:4], txi.GasPrice(), i+1, fromNext[:4], next.GasPrice())
-			}
-			// Make sure time order is ascending if the txs have the same gas price
-			if txi.GasPrice().Cmp(next.GasPrice()) == 0 && txi.time.After(next.time) {
-				t.Errorf("invalid received time ordering: tx #%d (A=%x T=%v) > tx #%d (A=%x T=%v)", i, fromi[:4], txi.time, i+1, fromNext[:4], next.time)
-			}
-		}
-	}
-}
-
-// TestTransactionCoding tests serializing/de-serializing to/from rlp and JSON.
+// TestTransactionCoding tests transaction coding.
 func TestTransactionCoding(t *testing.T) {
 	key, err := crypto.GenerateKey()
 	if err != nil {
@@ -540,4 +431,412 @@ func assertEqual(orig *Transaction, cpy *Transaction) error {
 		}
 	}
 	return nil
+}
+
+// TestTransactionSizes tests transaction sizes.
+func TestTransactionSizes(t *testing.T) {
+	signer := NewLondonSigner(big.NewInt(123))
+	key, _ := crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
+	to := common.HexToAddress("0x01")
+	for i, txdata := range []TxData{
+		&AccessListTx{
+			ChainID:  big.NewInt(123),
+			Nonce:    0,
+			To:       nil,
+			Value:    big.NewInt(1000),
+			Gas:      21000,
+			GasPrice: big.NewInt(100000),
+		},
+		&LegacyTx{
+			Nonce:    1,
+			GasPrice: big.NewInt(500),
+			Gas:      1000000,
+			To:       &to,
+			Value:    big.NewInt(1),
+		},
+		&AccessListTx{
+			ChainID:  big.NewInt(123),
+			Nonce:    1,
+			GasPrice: big.NewInt(500),
+			Gas:      1000000,
+			To:       &to,
+			Value:    big.NewInt(1),
+			AccessList: AccessList{
+				AccessTuple{
+					Address:     common.HexToAddress("0x01"),
+					StorageKeys: []common.Hash{common.HexToHash("0x01")},
+				}},
+		},
+		&DynamicFeeTx{
+			ChainID:   big.NewInt(123),
+			Nonce:     1,
+			Gas:       1000000,
+			To:        &to,
+			Value:     big.NewInt(1),
+			GasTipCap: big.NewInt(500),
+			GasFeeCap: big.NewInt(500),
+		},
+	} {
+		tx, err := SignNewTx(key, signer, txdata)
+		if err != nil {
+			t.Fatalf("test %d: %v", i, err)
+		}
+		bin, _ := tx.MarshalBinary()
+
+		// Check initial calc
+		if have, want := int(tx.Size()), len(bin); have != want {
+			t.Errorf("test %d: size wrong, have %d want %d", i, have, want)
+		}
+		// Check cached version too
+		if have, want := int(tx.Size()), len(bin); have != want {
+			t.Errorf("test %d: (cached) size wrong, have %d want %d", i, have, want)
+		}
+		// Check unmarshalled version too
+		utx := new(Transaction)
+		if err := utx.UnmarshalBinary(bin); err != nil {
+			t.Fatalf("test %d: failed to unmarshal tx: %v", i, err)
+		}
+		if have, want := int(utx.Size()), len(bin); have != want {
+			t.Errorf("test %d: (unmarshalled) size wrong, have %d want %d", i, have, want)
+		}
+	}
+}
+
+// BenchmarkEffectiveGasTipCmp benchmarks effective gas tip cmp.
+func BenchmarkEffectiveGasTipCmp(b *testing.B) {
+	signer := LatestSigner(params.TestChainConfig)
+	key, _ := crypto.GenerateKey()
+	txdata := &DynamicFeeTx{
+		ChainID:   big.NewInt(1),
+		Nonce:     0,
+		GasTipCap: big.NewInt(2000000000),
+		GasFeeCap: big.NewInt(3000000000),
+		Gas:       21000,
+		To:        &common.Address{},
+		Value:     big.NewInt(0),
+		Data:      nil,
+	}
+	tx, _ := SignNewTx(key, signer, txdata)
+	other, _ := SignNewTx(key, signer, txdata)
+	baseFee := uint256.NewInt(1000000000) // 1 gwei
+
+	b.Run("Original", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			tx.EffectiveGasTipCmp(other, baseFee)
+		}
+	})
+}
+
+// TestLatestSignerUsesModernSignerForXDPoSMockChainConfig tests latest signer uses modern signer for xd po s mock chain config.
+func TestLatestSignerUsesModernSignerForXDPoSMockChainConfig(t *testing.T) {
+	signer := LatestSigner(params.TestXDPoSMockChainConfig)
+	if _, ok := signer.(pragueSigner); !ok {
+		t.Fatalf("unexpected signer type %T, want pragueSigner for TestXDPoSMockChainConfig", signer)
+	}
+}
+
+// TestLatestSignerNilConfigPanics tests latest signer fails fast for nil config.
+func TestLatestSignerNilConfigPanics(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected panic for nil config")
+		}
+	}()
+	LatestSigner(nil)
+
+}
+
+// TestMakeSignerNilConfigPanics tests make signer fails fast for nil config.
+func TestMakeSignerNilConfigPanics(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected panic for nil config")
+		}
+	}()
+	MakeSigner(nil, big.NewInt(0))
+}
+
+// TestEffectiveGasTipIntCmpMatchesBigIntSemantics tests effective gas tip int cmp matches big int semantics.
+func TestEffectiveGasTipIntCmpMatchesBigIntSemantics(t *testing.T) {
+	tests := []struct {
+		name     string
+		tipCap   int64
+		feeCap   int64
+		baseFee  *uint256.Int
+		otherTip uint64
+	}{
+		{
+			name:     "nil base fee",
+			tipCap:   20,
+			feeCap:   100,
+			baseFee:  nil,
+			otherTip: 10,
+		},
+		{
+			name:     "regular effective tip",
+			tipCap:   20,
+			feeCap:   100,
+			baseFee:  uint256.NewInt(50),
+			otherTip: 19,
+		},
+		{
+			name:     "fee cap below base fee",
+			tipCap:   20,
+			feeCap:   40,
+			baseFee:  uint256.NewInt(50),
+			otherTip: 1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tx := NewTx(&DynamicFeeTx{
+				ChainID:   big.NewInt(1),
+				Nonce:     0,
+				GasTipCap: big.NewInt(tc.tipCap),
+				GasFeeCap: big.NewInt(tc.feeCap),
+				Gas:       21000,
+				To:        &common.Address{},
+				Value:     big.NewInt(0),
+			})
+			other := uint256.NewInt(tc.otherTip)
+
+			got := tx.EffectiveGasTipIntCmp(other, tc.baseFee)
+
+			var want int
+			if tc.baseFee == nil {
+				want = tx.GasTipCapIntCmp(other.ToBig())
+			} else {
+				want = tx.EffectiveGasTipValue(tc.baseFee.ToBig()).Cmp(other.ToBig())
+			}
+
+			if got != want {
+				t.Fatalf("unexpected comparison result: got %d, want %d", got, want)
+			}
+		})
+	}
+}
+
+// TestEffectiveGasTipNilBaseFeeReturnsTipCap tests effective gas tip nil base fee returns tip cap.
+func TestEffectiveGasTipNilBaseFeeReturnsTipCap(t *testing.T) {
+	tx := NewTx(&DynamicFeeTx{
+		ChainID:   big.NewInt(1),
+		Nonce:     0,
+		GasTipCap: big.NewInt(20),
+		GasFeeCap: big.NewInt(1),
+		Gas:       21000,
+		To:        &common.Address{},
+		Value:     big.NewInt(0),
+	})
+
+	tip, err := tx.EffectiveGasTip(nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if tip.Cmp(big.NewInt(20)) != 0 {
+		t.Fatalf("unexpected effective tip: got %v, want %v", tip, 20)
+	}
+}
+
+// TestCalcEffectiveGasTipClearsDstOnFeeCapBelowBaseFee tests calc effective gas tip clears dst on fee cap below base fee.
+func TestCalcEffectiveGasTipClearsDstOnFeeCapBelowBaseFee(t *testing.T) {
+	tx := NewTx(&DynamicFeeTx{
+		ChainID:   big.NewInt(1),
+		Nonce:     0,
+		GasTipCap: big.NewInt(20),
+		GasFeeCap: big.NewInt(40),
+		Gas:       21000,
+		To:        &common.Address{},
+		Value:     big.NewInt(0),
+	})
+	dst := uint256.NewInt(123)
+
+	err := tx.calcEffectiveGasTip(dst, uint256.NewInt(50))
+	if !errors.Is(err, ErrGasFeeCapTooLow) {
+		t.Fatalf("unexpected error: got %v, want %v", err, ErrGasFeeCapTooLow)
+	}
+	if dst.Sign() != 0 {
+		t.Fatalf("expected dst to be cleared on error, got %v", dst)
+	}
+}
+
+// TestIsNonEVMTx tests the IsNonEVMTx method to ensure it correctly identifies
+// transactions that are handled by native code rather than EVM execution.
+func TestIsNonEVMTx(t *testing.T) {
+	tests := []struct {
+		name     string
+		tx       *Transaction
+		expected bool
+	}{
+		{
+			name:     "nil transaction",
+			tx:       nil,
+			expected: false,
+		},
+		{
+			name:     "contract creation (nil to)",
+			expected: false,
+		},
+		{
+			name: "regular transaction",
+			tx: NewTransaction(
+				0,
+				common.HexToAddress("0x1234567890123456789012345678901234567890"),
+				big.NewInt(0),
+				0,
+				big.NewInt(0),
+				nil,
+			),
+			expected: false,
+		},
+		{
+			name: "BlockSignersBinary transaction",
+			tx: NewTransaction(
+				0,
+				common.BlockSignersBinary,
+				big.NewInt(0),
+				0,
+				big.NewInt(0),
+				nil,
+			),
+			expected: true,
+		},
+		{
+			name: "XDCXAddrBinary transaction",
+			tx: NewTransaction(
+				0,
+				common.XDCXAddrBinary,
+				big.NewInt(0),
+				0,
+				big.NewInt(0),
+				nil,
+			),
+			expected: true,
+		},
+		{
+			name: "TradingStateAddrBinary transaction",
+			tx: NewTransaction(
+				0,
+				common.TradingStateAddrBinary,
+				big.NewInt(0),
+				0,
+				big.NewInt(0),
+				nil,
+			),
+			expected: true,
+		},
+		{
+			name: "XDCXLendingAddressBinary transaction",
+			tx: NewTransaction(
+				0,
+				common.XDCXLendingAddressBinary,
+				big.NewInt(0),
+				0,
+				big.NewInt(0),
+				nil,
+			),
+			expected: true,
+		},
+		{
+			name: "XDCXLendingFinalizedTradeAddressBinary transaction",
+			tx: NewTransaction(
+				0,
+				common.XDCXLendingFinalizedTradeAddressBinary,
+				big.NewInt(0),
+				0,
+				big.NewInt(0),
+				nil,
+			),
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Handle the contract creation case separately
+			var tx *Transaction
+			if tt.name == "contract creation (nil to)" {
+				tx = NewContractCreation(0, big.NewInt(0), 0, big.NewInt(0), nil)
+			} else {
+				tx = tt.tx
+			}
+
+			result := tx.IsNonEVMTx()
+			if result != tt.expected {
+				t.Errorf("IsNonEVMTx() = %v, want %v", result, tt.expected)
+			}
+		})
+	}
+}
+
+// TestApplyTransactionClassifiersRequireConfiguredSystemAddresses tests apply
+// transaction classifiers require the configured non-zero target address.
+func TestApplyTransactionClassifiersRequireConfiguredSystemAddresses(t *testing.T) {
+	tests := []struct {
+		name        string
+		method      string
+		setConfig   func(*params.ChainConfig, common.Address)
+		classify    func(*Transaction, *params.ChainConfig) bool
+		addressName string
+		address     common.Address
+	}{
+		{
+			name:   "XDCX",
+			method: common.XDCXApplyMethod,
+			setConfig: func(config *params.ChainConfig, address common.Address) {
+				config.XDCXListingSMC = address
+			},
+			classify:    (*Transaction).IsXDCXApplyTransaction,
+			addressName: "XDCXListingSMC",
+			address:     common.HexToAddress("0x1000000000000000000000000000000000000001"),
+		},
+		{
+			name:   "XDCZ",
+			method: common.XDCZApplyMethod,
+			setConfig: func(config *params.ChainConfig, address common.Address) {
+				config.TRC21IssuerSMC = address
+			},
+			classify:    (*Transaction).IsXDCZApplyTransaction,
+			addressName: "TRC21IssuerSMC",
+			address:     common.HexToAddress("0x2000000000000000000000000000000000000002"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data := append(common.FromHex(tt.method), make([]byte, 32)...)
+			zeroAddressTx := NewTransaction(
+				0,
+				common.Address{},
+				big.NewInt(0),
+				21000,
+				big.NewInt(1),
+				data,
+			)
+
+			if tt.classify(zeroAddressTx, nil) {
+				t.Fatalf("expected nil config to not classify zero-address transaction as %s apply", tt.name)
+			}
+
+			zeroConfig := &params.ChainConfig{}
+			if tt.classify(zeroAddressTx, zeroConfig) {
+				t.Fatalf("expected zero %s address to not classify zero-address transaction as %s apply", tt.addressName, tt.name)
+			}
+
+			config := &params.ChainConfig{}
+			tt.setConfig(config, tt.address)
+			matchingTx := NewTransaction(
+				0,
+				tt.address,
+				big.NewInt(0),
+				21000,
+				big.NewInt(1),
+				data,
+			)
+			if !tt.classify(matchingTx, config) {
+				t.Fatalf("expected non-zero configured %s to match %s apply transaction", tt.addressName, tt.name)
+			}
+		})
+	}
 }

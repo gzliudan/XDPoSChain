@@ -133,14 +133,14 @@ func testSendTransactions(t *testing.T, protocol int) {
 	const txsize = txsyncPackSize / 10
 	alltxs := make([]*types.Transaction, 100)
 	for nonce := range alltxs {
-		alltxs[nonce] = newTestTransaction(testAccount, uint64(nonce), txsize)
+		tx := newTestTransaction(testAccount, uint64(nonce), txsize)
+		alltxs[nonce] = tx
 	}
-	pm.txpool.AddRemotes(alltxs)
+	pm.txpool.Add(alltxs, false)
 
 	// Connect several peers. They should all receive the pending transactions.
 	var wg sync.WaitGroup
 	checktxs := func(p *testPeer) {
-		defer wg.Done()
 		defer p.close()
 		seen := make(map[common.Hash]bool)
 		for _, tx := range alltxs {
@@ -172,9 +172,10 @@ func testSendTransactions(t *testing.T, protocol int) {
 		}
 	}
 	for i := 0; i < 3; i++ {
-		p, _ := newTestPeer(fmt.Sprintf("peer #%d", i), protocol, pm, true)
-		wg.Add(1)
-		go checktxs(p)
+		wg.Go(func() {
+			p, _ := newTestPeer(fmt.Sprintf("peer #%d", i), protocol, pm, true)
+			checktxs(p)
+		})
 	}
 	wg.Wait()
 }

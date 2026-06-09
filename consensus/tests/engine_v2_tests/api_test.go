@@ -13,6 +13,7 @@ import (
 )
 
 func TestGetMissedRoundsInEpochByBlockNumOnlyForV2Consensus(t *testing.T) {
+	skipLongInShortMode(t)
 	_, bc, _, _, _ := PrepareXDCTestBlockChainWith128Candidates(t, 1802, params.TestXDPoSMockChainConfig)
 
 	engine := bc.BlockChain().Engine().(*XDPoS.XDPoS)
@@ -25,6 +26,7 @@ func TestGetMissedRoundsInEpochByBlockNumOnlyForV2Consensus(t *testing.T) {
 }
 
 func TestGetMissedRoundsInEpochByBlockNumReturnEmptyForV2(t *testing.T) {
+	skipLongInShortMode(t)
 	_, bc, cb, _, _ := PrepareXDCTestBlockChainWith128Candidates(t, 1802, params.TestXDPoSMockChainConfig)
 
 	engine := bc.BlockChain().Engine().(*XDPoS.XDPoS)
@@ -57,6 +59,7 @@ func TestGetMissedRoundsInEpochByBlockNumReturnEmptyForV2(t *testing.T) {
 }
 
 func TestGetMissedRoundsInEpochByBlockNumReturnEmptyForV2FistEpoch(t *testing.T) {
+	skipLongInShortMode(t)
 	_, bc, _, _, _ := PrepareXDCTestBlockChainWith128Candidates(t, 1802, params.TestXDPoSMockChainConfig)
 
 	engine := bc.BlockChain().Engine().(*XDPoS.XDPoS)
@@ -71,6 +74,7 @@ func TestGetMissedRoundsInEpochByBlockNumReturnEmptyForV2FistEpoch(t *testing.T)
 }
 
 func TestGetMissedRoundsInEpochByBlockNum(t *testing.T) {
+	skipLongInShortMode(t)
 	blockchain, bc, currentBlock, signer, signFn := PrepareXDCTestBlockChainWith128Candidates(t, 1802, params.TestXDPoSMockChainConfig)
 	chainConfig := params.TestXDPoSMockChainConfig
 	engine := bc.BlockChain().Engine().(*XDPoS.XDPoS)
@@ -86,7 +90,7 @@ func TestGetMissedRoundsInEpochByBlockNum(t *testing.T) {
 	}
 
 	// Update Signer as there is no previous signer assigned
-	err = UpdateSigner(blockchain)
+	blockchain.UpdateM1()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,6 +116,7 @@ func TestGetMissedRoundsInEpochByBlockNum(t *testing.T) {
 }
 
 func TestGetEpochNumbersBetween(t *testing.T) {
+	skipLongInShortMode(t)
 	_, bc, _, _, _ := PrepareXDCTestBlockChainWith128Candidates(t, 1802, params.TestXDPoSMockChainConfig)
 
 	engine := bc.BlockChain().Engine().(*XDPoS.XDPoS)
@@ -158,7 +163,7 @@ func TestGetEpochNumbersBetween(t *testing.T) {
 	numbers, err = engine.APIs(bc.BlockChain())[0].Service.(*XDPoS.API).GetEpochNumbersBetween(&begin, &end)
 
 	assert.Nil(t, numbers)
-	assert.EqualError(t, err, "illegal end block number")
+	assert.EqualError(t, err, "illegal end block number 1803")
 
 	// 1803 not exist
 	begin = rpc.BlockNumber(1803)
@@ -166,17 +171,18 @@ func TestGetEpochNumbersBetween(t *testing.T) {
 	numbers, err = engine.APIs(bc.BlockChain())[0].Service.(*XDPoS.API).GetEpochNumbersBetween(&begin, &end)
 
 	assert.Nil(t, numbers)
-	assert.EqualError(t, err, "illegal begin block number")
+	assert.EqualError(t, err, "illegal begin block number 1803")
 }
 func TestGetBlockByEpochNumber(t *testing.T) {
+	skipLongInShortMode(t)
 	blockchain, _, currentBlock, signer, signFn := PrepareXDCTestBlockChainWithPenaltyForV2Engine(t, 1802, params.TestXDPoSMockChainConfig)
 
 	blockCoinBase := "0x111000000000000000000000000000000123"
-	largeRound := int64(1802)
+	largeRound := int64(1800)
 	newBlock := CreateBlock(blockchain, params.TestXDPoSMockChainConfig, currentBlock, int(currentBlock.NumberU64())+1, largeRound, blockCoinBase, signer, signFn, nil, nil, currentBlock.Header().Root.Hex())
 	err := blockchain.InsertBlock(newBlock)
 	assert.Nil(t, err)
-	largeRound2 := int64(3603)
+	largeRound2 := int64(3600)
 	newBlock2 := CreateBlock(blockchain, params.TestXDPoSMockChainConfig, newBlock, int(newBlock.NumberU64())+1, largeRound2, blockCoinBase, signer, signFn, nil, nil, newBlock.Header().Root.Hex())
 	err = blockchain.InsertBlock(newBlock2)
 	assert.Nil(t, err)
@@ -189,9 +195,9 @@ func TestGetBlockByEpochNumber(t *testing.T) {
 	// 1800,900,2 (2nd epoch switch block)
 	// 1801,901,2
 	// 1802,902,2
-	// 1803,1802,3 (epoch switch)
+	// 1803,1800,3 (epoch switch)
 	// epoch 4 has no block
-	// 1804,3603,5 (epoch switch)
+	// 1804,3600,5 (epoch switch)
 	engine := blockchain.Engine().(*XDPoS.XDPoS)
 
 	// init the snapshot, otherwise getEpochSwitchInfo would return error
@@ -200,19 +206,22 @@ func TestGetBlockByEpochNumber(t *testing.T) {
 	assert.Nil(t, err)
 
 	info, err := engine.APIs(blockchain)[0].Service.(*XDPoS.API).GetBlockInfoByEpochNum(0)
-	assert.NotNil(t, err)
-	assert.Nil(t, info)
+	assert.Equal(t, info.EpochConsensusVersion, "v1")
+	assert.Nil(t, err)
 
 	info, err = engine.APIs(blockchain)[0].Service.(*XDPoS.API).GetBlockInfoByEpochNum(1)
-	assert.Equal(t, info.EpochRound, types.Round(1))
+	assert.Equal(t, *info.EpochRound, types.Round(1))
+	assert.Equal(t, info.EpochConsensusVersion, "v2")
 	assert.Nil(t, err)
 
 	info, err = engine.APIs(blockchain)[0].Service.(*XDPoS.API).GetBlockInfoByEpochNum(2)
-	assert.Equal(t, info.EpochRound, types.Round(900))
+	assert.Equal(t, *info.EpochRound, types.Round(900))
+	assert.Equal(t, info.EpochConsensusVersion, "v2")
 	assert.Nil(t, err)
 
 	info, err = engine.APIs(blockchain)[0].Service.(*XDPoS.API).GetBlockInfoByEpochNum(3)
-	assert.Equal(t, info.EpochRound, types.Round(largeRound))
+	assert.Equal(t, *info.EpochRound, types.Round(largeRound))
+	assert.Equal(t, info.EpochConsensusVersion, "v2")
 	assert.Nil(t, err)
 
 	info, err = engine.APIs(blockchain)[0].Service.(*XDPoS.API).GetBlockInfoByEpochNum(4)
@@ -220,7 +229,8 @@ func TestGetBlockByEpochNumber(t *testing.T) {
 	assert.Nil(t, info)
 
 	info, err = engine.APIs(blockchain)[0].Service.(*XDPoS.API).GetBlockInfoByEpochNum(5)
-	assert.Equal(t, info.EpochRound, types.Round(largeRound2))
+	assert.Equal(t, *info.EpochRound, types.Round(largeRound2))
+	assert.Equal(t, info.EpochConsensusVersion, "v2")
 	assert.Nil(t, err)
 
 	info, err = engine.APIs(blockchain)[0].Service.(*XDPoS.API).GetBlockInfoByEpochNum(6)

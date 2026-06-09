@@ -3,7 +3,6 @@ package lendingstate
 import (
 	"fmt"
 	"math/big"
-	"math/rand"
 	"os"
 	"testing"
 	"time"
@@ -13,10 +12,12 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/core/state"
 	"github.com/XinFinOrg/XDPoSChain/core/types"
 	"github.com/XinFinOrg/XDPoSChain/crypto"
+	"github.com/XinFinOrg/XDPoSChain/crypto/keccak"
+	"github.com/XinFinOrg/XDPoSChain/params"
 	"github.com/XinFinOrg/XDPoSChain/rpc"
-	"golang.org/x/crypto/sha3"
 )
 
+// TestLendingItem_VerifyLendingSide tests lending item verify lending side.
 func TestLendingItem_VerifyLendingSide(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -39,6 +40,7 @@ func TestLendingItem_VerifyLendingSide(t *testing.T) {
 	}
 }
 
+// TestLendingItem_VerifyLendingInterest tests lending item verify lending interest.
 func TestLendingItem_VerifyLendingInterest(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -62,6 +64,7 @@ func TestLendingItem_VerifyLendingInterest(t *testing.T) {
 	}
 }
 
+// TestLendingItem_VerifyLendingQuantity tests lending item verify lending quantity.
 func TestLendingItem_VerifyLendingQuantity(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -85,6 +88,7 @@ func TestLendingItem_VerifyLendingQuantity(t *testing.T) {
 	}
 }
 
+// TestLendingItem_VerifyLendingType tests lending item verify lending type.
 func TestLendingItem_VerifyLendingType(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -110,6 +114,7 @@ func TestLendingItem_VerifyLendingType(t *testing.T) {
 	}
 }
 
+// TestLendingItem_VerifyExtraData tests lending item verify extra data.
 func TestLendingItem_VerifyExtraData(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -131,6 +136,7 @@ func TestLendingItem_VerifyExtraData(t *testing.T) {
 	}
 }
 
+// TestLendingItem_VerifyLendingStatus tests lending item verify lending status.
 func TestLendingItem_VerifyLendingStatus(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -157,32 +163,50 @@ func TestLendingItem_VerifyLendingStatus(t *testing.T) {
 	}
 }
 
-func SetFee(statedb *state.StateDB, coinbase common.Address, feeRate *big.Int) {
+func SetFee(statedb *state.StateDB, coinbase common.Address, feeRate *big.Int) error {
+	registrationSMC, err := statedb.LendingRegistrationSMC()
+	if err != nil {
+		return err
+	}
 	locRelayerState := state.GetLocMappingAtKey(coinbase.Hash(), LendingRelayerListSlot)
 	locHash := common.BytesToHash(new(big.Int).Add(locRelayerState, LendingRelayerStructSlots["fee"]).Bytes())
-	statedb.SetState(common.LendingRegistrationSMC, locHash, common.BigToHash(feeRate))
+	statedb.SetState(registrationSMC, locHash, common.BigToHash(feeRate))
+	return nil
 }
 
-func SetCollateralDetail(statedb *state.StateDB, token common.Address, depositRate *big.Int, liquidationRate *big.Int, price *big.Int) {
+func SetCollateralDetail(statedb *state.StateDB, token common.Address, depositRate *big.Int, liquidationRate *big.Int, price *big.Int) error {
+	registrationSMC, err := statedb.LendingRegistrationSMC()
+	if err != nil {
+		return err
+	}
 	collateralState := GetLocMappingAtKey(token.Hash(), CollateralMapSlot)
 	locDepositRate := state.GetLocOfStructElement(collateralState, CollateralStructSlots["depositRate"])
 	locLiquidationRate := state.GetLocOfStructElement(collateralState, CollateralStructSlots["liquidationRate"])
 	locCollateralPrice := state.GetLocOfStructElement(collateralState, CollateralStructSlots["price"])
-	statedb.SetState(common.LendingRegistrationSMC, locDepositRate, common.BigToHash(depositRate))
-	statedb.SetState(common.LendingRegistrationSMC, locLiquidationRate, common.BigToHash(liquidationRate))
-	statedb.SetState(common.LendingRegistrationSMC, locCollateralPrice, common.BigToHash(price))
+	statedb.SetState(registrationSMC, locDepositRate, common.BigToHash(depositRate))
+	statedb.SetState(registrationSMC, locLiquidationRate, common.BigToHash(liquidationRate))
+	statedb.SetState(registrationSMC, locCollateralPrice, common.BigToHash(price))
+	return nil
 }
 
+// TestVerifyBalance tests verify balance.
 func TestVerifyBalance(t *testing.T) {
 	db := rawdb.NewMemoryDatabase()
-	statedb, _ := state.New(types.EmptyRootHash, state.NewDatabase(db))
+	statedb, err := state.NewWithChainConfig(types.EmptyRootHash, state.NewDatabase(db), params.LocalnetChainConfig)
+	if err != nil {
+		t.Fatalf("failed to create state db: %v", err)
+	}
 	relayer := common.HexToAddress("0x0D3ab14BBaD3D99F4203bd7a11aCB94882050E7e")
 	uAddr := common.HexToAddress("0xDeE6238780f98c0ca2c2C28453149bEA49a3Abc9")
 	lendingToken := common.HexToAddress("0xd9bb01454c85247B2ef35BB5BE57384cC275a8cf")    // USD
 	collateralToken := common.HexToAddress("0x4d7eA2cE949216D6b120f3AA10164173615A2b6C") // BTC
 
-	SetFee(statedb, relayer, big.NewInt(100))
-	SetCollateralDetail(statedb, collateralToken, big.NewInt(150), big.NewInt(110), big.NewInt(8000)) // BTC price: 8k USD
+	if err := SetFee(statedb, relayer, big.NewInt(100)); err != nil {
+		t.Fatalf("failed to seed lending fee: %v", err)
+	}
+	if err := SetCollateralDetail(statedb, collateralToken, big.NewInt(150), big.NewInt(110), big.NewInt(8000)); err != nil {
+		t.Fatalf("failed to seed collateral detail: %v", err)
+	}
 
 	// have 10k USD
 	statedb.GetOrNewStateObject(lendingToken)
@@ -506,6 +530,7 @@ type LendingOrderMsg struct {
 	Hash common.Hash `json:"hash" rlp:"-"`
 }
 
+// Test_CreateOrder tests create order.
 func Test_CreateOrder(t *testing.T) {
 	t.SkipNow()
 	for i := 0; i < 1; i++ {
@@ -521,7 +546,6 @@ func sendOrder(nonce uint64) {
 		os.Exit(1)
 	}
 	defer rpcClient.Close()
-	rand.Seed(time.Now().UTC().UnixNano())
 	item := &LendingOrderMsg{
 		AccountNonce:    nonce,
 		Quantity:        EtherToWei(big.NewInt(1000)),
@@ -569,7 +593,7 @@ func sendOrder(nonce uint64) {
 }
 
 func computeHash(l *LendingOrderMsg) common.Hash {
-	sha := sha3.NewLegacyKeccak256()
+	sha := keccak.NewLegacyKeccak256()
 	if l.Status == LendingStatusCancelled {
 		sha.Write(l.Hash.Bytes())
 		sha.Write(common.BigToHash(big.NewInt(int64(l.AccountNonce))).Bytes())

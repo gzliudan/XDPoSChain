@@ -20,8 +20,8 @@ import (
 	"sync"
 
 	"github.com/XinFinOrg/XDPoSChain/crypto"
+	"github.com/XinFinOrg/XDPoSChain/crypto/keccak"
 	"github.com/XinFinOrg/XDPoSChain/rlp"
-	"golang.org/x/crypto/sha3"
 )
 
 // hasher is a type used for the trie Hash operation. A hasher has some
@@ -35,10 +35,10 @@ type hasher struct {
 
 // hasherPool holds pureHashers
 var hasherPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return &hasher{
 			tmp:    make([]byte, 0, 550), // cap is as large as a full fullNode.
-			sha:    sha3.NewLegacyKeccak256().(crypto.KeccakState),
+			sha:    keccak.NewLegacyKeccak256().(crypto.KeccakState),
 			encbuf: rlp.NewEncoderBuffer(nil),
 		}
 	},
@@ -113,9 +113,8 @@ func (h *hasher) hashFullNodeChildren(n *fullNode) (collapsed *fullNode, cached 
 	collapsed = n.copy()
 	if h.parallel {
 		var wg sync.WaitGroup
-		wg.Add(16)
 		for i := 0; i < 16; i++ {
-			go func(i int) {
+			wg.Go(func() {
 				hasher := newHasher(false)
 				if child := n.Children[i]; child != nil {
 					collapsed.Children[i], cached.Children[i] = hasher.hash(child, false)
@@ -123,8 +122,7 @@ func (h *hasher) hashFullNodeChildren(n *fullNode) (collapsed *fullNode, cached 
 					collapsed.Children[i] = nilValueNode
 				}
 				returnHasherToPool(hasher)
-				wg.Done()
-			}(i)
+			})
 		}
 		wg.Wait()
 	} else {
@@ -191,7 +189,7 @@ func (h *hasher) hashData(data []byte) hashNode {
 }
 
 // proofHash is used to construct trie proofs, and returns the 'collapsed'
-// Node (for later RLP encoding) aswell as the hashed Node -- unless the
+// Node (for later RLP encoding) as well as the hashed Node -- unless the
 // Node is smaller than 32 bytes, in which case it will be returned as is.
 // This method does not do anything on value- or hash-nodes.
 func (h *hasher) proofHash(original node) (collapsed, hashed node) {

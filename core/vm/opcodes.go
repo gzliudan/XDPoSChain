@@ -60,6 +60,7 @@ const (
 	SHL    OpCode = 0x1b
 	SHR    OpCode = 0x1c
 	SAR    OpCode = 0x1d
+	CLZ    OpCode = 0x1e
 )
 
 // 0x20 range - crypto.
@@ -162,7 +163,7 @@ const (
 
 // 0x80 range - dups.
 const (
-	DUP1 = 0x80 + iota
+	DUP1 OpCode = 0x80 + iota
 	DUP2
 	DUP3
 	DUP4
@@ -182,7 +183,7 @@ const (
 
 // 0x90 range - swaps.
 const (
-	SWAP1 = 0x90 + iota
+	SWAP1 OpCode = 0x90 + iota
 	SWAP2
 	SWAP3
 	SWAP4
@@ -207,6 +208,13 @@ const (
 	LOG2
 	LOG3
 	LOG4
+)
+
+// 0xe0 range - eof operations.
+const (
+	DUPN     OpCode = 0xe6
+	SWAPN    OpCode = 0xe7
+	EXCHANGE OpCode = 0xe8
 )
 
 // 0xf0 range - closures.
@@ -252,6 +260,7 @@ var opCodeToString = [256]string{
 	SHL:    "SHL",
 	SHR:    "SHR",
 	SAR:    "SAR",
+	CLZ:    "CLZ",
 	ADDMOD: "ADDMOD",
 	MULMOD: "MULMOD",
 
@@ -384,6 +393,11 @@ var opCodeToString = [256]string{
 	LOG3: "LOG3",
 	LOG4: "LOG4",
 
+	// 0xe0 range.
+	DUPN:     "DUPN",
+	SWAPN:    "SWAPN",
+	EXCHANGE: "EXCHANGE",
+
 	// 0xf0 range - closures.
 	CREATE:       "CREATE",
 	CALL:         "CALL",
@@ -431,6 +445,7 @@ var stringToOp = map[string]OpCode{
 	"SHL":            SHL,
 	"SHR":            SHR,
 	"SAR":            SAR,
+	"CLZ":            CLZ,
 	"ADDMOD":         ADDMOD,
 	"MULMOD":         MULMOD,
 	"KECCAK256":      KECCAK256,
@@ -549,6 +564,9 @@ var stringToOp = map[string]OpCode{
 	"LOG2":           LOG2,
 	"LOG3":           LOG3,
 	"LOG4":           LOG4,
+	"DUPN":           DUPN,
+	"SWAPN":          SWAPN,
+	"EXCHANGE":       EXCHANGE,
 	"CREATE":         CREATE,
 	"CREATE2":        CREATE2,
 	"CALL":           CALL,

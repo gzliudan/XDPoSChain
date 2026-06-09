@@ -26,9 +26,9 @@ import (
 	"time"
 
 	"github.com/XinFinOrg/XDPoSChain/crypto"
+	"github.com/XinFinOrg/XDPoSChain/crypto/keccak"
 	"github.com/XinFinOrg/XDPoSChain/log"
 	"github.com/XinFinOrg/XDPoSChain/p2p/discover"
-	"golang.org/x/crypto/sha3"
 )
 
 func init() {
@@ -47,8 +47,8 @@ func newTestTransport(id discover.NodeID, fd net.Conn) transport {
 	wrapped.rw = newRLPXFrameRW(fd, secrets{
 		MAC:        zero16,
 		AES:        zero16,
-		IngressMAC: sha3.NewLegacyKeccak256(),
-		EgressMAC:  sha3.NewLegacyKeccak256(),
+		IngressMAC: keccak.NewLegacyKeccak256(),
+		EgressMAC:  keccak.NewLegacyKeccak256(),
 	})
 	return &testTransport{id: id, rlpx: wrapped}
 }
@@ -484,6 +484,26 @@ func TestServerPeerLimits(t *testing.T) {
 		t.Errorf("unexpected close error: %q", tp.closeErr)
 	}
 	conn.Close()
+}
+
+func TestRemovePeerTrackingKeepsPrimaryOnPairDrop(t *testing.T) {
+	id := randomID()
+	primary := newPeer(&conn{id: id}, nil)
+	pair := newPeer(&conn{id: id}, nil)
+	primary.SetPairPeer(pair)
+
+	peers := map[discover.NodeID]*Peer{id: primary}
+	connCount := removePeerTracking(peers, peerDrop{Peer: pair}, 2)
+
+	if connCount != 1 {
+		t.Fatalf("unexpected connection count: got %d want %d", connCount, 1)
+	}
+	if peers[id] != primary {
+		t.Fatal("primary peer was removed while dropping pair peer")
+	}
+	if primary.PairPeer() != nil {
+		t.Fatal("primary peer still references dropped pair peer")
+	}
 }
 
 func TestServerSetupConn(t *testing.T) {

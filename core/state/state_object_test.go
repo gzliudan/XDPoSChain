@@ -25,24 +25,22 @@ import (
 
 func BenchmarkCutOriginal(b *testing.B) {
 	value := common.HexToHash("0x01")
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		bytes.TrimLeft(value[:], "\x00")
 	}
 }
 
 func BenchmarkCutsetterFn(b *testing.B) {
 	value := common.HexToHash("0x01")
-	cutSetFn := func(r rune) bool {
-		return int32(r) == int32(0)
-	}
-	for i := 0; i < b.N; i++ {
+	cutSetFn := func(r rune) bool { return r == 0 }
+	for b.Loop() {
 		bytes.TrimLeftFunc(value[:], cutSetFn)
 	}
 }
 
 func BenchmarkCutCustomTrim(b *testing.B) {
 	value := common.HexToHash("0x01")
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		common.TrimLeftZeroes(value[:])
 	}
 }

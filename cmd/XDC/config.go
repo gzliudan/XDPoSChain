@@ -39,6 +39,7 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/eth/ethconfig"
 	"github.com/XinFinOrg/XDPoSChain/internal/ethapi"
 	"github.com/XinFinOrg/XDPoSChain/internal/flags"
+	"github.com/XinFinOrg/XDPoSChain/internal/version"
 	"github.com/XinFinOrg/XDPoSChain/log"
 	"github.com/XinFinOrg/XDPoSChain/metrics"
 	"github.com/XinFinOrg/XDPoSChain/node"
@@ -77,7 +78,7 @@ var tomlSettings = toml.Config{
 		if unicode.IsUpper(rune(rt.Name()[0])) && rt.PkgPath() != "main" {
 			link = fmt.Sprintf(", see https://godoc.org/%s#%s for available fields", rt.PkgPath(), rt.Name())
 		}
-		return fmt.Errorf("field '%s' is not defined in %s%s", field, rt.String(), link)
+		return fmt.Errorf("field '%s' is not defined in %s%s", field, rt, link)
 	},
 }
 
@@ -122,9 +123,10 @@ func loadConfig(file string, cfg *XDCConfig) error {
 }
 
 func defaultNodeConfig() node.Config {
+	git, _ := version.VCS()
 	cfg := node.DefaultConfig
 	cfg.Name = clientIdentifier
-	cfg.Version = params.VersionWithCommit(gitCommit)
+	cfg.Version = version.WithCommit(git.Commit, git.Date)
 	cfg.HTTPModules = append(cfg.HTTPModules, "eth")
 	cfg.WSModules = append(cfg.WSModules, "eth")
 	cfg.IPCPath = "XDC.ipc"
@@ -168,14 +170,14 @@ func loadBaseConfig(ctx *cli.Context) XDCConfig {
 			common.MinGasPrice = big.NewInt(gasPrice)
 		}
 	}
-	common.MinGasPrice50x = common.MinGasPrice50x.Mul(common.MinGasPrice, big.NewInt(50))
+	params.SetMinGasPrice50x(common.MinGasPrice)
 
 	// read passwords from environment
 	passwords := []string{}
 	for _, env := range cfg.Account.Passwords {
 		if trimmed := strings.TrimSpace(env); trimmed != "" {
 			value := os.Getenv(trimmed)
-			for _, info := range strings.Split(value, ",") {
+			for info := range strings.SplitSeq(value, ",") {
 				if trimmed2 := strings.TrimSpace(info); trimmed2 != "" {
 					passwords = append(passwords, trimmed2)
 				}
@@ -215,6 +217,7 @@ func makeConfigNode(ctx *cli.Context) (*node.Node, XDCConfig) {
 	return stack, cfg
 }
 
+// makeFullNode loads geth configuration and creates the Ethereum backend.
 func makeFullNode(ctx *cli.Context) (*node.Node, ethapi.Backend, XDCConfig) {
 	stack, cfg := makeConfigNode(ctx)
 
@@ -228,7 +231,7 @@ func makeFullNode(ctx *cli.Context) (*node.Node, ethapi.Backend, XDCConfig) {
 
 	// Create gauge with geth system and build information
 	if eth != nil { // The 'eth' backend may be nil in light mode
-		var protos []string
+		protos := make([]string, 0, len(eth.Protocols()))
 		for _, p := range eth.Protocols() {
 			protos = append(protos, fmt.Sprintf("%v/%d", p.Name, p.Version))
 		}
@@ -298,6 +301,12 @@ func applyMetricConfig(ctx *cli.Context, cfg *XDCConfig) {
 	if ctx.IsSet(utils.MetricsInfluxDBTagsFlag.Name) {
 		cfg.Metrics.InfluxDBTags = ctx.String(utils.MetricsInfluxDBTagsFlag.Name)
 	}
+	if ctx.IsSet(utils.MetricsInfluxDBIntervalFlag.Name) {
+		cfg.Metrics.InfluxDBInterval = ctx.Duration(utils.MetricsInfluxDBIntervalFlag.Name)
+		if cfg.Metrics.InfluxDBInterval <= 0 {
+			utils.Fatalf("invalid metrics InfluxDB interval %v: must be greater than 0", cfg.Metrics.InfluxDBInterval)
+		}
+	}
 	if ctx.IsSet(utils.MetricsEnableInfluxDBV2Flag.Name) {
 		cfg.Metrics.EnableInfluxDBV2 = ctx.Bool(utils.MetricsEnableInfluxDBV2Flag.Name)
 	}
@@ -326,9 +335,9 @@ func applyMetricConfig(ctx *cli.Context, cfg *XDCConfig) {
 			ctx.IsSet(utils.MetricsInfluxDBBucketFlag.Name)
 
 		if enableExport && v2FlagIsSet {
-			utils.Fatalf("Flags --influxdb-metrics.organization, --influxdb-metrics.token, --influxdb-metrics.bucket are only available for influxdb-v2")
+			utils.Fatalf("Flags --%s, --%s, --%s are only available for influxdb-v2", utils.MetricsInfluxDBOrganizationFlag.Name, utils.MetricsInfluxDBTokenFlag.Name, utils.MetricsInfluxDBBucketFlag.Name)
 		} else if enableExportV2 && v1FlagIsSet {
-			utils.Fatalf("Flags --influxdb-metrics.username, --influxdb-metrics.password are only available for influxdb-v1")
+			utils.Fatalf("Flags --%s, --%s are only available for influxdb-v1", utils.MetricsInfluxDBUsernameFlag.Name, utils.MetricsInfluxDBPasswordFlag.Name)
 		}
 	}
 }

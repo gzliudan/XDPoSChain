@@ -1,4 +1,7 @@
 # Documents
 
-- [JSONRPC API](./xdc/jsonrpc.md)
-- [Validator Contract](./xdc/validator.md)
+- [JSONRPC API](xdc/jsonrpc.md)
+- [Validator Contract](xdc/validator.md)
+- [Development environment](develop.md)
+- [Solidity](solidity.md)
+- [Upgrade notes](upgrade.md)

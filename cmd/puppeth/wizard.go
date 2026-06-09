@@ -24,7 +24,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,13 +32,14 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/common"
 	"github.com/XinFinOrg/XDPoSChain/core"
 	"github.com/XinFinOrg/XDPoSChain/log"
-	"golang.org/x/crypto/ssh/terminal"
+	"golang.org/x/term"
 )
 
 // config contains all the configurations needed by puppeth that should be saved
 // between sessions.
 type config struct {
-	path      string   // File containing the configuration values
+	path      string   // Output file containing the configuration values
+	inpath    string   // Input file to read genesis generation parameters (optional)
 	bootnodes []string // Bootnodes to always connect to by all nodes
 	ethstats  string   // Ethstats settings to cache for node deploys
 
@@ -52,7 +53,7 @@ func (c config) servers() []string {
 	for server := range c.Servers {
 		servers = append(servers, server)
 	}
-	sort.Strings(servers)
+	slices.Sort(servers)
 
 	return servers
 }
@@ -62,6 +63,7 @@ func (c config) flush() {
 	os.MkdirAll(filepath.Dir(c.path), 0755)
 
 	out, _ := json.MarshalIndent(c.Genesis, "", "  ")
+	log.Warn("writing to file", "filename", c.path)
 	if err := os.WriteFile(c.path, out, 0644); err != nil {
 		log.Warn("Failed to save puppeth configs", "file", c.path, "err", err)
 	}
@@ -230,7 +232,7 @@ func (w *wizard) readDefaultFloat(def float64) float64 {
 // line and returns it. The input will not be echoed.
 func (w *wizard) readPassword() string {
 	fmt.Printf("> ")
-	text, err := terminal.ReadPassword(int(os.Stdin.Fd()))
+	text, err := term.ReadPassword(int(os.Stdin.Fd()))
 	if err != nil {
 		log.Crit("Failed to read password", "err", err)
 	}

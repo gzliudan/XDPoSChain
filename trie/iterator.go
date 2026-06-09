@@ -23,8 +23,14 @@ import (
 
 	"github.com/XinFinOrg/XDPoSChain/common"
 	"github.com/XinFinOrg/XDPoSChain/core/types"
-	"github.com/XinFinOrg/XDPoSChain/ethdb"
 )
+
+// NodeResolver is used for looking up trie nodes before reaching into the real
+// persistent layer. This is not mandatory, rather is an optimization for cases
+// where trie nodes can be recovered from some external mechanism without reading
+// from disk. In those cases, this resolver allows short circuiting accesses and
+// returning them from memory.
+type NodeResolver func(owner common.Hash, path []byte, hash common.Hash) []byte
 
 // Iterator is a key-value trie iterator that traverses a Trie.
 type Iterator struct {
@@ -35,7 +41,7 @@ type Iterator struct {
 	Err   error
 }
 
-// NewIterator creates a new key-value iterator from a Node iterator.
+// NewIterator creates a new key-value iterator from a node iterator.
 // Note that the value returned by the iterator is raw. If the content is encoded
 // (e.g. storage value is RLP-encoded), it's caller's duty to decode it.
 func NewIterator(it NodeIterator) *Iterator {
@@ -86,7 +92,11 @@ type NodeIterator interface {
 	// For leaf nodes, the last element of the path is the 'terminator symbol' 0x10.
 	Path() []byte
 
-	// Leaf returns true iff the current Node is a leaf Node.
+	// NodeBlob returns the rlp-encoded value of the current iterated node.
+	// If the node is an embedded node in its parent, nil is returned then.
+	NodeBlob() []byte
+
+	// Leaf returns true iff the current node is a leaf node.
 	Leaf() bool
 
 	// LeafKey returns the key of the leaf. The method panics if the iterator is not
@@ -104,8 +114,8 @@ type NodeIterator interface {
 	// to the value after calling Next.
 	LeafProof() [][]byte
 
-	// AddResolver sets an intermediate database to use for looking up trie nodes
-	// before reaching into the real persistent layer.
+	// AddResolver sets a node resolver to use for looking up trie nodes before
+	// reaching into the real persistent layer.
 	//
 	// This is not required for normal operation, rather is an optimization for
 	// cases where trie nodes can be recovered from some external mechanism without
@@ -115,7 +125,7 @@ type NodeIterator interface {
 	// Before adding a similar mechanism to any other place in Geth, consider
 	// making trie.Database an interface and wrapping at that level. It's a huge
 	// refactor, but it could be worth it if another occurrence arises.
-	AddResolver(ethdb.KeyValueStore)
+	AddResolver(NodeResolver)
 }
 
 // nodeIteratorState represents the iteration state at one particular Node of the
@@ -134,7 +144,7 @@ type nodeIterator struct {
 	path  []byte               // Path to the current Node
 	err   error                // Failure set in case of an internal error in the iterator
 
-	resolver ethdb.KeyValueStore // Optional intermediate resolver above the disk layer
+	resolver NodeResolver // optional node resolver for avoiding disk hits
 }
 
 // errIteratorEnd is stored in nodeIterator.err when iteration is done.
@@ -162,7 +172,7 @@ func newNodeIterator(trie *Trie, start []byte) NodeIterator {
 	return it
 }
 
-func (it *nodeIterator) AddResolver(resolver ethdb.KeyValueStore) {
+func (it *nodeIterator) AddResolver(resolver NodeResolver) {
 	it.resolver = resolver
 }
 
@@ -224,6 +234,18 @@ func (it *nodeIterator) LeafProof() [][]byte {
 
 func (it *nodeIterator) Path() []byte {
 	return it.path
+}
+
+func (it *nodeIterator) NodeBlob() []byte {
+	if it.Hash() == (common.Hash{}) {
+		return nil // skip the non-standalone node
+	}
+	blob, err := it.resolveBlob(it.Hash().Bytes(), it.Path())
+	if err != nil {
+		it.err = err
+		return nil
+	}
+	return blob
 }
 
 func (it *nodeIterator) Error() error {
@@ -354,14 +376,39 @@ func (it *nodeIterator) peekSeek(seekKey []byte) (*nodeIteratorState, *int, []by
 
 func (it *nodeIterator) resolveHash(hash hashNode, path []byte) (node, error) {
 	if it.resolver != nil {
-		if blob, err := it.resolver.Get(hash); err == nil && len(blob) > 0 {
+		if blob := it.resolver(it.trie.owner, path, common.BytesToHash(hash)); len(blob) > 0 {
 			if resolved, err := decodeNode(hash, blob); err == nil {
 				return resolved, nil
 			}
 		}
 	}
-	resolved, err := it.trie.resolveHash(hash, path)
-	return resolved, err
+	// Retrieve the specified node from the underlying node reader.
+	// it.trie.resolveAndTrack is not used since in that function the
+	// loaded blob will be tracked, while it's not required here since
+	// all loaded nodes won't be linked to trie at all and track nodes
+	// may lead to out-of-memory issue.
+	blob, err := it.trie.reader.node(path, common.BytesToHash(hash))
+	if err != nil {
+		return nil, err
+	}
+	// The raw-blob format nodes are loaded either from the
+	// clean cache or the database, they are all in their own
+	// copy and safe to use unsafe decoder.
+	return mustDecodeNodeUnsafe(hash, blob), nil
+}
+
+func (it *nodeIterator) resolveBlob(hash hashNode, path []byte) ([]byte, error) {
+	if it.resolver != nil {
+		if blob := it.resolver(it.trie.owner, path, common.BytesToHash(hash)); len(blob) > 0 {
+			return blob, nil
+		}
+	}
+	// Retrieve the specified node from the underlying node reader.
+	// it.trie.resolveAndTrack is not used since in that function the
+	// loaded blob will be tracked, while it's not required here since
+	// all loaded nodes won't be linked to trie at all and track nodes
+	// may lead to out-of-memory issue.
+	return it.trie.reader.node(path, common.BytesToHash(hash))
 }
 
 func (st *nodeIteratorState) resolve(it *nodeIterator, path []byte) error {
@@ -552,7 +599,11 @@ func (it *differenceIterator) Path() []byte {
 	return it.b.Path()
 }
 
-func (it *differenceIterator) AddResolver(resolver ethdb.KeyValueStore) {
+func (it *differenceIterator) NodeBlob() []byte {
+	return it.b.NodeBlob()
+}
+
+func (it *differenceIterator) AddResolver(resolver NodeResolver) {
 	panic("not implemented")
 }
 
@@ -663,7 +714,11 @@ func (it *unionIterator) Path() []byte {
 	return (*it.items)[0].Path()
 }
 
-func (it *unionIterator) AddResolver(resolver ethdb.KeyValueStore) {
+func (it *unionIterator) NodeBlob() []byte {
+	return (*it.items)[0].NodeBlob()
+}
+
+func (it *unionIterator) AddResolver(resolver NodeResolver) {
 	panic("not implemented")
 }
 

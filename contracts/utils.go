@@ -84,16 +84,17 @@ func CreateTransactionSign(chainConfig *params.ChainConfig, pool *txpool.TxPool,
 			}
 		}
 
-		// Create and send tx to smart contract for sign validate block.
-		nonce := pool.Nonce(account.Address)
+		// Use the pool's pending nonce so imported-block signing does not reuse
+		// an already-pending nonce and trigger replacement-underpriced errors.
+		nonce := pool.PoolNonce(account.Address)
 		tx := CreateTxSign(block.Number(), block.Hash(), nonce, common.BlockSignersBinary)
-		txSigned, err := wallet.SignTx(account, tx, chainConfig.ChainId)
+		txSigned, err := wallet.SignTx(account, tx, chainConfig.ChainID)
 		if err != nil {
 			log.Error("Fail to create tx sign", "error", err)
 			return err
 		}
 		// Add tx signed to local tx pool.
-		err = pool.AddLocal(txSigned)
+		err = pool.AddLocal(txSigned, true)
 		if err != nil {
 			log.Error("Fail to add tx sign to local pool.", "error", err, "number", block.NumberU64(), "hash", block.Hash().Hex(), "from", account.Address, "nonce", nonce)
 			return err
@@ -103,8 +104,7 @@ func CreateTransactionSign(chainConfig *params.ChainConfig, pool *txpool.TxPool,
 		blockNumber := block.Number().Uint64()
 		checkNumber := blockNumber % chainConfig.XDPoS.Epoch
 		// Generate random private key and save into chaindb.
-		randomizeKeyName := []byte("randomizeKey")
-		exist, _ := chainDb.Has(randomizeKeyName)
+		exist := rawdb.HasRandomize(chainDb)
 
 		// Set secret for randomize.
 		if !exist && checkNumber > 0 && common.EpocBlockSecret <= checkNumber && common.EpocBlockOpening > checkNumber {
@@ -116,25 +116,25 @@ func CreateTransactionSign(chainConfig *params.ChainConfig, pool *txpool.TxPool,
 				log.Error("Fail to get tx opening for randomize", "error", err)
 				return err
 			}
-			txSigned, err := wallet.SignTx(account, tx, chainConfig.ChainId)
+			txSigned, err := wallet.SignTx(account, tx, chainConfig.ChainID)
 			if err != nil {
 				log.Error("Fail to create tx secret", "error", err)
 				return err
 			}
 			// Add tx signed to local tx pool.
-			err = pool.AddLocal(txSigned)
+			err = pool.AddLocal(txSigned, true)
 			if err != nil {
 				log.Error("Fail to add tx secret to local pool.", "error", err, "number", block.NumberU64(), "hash", block.Hash().Hex(), "from", account.Address, "nonce", nonce)
 				return err
 			}
 
 			// Put randomize key into chainDb.
-			chainDb.Put(randomizeKeyName, randomizeKeyValue)
+			rawdb.WriteRandomize(chainDb, randomizeKeyValue)
 		}
 
 		// Set opening for randomize.
 		if exist && checkNumber > 0 && common.EpocBlockOpening <= checkNumber && common.EpocBlockRandomize >= checkNumber {
-			randomizeKeyValue, err := chainDb.Get(randomizeKeyName)
+			randomizeKeyValue, err := rawdb.ReadRandomize(chainDb)
 			if err != nil {
 				log.Error("Fail to get randomize key from state db.", "error", err)
 				return err
@@ -145,20 +145,20 @@ func CreateTransactionSign(chainConfig *params.ChainConfig, pool *txpool.TxPool,
 				log.Error("Fail to get tx opening for randomize", "error", err)
 				return err
 			}
-			txSigned, err := wallet.SignTx(account, tx, chainConfig.ChainId)
+			txSigned, err := wallet.SignTx(account, tx, chainConfig.ChainID)
 			if err != nil {
 				log.Error("Fail to create tx opening", "error", err)
 				return err
 			}
 			// Add tx to pool.
-			err = pool.AddLocal(txSigned)
+			err = pool.AddLocal(txSigned, true)
 			if err != nil {
 				log.Error("Fail to add tx opening to local pool.", "error", err, "number", block.NumberU64(), "hash", block.Hash().Hex(), "from", account.Address, "nonce", nonce)
 				return err
 			}
 
 			// Clear randomize key in state db.
-			chainDb.Delete(randomizeKeyName)
+			rawdb.DeleteRandomize(chainDb)
 		}
 	}
 
@@ -210,7 +210,7 @@ func BuildTxOpeningRandomize(nonce uint64, randomizeAddr common.Address, randomi
 
 // Get signers signed for blockNumber from blockSigner contract.
 func GetSignersFromContract(statedb *state.StateDB, block *types.Block) ([]common.Address, error) {
-	return state.GetSigners(statedb, block), nil
+	return statedb.GetSigners(block), nil
 }
 
 // Get signers signed for blockNumber from blockSigner contract.
@@ -231,11 +231,17 @@ func GetSignersByExecutingEVM(addrBlockSigner common.Address, client bind.Contra
 
 // Get random from randomize contract.
 func GetRandomizeFromContract(client bind.ContractBackend, addrMasternode common.Address) (int64, error) {
+	return GetRandomizeFromContractAtNumber(client, addrMasternode, nil)
+}
+
+// GetRandomizeFromContractAtNumber reads randomize data at a specific block height.
+// If blockNumber is nil, the latest state is used.
+func GetRandomizeFromContractAtNumber(client bind.ContractBackend, addrMasternode common.Address, blockNumber *big.Int) (int64, error) {
 	randomize, err := randomizeContract.NewXDCRandomize(common.RandomizeSMCBinary, client)
 	if err != nil {
 		log.Error("Fail to get instance of randomize", "error", err)
 	}
-	opts := new(bind.CallOpts)
+	opts := &bind.CallOpts{BlockNumber: blockNumber}
 	secrets, err := randomize.GetSecret(opts, addrMasternode)
 	if err != nil {
 		log.Error("Fail get secrets from randomize", "error", err)
@@ -253,18 +259,17 @@ func GenM2FromRandomize(randomizes []int64, lenSigners int64) ([]int64, error) {
 	blockValidator := NewSlice(int64(0), lenSigners, 1)
 	randIndexs := make([]int64, lenSigners)
 	total := int64(0)
-	var temp int64 = 0
 	for _, j := range randomizes {
 		total += j
 	}
-	rand.Seed(total)
+	rng := rand.New(rand.NewSource(total))
 	for i := len(blockValidator) - 1; i >= 0; i-- {
 		blockLength := len(blockValidator) - 1
 		if blockLength <= 1 {
 			blockLength = 1
 		}
-		randomIndex := int64(rand.Intn(blockLength))
-		temp = blockValidator[randomIndex]
+		randomIndex := int64(rng.Intn(blockLength))
+		temp := blockValidator[randomIndex]
 		blockValidator[randomIndex] = blockValidator[i]
 		blockValidator[i] = temp
 		blockValidator = append(blockValidator[:i], blockValidator[i+1:]...)
@@ -276,10 +281,10 @@ func GenM2FromRandomize(randomizes []int64, lenSigners int64) ([]int64, error) {
 
 // Get validators from m2 array integer.
 func BuildValidatorFromM2(listM2 []int64) []byte {
-	var validatorBytes []byte
+	validatorBytes := make([]byte, 0, len(listM2)*utils.M2ByteLength)
 	for _, numberM2 := range listM2 {
 		// Convert number to byte.
-		m2Byte := common.LeftPadBytes([]byte(fmt.Sprintf("%d", numberM2)), utils.M2ByteLength)
+		m2Byte := common.LeftPadBytes(fmt.Appendf(nil, "%d", numberM2), utils.M2ByteLength)
 		validatorBytes = append(validatorBytes, m2Byte...)
 	}
 
@@ -293,7 +298,7 @@ func DecodeValidatorsHexData(validatorsStr string) ([]int64, error) {
 		return nil, err
 	}
 
-	return utils.ExtractValidatorsFromBytes(validatorsByte), nil
+	return utils.ExtractValidatorsFromBytes(validatorsByte)
 }
 
 // Decrypt randomize from secrets and opening.
@@ -333,7 +338,7 @@ func GetRewardForCheckpoint(c *XDPoS.XDPoS, chain consensus.ChainReader, header 
 		mapBlkHash[i] = header.Hash()
 		signingTxs, ok := c.GetCachedSigningTxs(header.Hash())
 		if !ok {
-			log.Debug("Failed get from cached", "hash", header.Hash().String(), "number", i)
+			log.Debug("Failed get from cached", "hash", header.Hash(), "number", i)
 			block := chain.GetBlock(header.Hash(), i)
 			txs := block.Transactions()
 			if !chain.Config().IsTIPSigning(header.Number) {
@@ -413,26 +418,31 @@ func CalculateRewardForSigner(chainReward *big.Int, signers map[common.Address]*
 
 // Get candidate owner by address.
 func GetCandidatesOwnerBySigner(statedb *state.StateDB, signerAddr common.Address) common.Address {
-	owner := state.GetCandidateOwner(statedb, signerAddr)
-	return owner
+	return statedb.GetCandidateOwner(signerAddr)
 }
 
-func CalculateRewardForHolders(foundationWalletAddr common.Address, state *state.StateDB, signer common.Address, calcReward *big.Int, blockNumber uint64) (map[common.Address]*big.Int, error) {
-	rewards, err := GetRewardBalancesRate(foundationWalletAddr, state, signer, calcReward, blockNumber)
+// CalculateRewardForHolders returns the reward distribution for a signer and
+// its voters for the given block using the supplied chain config to evaluate
+// fork-dependent reward rules.
+func CalculateRewardForHolders(chainConfig *params.ChainConfig, foundationWalletAddr common.Address, state *state.StateDB, signer common.Address, calcReward *big.Int, blockNumber *big.Int) (map[common.Address]*big.Int, error) {
+	rewards, err := GetRewardBalancesRate(chainConfig, foundationWalletAddr, state, signer, calcReward, blockNumber)
 	if err != nil {
 		return nil, err
 	}
 	return rewards, nil
 }
 
-func GetRewardBalancesRate(foundationWalletAddr common.Address, statedb *state.StateDB, masterAddr common.Address, totalReward *big.Int, blockNumber uint64) (map[common.Address]*big.Int, error) {
+// GetRewardBalancesRate computes the per-address reward split for a signer,
+// voters, and the foundation wallet for the given block. chainConfig and
+// blockNumber drive fork-aware behavior such as duplicate-voter handling.
+func GetRewardBalancesRate(chainConfig *params.ChainConfig, foundationWalletAddr common.Address, statedb *state.StateDB, masterAddr common.Address, totalReward *big.Int, blockNumber *big.Int) (map[common.Address]*big.Int, error) {
 	owner := GetCandidatesOwnerBySigner(statedb, masterAddr)
 	balances := make(map[common.Address]*big.Int)
 	rewardMaster := new(big.Int).Mul(totalReward, new(big.Int).SetInt64(common.RewardMasterPercent))
 	rewardMaster = new(big.Int).Div(rewardMaster, new(big.Int).SetInt64(100))
 	balances[owner] = rewardMaster
 	// Get voters for masternode.
-	voters := state.GetVoters(statedb, masterAddr)
+	voters := statedb.GetVoters(masterAddr)
 
 	if len(voters) > 0 {
 		totalVoterReward := new(big.Int).Mul(totalReward, new(big.Int).SetUint64(common.RewardVoterPercent))
@@ -441,10 +451,10 @@ func GetRewardBalancesRate(foundationWalletAddr common.Address, statedb *state.S
 		// Get voters capacities.
 		voterCaps := make(map[common.Address]*big.Int)
 		for _, voteAddr := range voters {
-			if _, ok := voterCaps[voteAddr]; ok && common.TIP2019Block.Uint64() <= blockNumber {
+			if _, ok := voterCaps[voteAddr]; ok && chainConfig != nil && chainConfig.IsTIP2019(blockNumber) {
 				continue
 			}
-			voterCap := state.GetVoterCap(statedb, masterAddr, voteAddr)
+			voterCap := statedb.GetVoterCap(masterAddr, voteAddr)
 			totalCap.Add(totalCap, voterCap)
 			voterCaps[voteAddr] = voterCap
 		}
@@ -467,7 +477,7 @@ func GetRewardBalancesRate(foundationWalletAddr common.Address, statedb *state.S
 	foundationReward := new(big.Int).Mul(totalReward, new(big.Int).SetInt64(common.RewardFoundationPercent))
 	foundationReward = new(big.Int).Div(foundationReward, new(big.Int).SetInt64(100))
 
-	if balances[foundationWalletAddr] != nil {
+	if chainConfig != nil && chainConfig.IsTIPUpgradeReward(blockNumber) && balances[foundationWalletAddr] != nil {
 		balances[foundationWalletAddr].Add(balances[foundationWalletAddr], foundationReward)
 	} else {
 		balances[foundationWalletAddr] = foundationReward
@@ -478,7 +488,7 @@ func GetRewardBalancesRate(foundationWalletAddr common.Address, statedb *state.S
 		log.Error("Fail to parse json holders", "error", err)
 		return nil, err
 	}
-	log.Trace("Holders reward", "holders", string(jsonHolders), "masternode", masterAddr.String())
+	log.Trace("Holders reward", "holders", string(jsonHolders), "masternode", masterAddr)
 
 	return balances, nil
 }

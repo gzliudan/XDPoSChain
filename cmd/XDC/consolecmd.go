@@ -18,12 +18,9 @@ package main
 
 import (
 	"fmt"
-	"os"
-	"os/signal"
-	"path/filepath"
+	"net/url"
 	"slices"
 	"strings"
-	"syscall"
 
 	"github.com/XinFinOrg/XDPoSChain/cmd/utils"
 	"github.com/XinFinOrg/XDPoSChain/console"
@@ -62,7 +59,7 @@ This command allows to open a console on a running XDC node.`,
 	javascriptCommand = &cli.Command{
 		Action:    ephemeralConsole,
 		Name:      "js",
-		Usage:     "Execute the specified JavaScript files",
+		Usage:     "(DEPRECATED) Execute the specified JavaScript files",
 		ArgsUsage: "<jsfile> [jsfile...]",
 		Flags:     slices.Concat(nodeFlags, consoleFlags),
 		Description: `
@@ -76,33 +73,40 @@ JavaScript API. See https://github.com/XinFinOrg/XDPoSChain/wiki/JavaScript-Cons
 func localConsole(ctx *cli.Context) error {
 	// Create and start the node based on the CLI flags
 	stack, backend, cfg := makeFullNode(ctx)
-	startNode(ctx, stack, backend, cfg)
+	startNode(ctx, stack, backend, cfg, true)
 	defer stack.Close()
 
-	// Attach to the newly started node and start the JavaScript console
+	// Attach to the newly started node and create the JavaScript console.
 	client := stack.Attach()
 	config := console.Config{
-		DataDir: utils.MakeDataDir(ctx),
-		DocRoot: ctx.String(utils.JSpathFlag.Name),
-		Client:  client,
-		Preload: utils.MakeConsolePreloads(ctx),
+		DataDir:        utils.MakeDataDir(ctx),
+		DocRoot:        ctx.String(utils.JSpathFlag.Name),
+		Client:         client,
+		LocalTransport: true,
+		Preload:        utils.MakeConsolePreloads(ctx),
 	}
-
 	console, err := console.New(config)
 	if err != nil {
-		utils.Fatalf("failed to start the JavaScript console: %v", err)
+		return fmt.Errorf("failed to start the JavaScript console: %v", err)
 	}
 	defer console.Stop(false)
 
-	// If only a short execution was requested, evaluate and return
+	// If only a short execution was requested, evaluate and return.
 	if script := ctx.String(utils.ExecFlag.Name); script != "" {
 		console.Evaluate(script)
 		return nil
 	}
-	// Otherwise print the welcome screen and enter interactive mode
+
+	// Track node shutdown and stop the console when it goes down.
+	// This happens when SIGTERM is sent to the process.
+	go func() {
+		stack.Wait()
+		console.StopInteractive()
+	}()
+
+	// Print the welcome screen and enter interactive mode.
 	console.Welcome()
 	console.Interactive()
-
 	return nil
 }
 
@@ -115,31 +119,34 @@ func remoteConsole(ctx *cli.Context) error {
 
 	endpoint := ctx.Args().First()
 	if endpoint == "" {
-		path := node.DefaultDataDir()
-		if ctx.IsSet(utils.DataDirFlag.Name) {
-			path = ctx.String(utils.DataDirFlag.Name)
-		}
-		if path != "" {
-			if ctx.Bool(utils.TestnetFlag.Name) {
-				path = filepath.Join(path, "testnet")
-			} else if ctx.Bool(utils.DevnetFlag.Name) {
-				path = filepath.Join(path, "devnet")
-			}
-		}
-		endpoint = fmt.Sprintf("%s/XDC.ipc", path)
+		// path := node.DefaultDataDir()
+		// if ctx.IsSet(utils.DataDirFlag.Name) {
+		// 	path = ctx.String(utils.DataDirFlag.Name)
+		// }
+		// if path != "" {
+		// 	if ctx.Bool(utils.TestnetFlag.Name) {
+		// 		path = filepath.Join(path, "testnet")
+		// 	} else if ctx.Bool(utils.DevnetFlag.Name) {
+		// 		path = filepath.Join(path, "devnet")
+		// 	}
+		// }
+		// endpoint = fmt.Sprintf("%s/XDC.ipc", path)
+		cfg := defaultNodeConfig()
+		utils.SetDataDir(ctx, &cfg)
+		endpoint = cfg.IPCEndpoint()
 	}
 
-	client, err := dialRPC(endpoint)
+	client, localTransport, err := dialRPC(endpoint)
 	if err != nil {
 		utils.Fatalf("Unable to attach to remote XDC: %v", err)
 	}
 	config := console.Config{
-		DataDir: utils.MakeDataDir(ctx),
-		DocRoot: ctx.String(utils.JSpathFlag.Name),
-		Client:  client,
-		Preload: utils.MakeConsolePreloads(ctx),
+		DataDir:        utils.MakeDataDir(ctx),
+		DocRoot:        ctx.String(utils.JSpathFlag.Name),
+		Client:         client,
+		LocalTransport: localTransport,
+		Preload:        utils.MakeConsolePreloads(ctx),
 	}
-
 	console, err := console.New(config)
 	if err != nil {
 		utils.Fatalf("Failed to start the JavaScript console: %v", err)
@@ -154,63 +161,52 @@ func remoteConsole(ctx *cli.Context) error {
 	// Otherwise print the welcome screen and enter interactive mode
 	console.Welcome()
 	console.Interactive()
+	return nil
+}
 
+// ephemeralConsole starts a new geth node, attaches an ephemeral JavaScript
+// console to it, executes each of the files specified as arguments and tears
+// everything down.
+func ephemeralConsole(ctx *cli.Context) error {
+	var b strings.Builder
+	for _, file := range ctx.Args().Slice() {
+		fmt.Fprintf(&b, "loadScript('%s');", file)
+	}
+	utils.Fatalf(`The "js" command is deprecated. Please use the following instead:
+XDC --exec "%s" console`, b.String())
 	return nil
 }
 
 // dialRPC returns a RPC client which connects to the given endpoint.
 // The check for empty endpoint implements the defaulting logic
 // for "XDC attach" and "XDC monitor" with no argument.
-func dialRPC(endpoint string) (*rpc.Client, error) {
-	if endpoint == "" {
-		endpoint = node.DefaultIPCEndpoint(clientIdentifier)
-	} else if strings.HasPrefix(endpoint, "rpc:") || strings.HasPrefix(endpoint, "ipc:") {
-		// Backwards compatibility with geth < 1.5 which required
-		// these prefixes.
-		endpoint = endpoint[4:]
-	}
-	return rpc.Dial(endpoint)
+func dialRPC(endpoint string) (*rpc.Client, bool, error) {
+	endpoint, localTransport := resolveConsoleEndpoint(endpoint)
+	client, err := rpc.Dial(endpoint)
+	return client, localTransport, err
 }
 
-// ephemeralConsole starts a new XDC node, attaches an ephemeral JavaScript
-// console to it, executes each of the files specified as arguments and tears
-// everything down.
-func ephemeralConsole(ctx *cli.Context) error {
-	// Create and start the node based on the CLI flags
-	stack, backend, cfg := makeFullNode(ctx)
-	startNode(ctx, stack, backend, cfg)
-	defer stack.Close()
-
-	// Attach to the newly started node and start the JavaScript console
-	client := stack.Attach()
-	config := console.Config{
-		DataDir: utils.MakeDataDir(ctx),
-		DocRoot: ctx.String(utils.JSpathFlag.Name),
-		Client:  client,
-		Preload: utils.MakeConsolePreloads(ctx),
+func resolveConsoleEndpoint(endpoint string) (string, bool) {
+	if endpoint == "" {
+		return node.DefaultIPCEndpoint(clientIdentifier), true
 	}
-
-	console, err := console.New(config)
+	if strings.HasPrefix(endpoint, "ipc:") {
+		return endpoint[4:], true
+	}
+	endpoint = strings.TrimPrefix(endpoint, "rpc:")
+	if endpoint == "stdio" {
+		return endpoint, false
+	}
+	u, err := url.Parse(endpoint)
 	if err != nil {
-		utils.Fatalf("Failed to start the JavaScript console: %v", err)
+		return endpoint, false
 	}
-	defer console.Stop(false)
-
-	// Evaluate each of the specified JavaScript files
-	for _, file := range ctx.Args().Slice() {
-		if err = console.Execute(file); err != nil {
-			utils.Fatalf("Failed to execute %s: %v", file, err)
-		}
+	switch u.Scheme {
+	case "http", "https", "ws", "wss", "stdio":
+		return endpoint, false
+	case "":
+		return endpoint, true
+	default:
+		return endpoint, false
 	}
-	// Wait for pending callbacks, but stop for Ctrl-C.
-	abort := make(chan os.Signal, 1)
-	signal.Notify(abort, syscall.SIGINT, syscall.SIGTERM)
-
-	go func() {
-		<-abort
-		os.Exit(0)
-	}()
-	console.Stop(true)
-
-	return nil
 }

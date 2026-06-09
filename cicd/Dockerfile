@@ -1,37 +1,38 @@
-FROM golang:1.23-alpine AS builder
+# Support setting various labels on the final image
+ARG GIT_COMMIT=""
+
+FROM golang:1.25-alpine AS builder
 
 RUN apk add make build-base linux-headers
 
-COPY . /builder
-RUN cd /builder && make && mv /builder/build/bin/XDC /builder/build/bin/XDC-mainnet
+WORKDIR /builder
 
-RUN mv /builder/common/constants/constants.go.testnet /builder/common/constants.go
-RUN cd /builder && make && mv /builder/build/bin/XDC /builder/build/bin/XDC-testnet
+COPY . .
 
-RUN mv /builder/common/constants/constants.go.devnet /builder/common/constants.go
-RUN cd /builder && make && mv /builder/build/bin/XDC /builder/build/bin/XDC-devnet
-
-RUN mv /builder/common/constants/constants.go.local /builder/common/constants.go
-RUN cd /builder && make && mv /builder/build/bin/XDC /builder/build/bin/XDC-local
+RUN make puppeth && make
 
 # The runtime image
 FROM alpine:3
+
+ENV GODEBUG=randseednop=0
 
 WORKDIR /work
 
 RUN apk add --no-cache bash curl
 
-COPY --from=builder /builder/build/bin/XDC-local /usr/bin
-COPY --from=builder /builder/build/bin/XDC-devnet /usr/bin
-COPY --from=builder /builder/build/bin/XDC-testnet /usr/bin
-COPY --from=builder /builder/build/bin/XDC-mainnet /usr/bin
+COPY --from=builder /builder/build/bin/puppeth /usr/bin
+COPY --from=builder /builder/build/bin/XDC /usr/bin/XDC
 
 # # Copy over files
 ADD cicd/local /work/local
 ADD cicd/devnet /work/devnet
 ADD cicd/testnet /work/testnet
 ADD cicd/mainnet /work/mainnet
-ADD cicd/entry.sh /work/
+ADD genesis/devnet.json /work/devnet/genesis.json
+ADD genesis/testnet.json /work/testnet/genesis.json
+ADD genesis/mainnet.json /work/mainnet/genesis.json
+ADD cicd/entry.sh /work/entry.sh
+ADD cicd/puppeth.sh /work/puppeth.sh
 
 # Create an empty pwd file
 RUN touch /work/.pwd
@@ -44,3 +45,8 @@ EXPOSE 8555
 EXPOSE 30303
 
 ENTRYPOINT ["bash","/work/entry.sh"]
+
+# Add some metadata labels to help programmatic image consumption
+ARG GIT_COMMIT=""
+ENV GIT_COMMIT="$GIT_COMMIT"
+LABEL git_commit="$GIT_COMMIT"

@@ -2,28 +2,20 @@
 # with Go source code. If you know what GOPATH is then you probably
 # don't need to bother with make.
 
-.PHONY: XDC XDC-cross evm all test clean
-.PHONY: XDC-linux XDC-linux-386 XDC-linux-amd64 XDC-linux-mips64 XDC-linux-mips64le
-.PHONY: XDC-darwin XDC-darwin-386 XDC-darwin-amd64
+.PHONY: XDC evm all test clean
 
 GOBIN = $(shell pwd)/build/bin
-GO ?= 1.23.6
+GO ?= latest
 GORUN = go run
 
 #? XDC: Build XDC.
 XDC:
+	@echo "Rebuild the XDC"
 	go run build/ci.go install ./cmd/XDC
 	@echo "Done building."
 	@echo "Run \"$(GOBIN)/XDC\" to launch XDC."
 
-XDC-devnet-local:
-	@echo "Rebuild the XDC first"
-	mv common/constants.go common/constants.go.tmp
-	cp common/constants/constants.go.devnet common/constants.go
-	make XDC
-	rm -rf common/constants.go
-	mv common/constants.go.tmp common/constants.go
-
+XDC-devnet-local: XDC
 	@echo "Run the devnet script in local"
 	cd cicd/devnet && ./start-local-devnet.sh
 
@@ -43,23 +35,27 @@ all:
 
 #? test: Run the tests.
 test: all
-	go run build/ci.go test
+	go run build/ci.go test -failfast
 
-#? quick-test: Run the tests except time-consuming tests.
+#? quick-test: Run tests in short mode (testing.Short()), fail fast.
 quick-test: all
-	go run build/ci.go test --quick
+	go run build/ci.go test -short -failfast
 
 #? lint: Run certain pre-selected linters.
 lint: ## Run linters.
 	$(GORUN) build/ci.go lint
 
-#? check_tidy: Verify go.mod and go.sum by 'go mod tidy'
-check_tidy: ## Run 'go mod tidy'.
-	$(GORUN) build/ci.go check_tidy
+#? tidy: Verify go.mod and go.sum are updated.
+tidy: ## Run 'go mod tidy'.
+	$(GORUN) build/ci.go tidy
 
-#? check_generate: Verify everything is 'go generate'-ed
-check_generate: ## Run 'go generate ./...'.
-	$(GORUN) build/ci.go check_generate
+#? generate: Verify everything is 'go generate'.
+generate: ## Run 'go generate ./...'.
+	$(GORUN) build/ci.go generate
+
+#? baddeps: Verify certain dependencies are avoided.
+baddeps:
+	$(GORUN) build/ci.go baddeps
 
 #? fmt: Ensure consistent code formatting.
 fmt:
@@ -90,62 +86,3 @@ help: Makefile
 	@echo ''
 	@echo 'Targets:'
 	@sed -n 's/^#?//p' $< | column -t -s ':' |  sort | sed -e 's/^/ /'
-
-# Cross Compilation Targets (xgo)
-
-XDC-cross: XDC-windows-amd64 XDC-darwin-amd64 XDC-linux
-	@echo "Full cross compilation done:"
-	@ls -ld $(GOBIN)/XDC-*
-
-XDC-linux: XDC-linux-386 XDC-linux-amd64 XDC-linux-mips64 XDC-linux-mips64le
-	@echo "Linux cross compilation done:"
-	@ls -ld $(GOBIN)/XDC-linux-*
-
-XDC-linux-386:
-	go run build/ci.go xgo -- --go=$(GO) --targets=linux/386 -v ./cmd/XDC
-	@echo "Linux 386 cross compilation done:"
-	@ls -ld $(GOBIN)/XDC-linux-* | grep 386
-
-XDC-linux-amd64:
-	go run build/ci.go xgo -- --go=$(GO) --targets=linux/amd64 -v ./cmd/XDC
-	@echo "Linux amd64 cross compilation done:"
-	@ls -ld $(GOBIN)/XDC-linux-* | grep amd64
-
-XDC-linux-mips:
-	go run build/ci.go xgo -- --go=$(GO) --targets=linux/mips --ldflags '-extldflags "-static"' -v ./cmd/XDC
-	@echo "Linux MIPS cross compilation done:"
-	@ls -ld $(GOBIN)/XDC-linux-* | grep mips
-
-XDC-linux-mipsle:
-	go run build/ci.go xgo -- --go=$(GO) --targets=linux/mipsle --ldflags '-extldflags "-static"' -v ./cmd/XDC
-	@echo "Linux MIPSle cross compilation done:"
-	@ls -ld $(GOBIN)/XDC-linux-* | grep mipsle
-
-XDC-linux-mips64:
-	go run build/ci.go xgo -- --go=$(GO) --targets=linux/mips64 --ldflags '-extldflags "-static"' -v ./cmd/XDC
-	@echo "Linux MIPS64 cross compilation done:"
-	@ls -ld $(GOBIN)/XDC-linux-* | grep mips64
-
-XDC-linux-mips64le:
-	go run build/ci.go xgo -- --go=$(GO) --targets=linux/mips64le --ldflags '-extldflags "-static"' -v ./cmd/XDC
-	@echo "Linux MIPS64le cross compilation done:"
-	@ls -ld $(GOBIN)/XDC-linux-* | grep mips64le
-
-XDC-darwin: XDC-darwin-386 XDC-darwin-amd64
-	@echo "Darwin cross compilation done:"
-	@ls -ld $(GOBIN)/XDC-darwin-*
-
-XDC-darwin-386:
-	go run build/ci.go xgo -- --go=$(GO) --targets=darwin/386 -v ./cmd/XDC
-	@echo "Darwin 386 cross compilation done:"
-	@ls -ld $(GOBIN)/XDC-darwin-* | grep 386
-
-XDC-darwin-amd64:
-	go run build/ci.go xgo -- --go=$(GO) --targets=darwin/amd64 -v ./cmd/XDC
-	@echo "Darwin amd64 cross compilation done:"
-	@ls -ld $(GOBIN)/XDC-darwin-* | grep amd64
-
-XDC-windows-amd64:
-	go run build/ci.go xgo -- --go=$(GO) -buildmode=mode -x --targets=windows/amd64 -v ./cmd/XDC
-	@echo "Windows amd64 cross compilation done:"
-	@ls -ld $(GOBIN)/XDC-windows-* | grep amd64

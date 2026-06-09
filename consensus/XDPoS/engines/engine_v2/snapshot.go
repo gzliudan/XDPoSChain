@@ -2,9 +2,11 @@ package engine_v2
 
 import (
 	"encoding/json"
+	"fmt"
 
 	"github.com/XinFinOrg/XDPoSChain/common"
 	"github.com/XinFinOrg/XDPoSChain/consensus"
+	"github.com/XinFinOrg/XDPoSChain/core/rawdb"
 	"github.com/XinFinOrg/XDPoSChain/ethdb"
 	"github.com/XinFinOrg/XDPoSChain/log"
 )
@@ -17,11 +19,12 @@ type SnapshotV2 struct {
 	Hash   common.Hash `json:"hash"`   // Block hash where the snapshot was created
 
 	// candidates will get assigned on updateM1
+	// NOTE: must keep JSON tag "masterNodes", ref: PR #517
 	NextEpochCandidates []common.Address `json:"masterNodes"` // Set of authorized candidates nodes at this moment for next epoch
 }
 
-// create new snapshot for next epoch to use
-func newSnapshot(number uint64, hash common.Hash, candidates []common.Address) *SnapshotV2 {
+// NewSnapshot creates a new snapshot for next epoch to use
+func NewSnapshot(number uint64, hash common.Hash, candidates []common.Address) *SnapshotV2 {
 	snap := &SnapshotV2{
 		Number:              number,
 		Hash:                hash,
@@ -32,7 +35,7 @@ func newSnapshot(number uint64, hash common.Hash, candidates []common.Address) *
 
 // loadSnapshot loads an existing snapshot from the database.
 func loadSnapshot(db ethdb.Database, hash common.Hash) (*SnapshotV2, error) {
-	blob, err := db.Get(append([]byte("XDPoS-V2-"), hash[:]...))
+	blob, err := rawdb.ReadXdposV2Snapshot(db, hash)
 	if err != nil {
 		return nil, err
 	}
@@ -44,13 +47,13 @@ func loadSnapshot(db ethdb.Database, hash common.Hash) (*SnapshotV2, error) {
 	return snap, nil
 }
 
-// store inserts the SnapshotV2 into the database.
-func storeSnapshot(s *SnapshotV2, db ethdb.Database) error {
+// StoreSnapshot inserts the SnapshotV2 into the database.
+func StoreSnapshot(s *SnapshotV2, db ethdb.Database) error {
 	blob, err := json.Marshal(s)
 	if err != nil {
 		return err
 	}
-	return db.Put(append([]byte("XDPoS-V2-"), s.Hash[:]...), blob)
+	return rawdb.WriteXdposV2Snapshot(db, s.Hash, blob)
 }
 
 // retrieves candidates nodes list in map type
@@ -77,14 +80,20 @@ func (x *XDPoS_v2) getSnapshot(chain consensus.ChainReader, number uint64, isGap
 	if isGapNumber {
 		gapBlockNum = number
 	} else {
-		gapBlockNum = number - number%x.config.Epoch - x.config.Gap
-		//prevent overflow
-		if number-number%x.config.Epoch < x.config.Gap {
+		gapBlockNum = number - number%x.config.Epoch
+		if gapBlockNum > x.config.Gap {
+			gapBlockNum -= x.config.Gap
+		} else {
 			gapBlockNum = 0
 		}
 	}
 
-	gapBlockHash := chain.GetHeaderByNumber(gapBlockNum).Hash()
+	gapHeader := chain.GetHeaderByNumber(gapBlockNum)
+	if gapHeader == nil {
+		log.Error("[getSnapshot] Fail to get header", "number", gapBlockNum)
+		return nil, fmt.Errorf("getSnapshot fail to get header by number: %v", gapBlockNum)
+	}
+	gapBlockHash := gapHeader.Hash()
 	log.Debug("get snapshot from gap block", "number", gapBlockNum, "hash", gapBlockHash.Hex())
 
 	// If an in-memory SnapshotV2 was found, use that

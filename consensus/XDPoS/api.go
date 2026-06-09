@@ -16,13 +16,15 @@
 package XDPoS
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math/big"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -32,6 +34,7 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/core/types"
 	"github.com/XinFinOrg/XDPoSChain/log"
 	"github.com/XinFinOrg/XDPoSChain/params"
+	"github.com/XinFinOrg/XDPoSChain/params/chainconfigview"
 	"github.com/XinFinOrg/XDPoSChain/rlp"
 	"github.com/XinFinOrg/XDPoSChain/rpc"
 )
@@ -50,7 +53,7 @@ type V2BlockInfo struct {
 	ParentHash common.Hash
 	Committed  bool
 	Miner      common.Hash
-	Timestamp  *big.Int
+	Timestamp  uint64
 	EncodedRLP string
 	Error      string
 }
@@ -120,12 +123,34 @@ const (
 
 type MessageStatus map[string]map[string]SignerTypes
 
+type configBackend struct {
+	chain consensus.ChainReader
+}
+
+func (b configBackend) GenesisHeader(_ context.Context) (*types.Header, error) {
+	header := b.chain.GetHeaderByNumber(0)
+	if header == nil {
+		return nil, errors.New("genesis header not found")
+	}
+	return header, nil
+}
+
+func (b configBackend) CurrentHeader() *types.Header {
+	return b.chain.CurrentHeader()
+}
+
+func (b configBackend) ChainConfig() *params.ChainConfig {
+	return b.chain.Config()
+}
+
 // GetSnapshot retrieves the state snapshot at a given block.
 func (api *API) GetSnapshot(number *rpc.BlockNumber) (*utils.PublicApiSnapshot, error) {
 	// Retrieve the requested block number (or current if none requested)
 	var header *types.Header
 	if number == nil || *number == rpc.LatestBlockNumber {
 		header = api.chain.CurrentHeader()
+	} else if number.Int64() < 0 {
+		return nil, fmt.Errorf("invalid block number %d", number.Int64())
 	} else {
 		header = api.chain.GetHeaderByNumber(uint64(number.Int64()))
 	}
@@ -151,6 +176,8 @@ func (api *API) GetSigners(number *rpc.BlockNumber) ([]common.Address, error) {
 	var header *types.Header
 	if number == nil || *number == rpc.LatestBlockNumber {
 		header = api.chain.CurrentHeader()
+	} else if number.Int64() < 0 {
+		return nil, fmt.Errorf("invalid block number %d", number.Int64())
 	} else {
 		header = api.chain.GetHeaderByNumber(uint64(number.Int64()))
 	}
@@ -175,11 +202,27 @@ func (api *API) GetMasternodesByNumber(number *rpc.BlockNumber) MasternodesStatu
 	var header *types.Header
 	if number == nil || *number == rpc.LatestBlockNumber {
 		header = api.chain.CurrentHeader()
-	} else if *number == rpc.CommittedBlockNumber {
-		hash := api.XDPoS.EngineV2.GetLatestCommittedBlockInfo().Hash
-		header = api.chain.GetHeaderByHash(hash)
+	} else if *number == rpc.FinalizedBlockNumber {
+		if info := api.XDPoS.EngineV2.GetLatestCommittedBlockInfo(); info != nil {
+			header = api.chain.GetHeaderByHash(info.Hash)
+		}
+	} else if number.Int64() < 0 {
+		return MasternodesStatus{
+			Error: fmt.Errorf("invalid block number %d", number.Int64()),
+		}
 	} else {
 		header = api.chain.GetHeaderByNumber(uint64(number.Int64()))
+	}
+
+	if header == nil {
+		if number == nil {
+			return MasternodesStatus{
+				Error: errors.New("can not get header by nil number"),
+			}
+		}
+		return MasternodesStatus{
+			Error: fmt.Errorf("can not get header by number %d", number.Int64()),
+		}
 	}
 
 	round, err := api.XDPoS.EngineV2.GetRoundNumber(header)
@@ -269,16 +312,26 @@ func (api *API) GetV2BlockByHeader(header *types.Header, uncle bool) *V2BlockInf
 }
 
 func (api *API) GetV2BlockByNumber(number *rpc.BlockNumber) *V2BlockInfo {
-	header := api.getHeaderFromApiBlockNum(number)
-	if header == nil {
+	header, err := api.getHeaderFromApiBlockNum(number)
+	if err != nil {
 		return &V2BlockInfo{
-			Number: big.NewInt(number.Int64()),
-			Error:  "can not find block from this number",
+			Error: err.Error(),
+		}
+	}
+	if header == nil {
+		if number == nil {
+			return &V2BlockInfo{
+				Error: "can not find block from nil number",
+			}
+		} else {
+			return &V2BlockInfo{
+				Number: big.NewInt(number.Int64()),
+				Error:  "can not find block from this number",
+			}
 		}
 	}
 
-	uncle := false
-	return api.GetV2BlockByHeader(header, uncle)
+	return api.GetV2BlockByHeader(header, false)
 }
 
 // Confirm V2 Block Committed Status
@@ -293,45 +346,67 @@ func (api *API) GetV2BlockByHash(blockHash common.Hash) *V2BlockInfo {
 
 	// confirm this is on the main chain
 	chainHeader := api.chain.GetHeaderByNumber(header.Number.Uint64())
-	uncle := false
-	if header.Hash() != chainHeader.Hash() {
-		uncle = true
+	if chainHeader == nil {
+		return &V2BlockInfo{
+			Number: header.Number,
+			Error:  "can not find chain header from this number",
+		}
 	}
 
+	uncle := header.Hash() != chainHeader.Hash()
 	return api.GetV2BlockByHeader(header, uncle)
 }
 
 func (api *API) NetworkInformation() NetworkInformation {
 	info := NetworkInformation{}
-	info.NetworkId = api.chain.Config().ChainId
+	config := api.chain.Config()
+	info.NetworkId = config.ChainID
 	info.XDCValidatorAddress = common.MasternodeVotingSMCBinary
-	info.LendingAddress = common.LendingRegistrationSMC
-	info.RelayerRegistrationAddress = common.RelayerRegistrationSMC
-	info.XDCXListingAddress = common.XDCXListingSMC
-	info.XDCZAddress = common.TRC21IssuerSMC
+	info.LendingAddress = config.LendingRegistrationSMC
+	info.RelayerRegistrationAddress = config.RelayerRegistrationSMC
+	info.XDCXListingAddress = config.XDCXListingSMC
+	info.XDCZAddress = config.TRC21IssuerSMC
 	info.ConsensusConfigs = *api.XDPoS.config
 
 	return info
+}
+
+// Config returns the current and scheduled chain configuration view.
+func (api *API) Config(ctx context.Context) (*chainconfigview.ConfigResponse, error) {
+	return chainconfigview.Build(ctx, configBackend{chain: api.chain})
 }
 
 /*
 An API exclusively for V2 consensus, designed to assist in troubleshooting miners by identifying who mined during their allocated term.
 */
 func (api *API) GetMissedRoundsInEpochByBlockNum(number *rpc.BlockNumber) (*utils.PublicApiMissedRoundsMetadata, error) {
-	return api.XDPoS.CalculateMissingRounds(api.chain, api.getHeaderFromApiBlockNum(number))
+	header, err := api.getHeaderFromApiBlockNum(number)
+	if err != nil {
+		return nil, err
+	}
+	if header == nil {
+		if number == nil {
+			return nil, errors.New("can not get header by nil number")
+		}
+		return nil, fmt.Errorf("can not get header by number %d", number.Int64())
+	}
+	return api.XDPoS.CalculateMissingRounds(api.chain, header)
 }
 
-func (api *API) getHeaderFromApiBlockNum(number *rpc.BlockNumber) *types.Header {
+func (api *API) getHeaderFromApiBlockNum(number *rpc.BlockNumber) (*types.Header, error) {
 	var header *types.Header
 	if number == nil || *number == rpc.LatestBlockNumber {
 		header = api.chain.CurrentHeader()
-	} else if *number == rpc.CommittedBlockNumber {
-		hash := api.XDPoS.EngineV2.GetLatestCommittedBlockInfo().Hash
-		header = api.chain.GetHeaderByHash(hash)
+	} else if *number == rpc.FinalizedBlockNumber {
+		if info := api.XDPoS.EngineV2.GetLatestCommittedBlockInfo(); info != nil {
+			header = api.chain.GetHeaderByHash(info.Hash)
+		}
+	} else if number.Int64() < 0 {
+		return nil, fmt.Errorf("invalid block number %d", number.Int64())
 	} else {
 		header = api.chain.GetHeaderByNumber(uint64(number.Int64()))
 	}
-	return header
+	return header, nil
 }
 
 func calculateSigners(message map[string]SignerTypes, pool map[string]map[common.Hash]utils.PoolObj, masternodes []common.Address) {
@@ -413,16 +488,34 @@ func (api *API) GetRewardByAccount(account common.Address, begin rpc.BlockNumber
 }
 
 func (api *API) getRewardFileNamesInRange(begin, end *rpc.BlockNumber) ([]rewardFileName, error) {
-	beginHeader := api.getHeaderFromApiBlockNum(begin)
-	if beginHeader == nil {
-		return nil, errors.New("illegal begin block number")
+	beginHeader, err := api.getHeaderFromApiBlockNum(begin)
+	if err != nil {
+		if begin == nil {
+			return nil, fmt.Errorf("can not get begin header from nil number, err: %w", err)
+		}
+		return nil, fmt.Errorf("can not get begin header from number %d, err: %w", begin.Int64(), err)
 	}
-	endHeader := api.getHeaderFromApiBlockNum(end)
+	if beginHeader == nil {
+		if begin == nil {
+			return nil, errors.New("begin block number is nil")
+		}
+		return nil, fmt.Errorf("illegal begin block number %d", begin.Int64())
+	}
+	endHeader, err := api.getHeaderFromApiBlockNum(end)
+	if err != nil {
+		if end == nil {
+			return nil, fmt.Errorf("can not get end header from nil number, err: %w", err)
+		}
+		return nil, fmt.Errorf("can not get end header from number %d, err: %w", end.Int64(), err)
+	}
 	if endHeader == nil {
-		return nil, errors.New("illegal end block number")
+		if end == nil {
+			return nil, errors.New("end block number is nil")
+		}
+		return nil, fmt.Errorf("illegal end block number %d", end.Int64())
 	}
 	if beginHeader.Number.Cmp(endHeader.Number) > 0 {
-		return nil, errors.New("illegal begin and end block number, begin > end")
+		return nil, fmt.Errorf("illegal block numbers: begin(%d) > end(%d)", beginHeader.Number.Int64(), endHeader.Number.Int64())
 	}
 	diff := new(big.Int).Sub(endHeader.Number, beginHeader.Number).Int64()
 	if diff < 0 {
@@ -435,8 +528,11 @@ func (api *API) getRewardFileNamesInRange(begin, end *rpc.BlockNumber) ([]reward
 	if err != nil {
 		return nil, err
 	}
+	if len(files) == 0 {
+		return nil, errors.New("no file in rewards folder")
+	}
 
-	var rewardFileNames = []rewardFileName{}
+	rewardFileNames := make([]rewardFileName, 0, len(files))
 	for _, file := range files {
 		if !file.IsDir() {
 			filePrefix, fileSuffix, found := strings.Cut(file.Name(), ".")
@@ -455,27 +551,30 @@ func (api *API) getRewardFileNamesInRange(begin, end *rpc.BlockNumber) ([]reward
 			}
 		}
 	}
+	if len(rewardFileNames) == 0 {
+		return nil, errors.New("no reward file in rewards folder")
+	}
 
-	sort.Slice(rewardFileNames, func(i, j int) bool {
-		return rewardFileNames[i].epochBlockNum < rewardFileNames[j].epochBlockNum
+	slices.SortFunc(rewardFileNames, func(a, b rewardFileName) int {
+		return a.epochBlockNum - b.epochBlockNum
 	})
-
-	epochNumbers := make([]int, len(rewardFileNames))
-	for i, obj := range rewardFileNames {
-		epochNumbers[i] = obj.epochBlockNum
+	startIndex, _ := slices.BinarySearchFunc(rewardFileNames, int(beginHeader.Number.Int64()), func(rfn rewardFileName, number int) int {
+		return rfn.epochBlockNum - number
+	})
+	if startIndex == len(rewardFileNames) {
+		// retrun early if startIndex is out of bounds
+		return []rewardFileName{}, nil
+	}
+	endIndex, _ := slices.BinarySearchFunc(rewardFileNames, int(endHeader.Number.Int64()), func(rfn rewardFileName, number int) int {
+		return rfn.epochBlockNum - number
+	})
+	if endIndex != len(rewardFileNames) {
+		endIndex++ // include the endIndex file
 	}
 
-	startIndex := sort.SearchInts(epochNumbers, int(beginHeader.Number.Int64()))
-	endIndex := sort.SearchInts(epochNumbers, int(endHeader.Number.Int64()))
-	if endIndex == len(epochNumbers) {
-		endIndex--  //this is to prevent endIndex out of bounds when endInput is higher than last reward(epoch) block but lower than latest block
-	}
-
-	var rewardfileNamesInRange []rewardFileName
-	for i := startIndex; i <= endIndex; i++ {
-		rewardfileNamesInRange = append(rewardfileNamesInRange, rewardFileNames[i])
-	}
-	return rewardfileNamesInRange, nil
+	// compact the slice's memory
+	ret := rewardFileNames[startIndex:endIndex]
+	return slices.Clip(ret), nil
 }
 
 func getEpochReward(account common.Address, header *types.Header) (AccountEpochReward, error) {
@@ -509,20 +608,43 @@ func getEpochReward(account common.Address, header *types.Header) (AccountEpochR
 	return epochReward, nil
 }
 
+// jsonNumberToBigInt parses a json.Number into a *big.Int, handling both plain
+// decimal strings (e.g. "4500000000000000000") and scientific notation
+// (e.g. "4.5e+21") that big.Int.SetString cannot parse directly.
+func jsonNumberToBigInt(n json.Number) (*big.Int, bool) {
+	s := n.String()
+	// Try plain integer first — the common case.
+	if i, ok := new(big.Int).SetString(s, 10); ok {
+		return i, true
+	}
+	// Fall back to big.Float to handle scientific notation.
+	f, _, err := new(big.Float).SetPrec(256).Parse(s, 10)
+	if err != nil {
+		log.Warn("[jsonNumberToBigInt] Failed to parse json.Number:", "number", s, "err", err)
+		return nil, false
+	}
+
+	i, acc := f.Int(nil)
+	if acc != big.Exact {
+		// The value had a fractional part; truncate is the best we can do
+		log.Warn("[jsonNumberToBigInt] json.Number is not an exact integer value", "number", s, "truncated", i.String(), "accuracy", acc)
+	}
+
+	return i, true
+}
+
 func (rewardObj *AccountEpochReward) getRewardAndStatus(account string, data map[string]interface{}) {
 	if signersData, exists := data["signers"]; exists {
 		if accountData, ok := signersData.(map[string]interface{})[account]; ok {
 			nodeReward := accountData.(map[string]interface{})["reward"]
 			delegatedReward := data["rewards"].(map[string]interface{})[account]
 			rewardObj.AccountStatus = statusMasternode
-			nodeRewardBigInt, ok := new(big.Int).SetString(nodeReward.(json.Number).String(), 10)
-			if ok {
+			if nodeRewardBigInt, ok := jsonNumberToBigInt(nodeReward.(json.Number)); ok {
 				rewardObj.AccountReward = nodeRewardBigInt
 			}
 
 			for k, v := range delegatedReward.(map[string]interface{}) {
-				delegatedBigInt, ok := new(big.Int).SetString(v.(json.Number).String(), 10)
-				if ok {
+				if delegatedBigInt, ok := jsonNumberToBigInt(v.(json.Number)); ok {
 					rewardObj.DelegatedReward[k] = delegatedBigInt
 				}
 			}
@@ -535,20 +657,17 @@ func (rewardObj *AccountEpochReward) getRewardAndStatus(account string, data map
 			nodeReward := accountData.(map[string]interface{})["reward"]
 			delegatedReward := data["rewardsProtector"].(map[string]interface{})[account]
 			rewardObj.AccountStatus = statusProtectornode
-			nodeRewardBigInt, successSetNodeReward := new(big.Int).SetString(nodeReward.(json.Number).String(), 10)
-			if successSetNodeReward {
+			if nodeRewardBigInt, ok := jsonNumberToBigInt(nodeReward.(json.Number)); ok {
 				rewardObj.AccountReward = nodeRewardBigInt
 			}
 
 			for k, v := range delegatedReward.(map[string]interface{}) {
-				delegatedBigInt, successSetDelegatedReward := new(big.Int).SetString(v.(json.Number).String(), 10)
-				if successSetDelegatedReward {
+				if delegatedBigInt, ok := jsonNumberToBigInt(v.(json.Number)); ok {
 					rewardObj.DelegatedReward[k] = delegatedBigInt
 				}
 			}
 			return
 		}
-
 	}
 
 	if signersData, exists := data["signersObserver"]; exists {
@@ -556,32 +675,48 @@ func (rewardObj *AccountEpochReward) getRewardAndStatus(account string, data map
 			nodeReward := accountData.(map[string]interface{})["reward"]
 			delegatedReward := data["rewardsObserver"].(map[string]interface{})[account]
 			rewardObj.AccountStatus = statusObservernode
-			nodeRewardBigInt, successSetNodeReward := new(big.Int).SetString(nodeReward.(json.Number).String(), 10)
-			if successSetNodeReward {
+			if nodeRewardBigInt, ok := jsonNumberToBigInt(nodeReward.(json.Number)); ok {
 				rewardObj.AccountReward = nodeRewardBigInt
 			}
 
 			for k, v := range delegatedReward.(map[string]interface{}) {
-				delegatedBigInt, successSetDelegatedReward := new(big.Int).SetString(v.(json.Number).String(), 10)
-				if successSetDelegatedReward {
+				if delegatedBigInt, ok := jsonNumberToBigInt(v.(json.Number)); ok {
 					rewardObj.DelegatedReward[k] = delegatedBigInt
 				}
 			}
 			return
 		}
 	}
-
 }
 
 func (api *API) GetEpochNumbersBetween(begin, end *rpc.BlockNumber) ([]uint64, error) {
-	beginHeader := api.getHeaderFromApiBlockNum(begin)
+	beginHeader, err := api.getHeaderFromApiBlockNum(begin)
+	if err != nil {
+		if begin == nil {
+			return nil, fmt.Errorf("can not get begin header from nil number, err: %w", err)
+		}
+		return nil, fmt.Errorf("can not get begin header from number %d, err: %w", begin.Int64(), err)
+	}
 	if beginHeader == nil {
-		return nil, errors.New("illegal begin block number")
+		if begin == nil {
+			return nil, errors.New("begin block is nil")
+		}
+		return nil, fmt.Errorf("illegal begin block number %d", begin.Int64())
 	}
-	endHeader := api.getHeaderFromApiBlockNum(end)
+	endHeader, err := api.getHeaderFromApiBlockNum(end)
+	if err != nil {
+		if end == nil {
+			return nil, fmt.Errorf("can not get end header from nil number, err: %w", err)
+		}
+		return nil, fmt.Errorf("can not get end header from number %d, err: %w", end.Int64(), err)
+	}
 	if endHeader == nil {
-		return nil, errors.New("illegal end block number")
+		if end == nil {
+			return nil, errors.New("end block number is nil")
+		}
+		return nil, fmt.Errorf("illegal end block number %d", end.Int64())
 	}
+
 	diff := new(big.Int).Sub(endHeader.Number, beginHeader.Number).Int64()
 	if diff < 0 {
 		return nil, errors.New("illegal begin and end block number, begin > end")
@@ -604,15 +739,16 @@ func (api *API) GetEpochNumbersBetween(begin, end *rpc.BlockNumber) ([]uint64, e
 An API exclusively for V2 consensus, designed to assist in getting rewards of the epoch number.
 Given the epoch number, search the epoch switch block.
 */
-func (api *API) GetBlockInfoByEpochNum(epochNumber uint64) (*utils.EpochNumInfo, error) {
+func (api *API) GetBlockInfoByV2EpochNum(epochNumber uint64) (*utils.EpochNumInfo, error) {
 	thisEpoch, err := api.XDPoS.EngineV2.GetBlockByEpochNumber(api.chain, epochNumber)
 	if err != nil {
 		return nil, err
 	}
 	info := &utils.EpochNumInfo{
 		EpochBlockHash:        thisEpoch.Hash,
-		EpochRound:            thisEpoch.Round,
+		EpochRound:            &thisEpoch.Round,
 		EpochFirstBlockNumber: thisEpoch.Number,
+		EpochConsensusVersion: "v2",
 	}
 	nextEpoch, err := api.XDPoS.EngineV2.GetBlockByEpochNumber(api.chain, epochNumber+1)
 
@@ -620,4 +756,29 @@ func (api *API) GetBlockInfoByEpochNum(epochNumber uint64) (*utils.EpochNumInfo,
 		info.EpochLastBlockNumber = new(big.Int).Sub(nextEpoch.Number, big.NewInt(1))
 	}
 	return info, nil
+}
+
+func (api *API) CalculateBlockInfoByV1EpochNum(targetEpochNum uint64) (*utils.EpochNumInfo, error) {
+	epoch := api.XDPoS.config.Epoch //900
+	epochBlockNum := targetEpochNum*epoch + 1
+	currentBlock := api.chain.CurrentHeader().Number.Uint64()
+	if currentBlock < epochBlockNum {
+		return nil, fmt.Errorf("epoch not reached: current block number %d, epoch block number %d", currentBlock, epochBlockNum)
+	}
+
+	epochLastBlockNum := epochBlockNum + epoch - 1
+
+	return &utils.EpochNumInfo{
+		EpochBlockHash:        api.chain.GetHeaderByNumber(epochBlockNum).Hash(),
+		EpochFirstBlockNumber: big.NewInt(int64(epochBlockNum)),
+		EpochLastBlockNumber:  big.NewInt(int64(epochLastBlockNum)),
+		EpochConsensusVersion: "v1",
+	}, nil
+}
+
+func (api *API) GetBlockInfoByEpochNum(epochNumber uint64) (*utils.EpochNumInfo, error) {
+	if epochNumber < api.XDPoS.config.V2.SwitchEpoch {
+		return api.CalculateBlockInfoByV1EpochNum(epochNumber)
+	}
+	return api.GetBlockInfoByV2EpochNum(epochNumber)
 }
