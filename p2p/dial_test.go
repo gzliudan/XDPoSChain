@@ -722,7 +722,19 @@ func (d *countingDialer) Dial(*enode.Node) (net.Conn, error) {
 // removed and the upstream single-connection semantics restored.
 func TestDialTaskDoSingleDial(t *testing.T) {
 	remkey := newkey()
-	srv := startTestServer(t, &remkey.PublicKey, func(p *Peer) {})
+	srv := &Server{
+		Config: Config{
+			Name:        "test",
+			MaxPeers:    10,
+			NoDiscovery: true,
+			PrivateKey:  newkey(),
+		},
+		newPeerHook:  func(p *Peer) {},
+		newTransport: func(fd net.Conn) transport { return newTestTransport(&remkey.PublicKey, fd) },
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatalf("Could not start server: %v", err)
+	}
 	defer srv.Stop()
 
 	dialer := &countingDialer{}

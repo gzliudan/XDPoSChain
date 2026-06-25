@@ -17,9 +17,9 @@
 package eth
 
 import (
-	"encoding/json"
 	"fmt"
 	"math/big"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -63,6 +63,8 @@ func errResp(code errCode, format string, v ...interface{}) error {
 type ProtocolManager struct {
 	networkId uint64
 
+	stopping uint32
+
 	snapSync  uint32 // Flag whether snap sync is enabled (gets disabled if we already have blocks)
 	acceptTxs uint32 // Flag whether we're considered synchronised (enables transaction processing)
 
@@ -95,6 +97,8 @@ type ProtocolManager struct {
 	// wait group is used for graceful shutdowns during downloading
 	// and processing
 	wg             sync.WaitGroup
+	handlerLock    sync.Mutex
+	registeredLive map[string]registeredPeerHandler
 	knownTxs       *lru.Cache[common.Hash, struct{}]
 	knowOrderTxs   *lru.Cache[common.Hash, struct{}]
 	knowLendingTxs *lru.Cache[common.Hash, struct{}]
@@ -103,6 +107,11 @@ type ProtocolManager struct {
 	knownVotes     *lru.Cache[common.Hash, struct{}]
 	knownSyncInfos *lru.Cache[common.Hash, struct{}]
 	knownTimeouts  *lru.Cache[common.Hash, struct{}]
+}
+
+type registeredPeerHandler struct {
+	peer  *peer
+	stage string
 }
 
 // NewProtocolManagerEx add order pool to protocol
@@ -263,6 +272,193 @@ func (pm *ProtocolManager) removePeer(id string) {
 	}
 	// Hard disconnect at the networking layer
 	peer.Peer.Disconnect(p2p.DiscUselessPeer)
+	closePeerReadWriter(peer.rw)
+	log.Info("Ethereum peer removal forced close", "peer", id, "remote", peer.RemoteAddr())
+}
+
+func registeredPeerHandlerKey(p *peer) string {
+	return p.id + "|" + p.RemoteAddr().String()
+}
+
+func (pm *ProtocolManager) trackRegisteredPeerHandler(p *peer, stage string) {
+	pm.handlerLock.Lock()
+	defer pm.handlerLock.Unlock()
+
+	if pm.registeredLive == nil {
+		pm.registeredLive = make(map[string]registeredPeerHandler)
+	}
+	pm.registeredLive[registeredPeerHandlerKey(p)] = registeredPeerHandler{peer: p, stage: stage}
+}
+
+func (pm *ProtocolManager) updateRegisteredPeerHandlerStage(p *peer, stage string) {
+	pm.handlerLock.Lock()
+	defer pm.handlerLock.Unlock()
+
+	if pm.registeredLive == nil {
+		return
+	}
+	key := registeredPeerHandlerKey(p)
+	handler, ok := pm.registeredLive[key]
+	if !ok {
+		return
+	}
+	handler.stage = stage
+	pm.registeredLive[key] = handler
+}
+
+func (pm *ProtocolManager) untrackRegisteredPeerHandler(p *peer) {
+	pm.handlerLock.Lock()
+	defer pm.handlerLock.Unlock()
+
+	if pm.registeredLive == nil {
+		return
+	}
+	delete(pm.registeredLive, registeredPeerHandlerKey(p))
+}
+
+func (pm *ProtocolManager) snapshotRegisteredPeerHandlers() []registeredPeerHandler {
+	pm.handlerLock.Lock()
+	defer pm.handlerLock.Unlock()
+
+	handlers := make([]registeredPeerHandler, 0, len(pm.registeredLive))
+	for _, handler := range pm.registeredLive {
+		handlers = append(handlers, handler)
+	}
+	sort.Slice(handlers, func(i, j int) bool {
+		if handlers[i].peer.id == handlers[j].peer.id {
+			return handlers[i].peer.RemoteAddr().String() < handlers[j].peer.RemoteAddr().String()
+		}
+		return handlers[i].peer.id < handlers[j].peer.id
+	})
+	return handlers
+}
+
+func closePeerReadWriter(rw p2p.MsgReadWriter) {
+	if closer, ok := rw.(interface{ Close() error }); ok {
+		_ = closer.Close()
+	}
+}
+
+func (pm *ProtocolManager) disconnectRegisteredPeerHandlers() {
+	for _, handler := range pm.snapshotRegisteredPeerHandlers() {
+		handler.peer.Disconnect(p2p.DiscQuitting)
+		closePeerReadWriter(handler.peer.rw)
+	}
+}
+
+func (pm *ProtocolManager) logRegisteredPeerHandlers(prefix string) {
+	for _, handler := range pm.snapshotRegisteredPeerHandlers() {
+		log.Info(prefix, "peer", handler.peer.id, "remote", handler.peer.RemoteAddr(), "stage", handler.stage)
+	}
+}
+
+func (pm *ProtocolManager) shouldAbortRequestDuringShutdown(msgCode uint64) bool {
+	if atomic.LoadUint32(&pm.stopping) == 0 {
+		return false
+	}
+	switch msgCode {
+	case GetBlockHeadersMsg, GetBlockBodiesMsg:
+		return true
+	case GetNodeDataMsg, GetReceiptsMsg:
+		return true
+	default:
+		return false
+	}
+}
+
+func (pm *ProtocolManager) collectHeadersForQuery(query *getBlockHeadersData, getHeaderByHash func(common.Hash) *types.Header, getHeaderByNumber func(uint64) *types.Header, getHashesFromHash func(common.Hash, uint64) []common.Hash) ([]*types.Header, error) {
+	hashMode := query.Origin.Hash != (common.Hash{})
+	var (
+		bytes   common.StorageSize
+		headers []*types.Header
+		unknown bool
+	)
+	for !unknown && len(headers) < int(query.Amount) && bytes < softResponseLimit && len(headers) < downloader.MaxHeaderFetch {
+		if pm.shouldAbortRequestDuringShutdown(GetBlockHeadersMsg) {
+			return nil, p2p.DiscQuitting
+		}
+		var origin *types.Header
+		if hashMode {
+			origin = getHeaderByHash(query.Origin.Hash)
+		} else {
+			origin = getHeaderByNumber(query.Origin.Number)
+		}
+		if pm.shouldAbortRequestDuringShutdown(GetBlockHeadersMsg) {
+			return nil, p2p.DiscQuitting
+		}
+		if origin == nil {
+			break
+		}
+		number := origin.Number.Uint64()
+		headers = append(headers, origin)
+		bytes += estHeaderRlpSize
+
+		switch {
+		case query.Origin.Hash != (common.Hash{}) && query.Reverse:
+			for i := 0; i < int(query.Skip)+1; i++ {
+				if header := getHeaderByHash(query.Origin.Hash); header != nil {
+					query.Origin.Hash = header.ParentHash
+					number--
+				} else {
+					unknown = true
+					break
+				}
+			}
+		case query.Origin.Hash != (common.Hash{}) && !query.Reverse:
+			var (
+				current = origin.Number.Uint64()
+				next    = current + query.Skip + 1
+			)
+			if next <= current {
+				unknown = true
+			} else {
+				if header := getHeaderByNumber(next); header != nil {
+					if getHashesFromHash(header.Hash(), query.Skip+1)[query.Skip] == query.Origin.Hash {
+						query.Origin.Hash = header.Hash()
+					} else {
+						unknown = true
+					}
+				} else {
+					unknown = true
+				}
+			}
+		case query.Reverse:
+			if query.Origin.Number >= query.Skip+1 {
+				query.Origin.Number -= query.Skip + 1
+			} else {
+				unknown = true
+			}
+		case !query.Reverse:
+			query.Origin.Number += query.Skip + 1
+		}
+	}
+	return headers, nil
+}
+
+func (pm *ProtocolManager) collectBodiesForRequest(msgStream *rlp.Stream, getBodyRLP func(common.Hash) rlp.RawValue) ([]rlp.RawValue, error) {
+	var (
+		hash   common.Hash
+		bytes  int
+		bodies []rlp.RawValue
+	)
+	for bytes < softResponseLimit && len(bodies) < downloader.MaxBlockFetch {
+		if pm.shouldAbortRequestDuringShutdown(GetBlockBodiesMsg) {
+			return nil, p2p.DiscQuitting
+		}
+		if err := msgStream.Decode(&hash); err == rlp.EOL {
+			break
+		} else if err != nil {
+			return nil, errResp(ErrDecode, "stream decode: %v", err)
+		}
+		if pm.shouldAbortRequestDuringShutdown(GetBlockBodiesMsg) {
+			return nil, p2p.DiscQuitting
+		}
+		if data := getBodyRLP(hash); len(data) != 0 {
+			bodies = append(bodies, data)
+			bytes += len(data)
+		}
+	}
+	return bodies, nil
 }
 
 func (pm *ProtocolManager) Start(maxPeers int) {
@@ -293,6 +489,7 @@ func (pm *ProtocolManager) Start(maxPeers int) {
 
 func (pm *ProtocolManager) Stop() {
 	log.Info("Stopping Ethereum protocol")
+	atomic.StoreUint32(&pm.stopping, 1)
 
 	pm.txsSub.Unsubscribe() // quits txBroadcastLoop
 	if pm.orderTxSub != nil {
@@ -305,19 +502,29 @@ func (pm *ProtocolManager) Stop() {
 
 	// Quit the sync loop.
 	// After this send has completed, no new peers will be accepted.
+	log.Info("Ethereum protocol stop: signaling sync loop", "peerCount", pm.peers.Len(), "registeredHandlers", len(pm.snapshotRegisteredPeerHandlers()))
 	pm.noMorePeers <- struct{}{}
+	log.Info("Ethereum protocol stop: sync loop signaled")
 
 	// Quit fetcher, txsyncLoop.
+	log.Info("Ethereum protocol stop: closing quitSync")
 	close(pm.quitSync)
+	log.Info("Ethereum protocol stop: quitSync closed")
 
 	// Disconnect existing sessions.
 	// This also closes the gate for any new registrations on the peer set.
 	// sessions which are already established but not added to pm.peers yet
 	// will exit when they try to register.
+	log.Info("Ethereum protocol stop: disconnecting peerSet", "peerCount", pm.peers.Len(), "registeredHandlers", len(pm.snapshotRegisteredPeerHandlers()))
 	pm.peers.Close()
+	pm.disconnectRegisteredPeerHandlers()
+	log.Info("Ethereum protocol stop: peerSet disconnected")
 
 	// Wait for all peer handler goroutines and the loops to come down.
+	log.Info("Ethereum protocol stop: waiting for goroutines", "registeredHandlers", len(pm.snapshotRegisteredPeerHandlers()))
+	pm.logRegisteredPeerHandlers("Ethereum protocol stop: active registered handler")
 	pm.wg.Wait()
+	log.Info("Ethereum protocol stop: goroutines exited", "registeredHandlers", len(pm.snapshotRegisteredPeerHandlers()))
 
 	log.Info("Ethereum protocol stopped")
 }
@@ -355,7 +562,11 @@ func (pm *ProtocolManager) handle(p *peer) error {
 		p.Log().Error("Ethereum peer registration failed", "err", err)
 		return err
 	}
-	defer pm.removePeer(p.id)
+	pm.trackRegisteredPeerHandler(p, "registered")
+	defer func() {
+		pm.untrackRegisteredPeerHandler(p)
+		pm.removePeer(p.id)
+	}()
 	// Register the peer in the downloader. If the downloader considers it banned, we disconnect
 	if err := pm.downloader.RegisterPeer(p.id, p.version, p); err != nil {
 		return err
@@ -396,13 +607,36 @@ func (pm *ProtocolManager) handle(p *peer) error {
 // handleMsg is invoked whenever an inbound message is received from a remote
 // peer. The remote connection is torn down upon returning any error.
 func (pm *ProtocolManager) handleMsg(p *peer) error {
+	pm.updateRegisteredPeerHandlerStage(p, "waiting_read_msg")
+	if atomic.LoadUint32(&pm.stopping) == 1 {
+		p.Log().Info("Ethereum peer waiting for message during shutdown", "peer", p.id, "remote", p.RemoteAddr())
+	}
 	// Read the next message from the remote peer, and ensure it's fully consumed
 	msg, err := p.rw.ReadMsg()
 	if err != nil {
+		if atomic.LoadUint32(&pm.stopping) == 1 {
+			p.Log().Info("Ethereum peer read message returned during shutdown", "peer", p.id, "remote", p.RemoteAddr(), "err", err)
+		}
 		return err
+	}
+	pm.updateRegisteredPeerHandlerStage(p, fmt.Sprintf("handling_msg_%d", msg.Code))
+	if atomic.LoadUint32(&pm.stopping) == 1 {
+		p.Log().Info("Ethereum peer received message during shutdown", "peer", p.id, "remote", p.RemoteAddr(), "code", msg.Code, "size", msg.Size)
 	}
 	if msg.Size > protocolMaxMsgSize {
 		return errResp(ErrMsgTooLarge, "%v > %v", msg.Size, protocolMaxMsgSize)
+	}
+	if atomic.LoadUint32(&pm.stopping) == 1 {
+		switch msg.Code {
+		case GetBlockHeadersMsg, GetBlockBodiesMsg:
+			p.Log().Info("Ethereum peer aborting request during shutdown", "peer", p.id, "remote", p.RemoteAddr(), "code", msg.Code)
+			return p2p.DiscQuitting
+		case GetNodeDataMsg, GetReceiptsMsg:
+			if p.version >= eth63 {
+				p.Log().Info("Ethereum peer aborting request during shutdown", "peer", p.id, "remote", p.RemoteAddr(), "code", msg.Code)
+				return p2p.DiscQuitting
+			}
+		}
 	}
 	defer msg.Discard()
 
@@ -419,75 +653,17 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 		if err := msg.Decode(&query); err != nil {
 			return errResp(ErrDecode, "%v: %v", msg, err)
 		}
-		hashMode := query.Origin.Hash != (common.Hash{})
-
-		// Gather headers until the fetch or network limits is reached
-		var (
-			bytes   common.StorageSize
-			headers []*types.Header
-			unknown bool
+		headers, err := pm.collectHeadersForQuery(
+			&query,
+			pm.blockchain.GetHeaderByHash,
+			pm.blockchain.GetHeaderByNumber,
+			pm.blockchain.GetBlockHashesFromHash,
 		)
-		for !unknown && len(headers) < int(query.Amount) && bytes < softResponseLimit && len(headers) < downloader.MaxHeaderFetch {
-			// Retrieve the next header satisfying the query
-			var origin *types.Header
-			if hashMode {
-				origin = pm.blockchain.GetHeaderByHash(query.Origin.Hash)
-			} else {
-				origin = pm.blockchain.GetHeaderByNumber(query.Origin.Number)
+		if err != nil {
+			if err == p2p.DiscQuitting {
+				p.Log().Info("Ethereum peer aborting request during shutdown", "peer", p.id, "remote", p.RemoteAddr(), "code", msg.Code)
 			}
-			if origin == nil {
-				break
-			}
-			number := origin.Number.Uint64()
-			headers = append(headers, origin)
-			bytes += estHeaderRlpSize
-
-			// Advance to the next header of the query
-			switch {
-			case query.Origin.Hash != (common.Hash{}) && query.Reverse:
-				// Hash based traversal towards the genesis block
-				for i := 0; i < int(query.Skip)+1; i++ {
-					if header := pm.blockchain.GetHeader(query.Origin.Hash, number); header != nil {
-						query.Origin.Hash = header.ParentHash
-						number--
-					} else {
-						unknown = true
-						break
-					}
-				}
-			case query.Origin.Hash != (common.Hash{}) && !query.Reverse:
-				// Hash based traversal towards the leaf block
-				var (
-					current = origin.Number.Uint64()
-					next    = current + query.Skip + 1
-				)
-				if next <= current {
-					infos, _ := json.MarshalIndent(p.Peer.Info(), "", "  ")
-					p.Log().Warn("GetBlockHeaders skip overflow attack", "current", current, "skip", query.Skip, "next", next, "attacker", infos)
-					unknown = true
-				} else {
-					if header := pm.blockchain.GetHeaderByNumber(next); header != nil {
-						if pm.blockchain.GetBlockHashesFromHash(header.Hash(), query.Skip+1)[query.Skip] == query.Origin.Hash {
-							query.Origin.Hash = header.Hash()
-						} else {
-							unknown = true
-						}
-					} else {
-						unknown = true
-					}
-				}
-			case query.Reverse:
-				// Number based traversal towards the genesis block
-				if query.Origin.Number >= query.Skip+1 {
-					query.Origin.Number -= query.Skip + 1
-				} else {
-					unknown = true
-				}
-
-			case !query.Reverse:
-				// Number based traversal towards the leaf block
-				query.Origin.Number += query.Skip + 1
-			}
+			return err
 		}
 		return p.SendBlockHeaders(headers)
 
@@ -550,24 +726,12 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 		if _, err := msgStream.List(); err != nil {
 			return err
 		}
-		// Gather blocks until the fetch or network limits is reached
-		var (
-			hash   common.Hash
-			bytes  int
-			bodies []rlp.RawValue
-		)
-		for bytes < softResponseLimit && len(bodies) < downloader.MaxBlockFetch {
-			// Retrieve the hash of the next block
-			if err := msgStream.Decode(&hash); err == rlp.EOL {
-				break
-			} else if err != nil {
-				return errResp(ErrDecode, "msg %v: %v", msg, err)
+		bodies, err := pm.collectBodiesForRequest(msgStream, pm.blockchain.GetBodyRLP)
+		if err != nil {
+			if err == p2p.DiscQuitting {
+				p.Log().Info("Ethereum peer aborting request during shutdown", "peer", p.id, "remote", p.RemoteAddr(), "code", msg.Code)
 			}
-			// Retrieve the requested block body, stopping if enough was found
-			if data := pm.blockchain.GetBodyRLP(hash); len(data) != 0 {
-				bodies = append(bodies, data)
-				bytes += len(data)
-			}
+			return err
 		}
 		return p.SendBlockBodiesRLP(bodies)
 

@@ -37,6 +37,42 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/rpc"
 )
 
+func TestRunTestReusedPeerIDDoesNotPanic(t *testing.T) {
+	svc := &testService{peers: make(map[enode.ID]*testPeer)}
+	id := enode.ID{1}
+	peer := p2p.NewPeer(id, "peer", nil)
+
+	runOnce := func() error {
+		local, remote := p2p.MsgPipe()
+		defer local.Close()
+
+		remoteErr := make(chan error, 1)
+		go func() {
+			defer remote.Close()
+			for _, code := range []uint64{2, 1, 0} {
+				if err := svc.handshake(remote, code); err != nil {
+					remoteErr <- err
+					return
+				}
+			}
+			remoteErr <- nil
+		}()
+
+		err := svc.RunTest(peer, local)
+		if remoteErr := <-remoteErr; remoteErr != nil {
+			return remoteErr
+		}
+		return err
+	}
+
+	for i := 0; i < 2; i++ {
+		err := runOnce()
+		if err != nil && err != p2p.ErrPipeClosed {
+			t.Fatalf("run %d returned %v, want nil or %v", i+1, err, p2p.ErrPipeClosed)
+		}
+	}
+}
+
 func TestMain(m *testing.M) {
 	flag.Parse()
 	os.Exit(m.Run())
@@ -73,6 +109,16 @@ func newTestService(ctx *adapters.ServiceContext, stack *node.Node) (node.Lifecy
 type testPeer struct {
 	testReady chan struct{}
 	dumReady  chan struct{}
+	testOnce  sync.Once
+	dumOnce   sync.Once
+}
+
+func (p *testPeer) signalTestReady() {
+	p.testOnce.Do(func() { close(p.testReady) })
+}
+
+func (p *testPeer) signalDumReady() {
+	p.dumOnce.Do(func() { close(p.dumReady) })
 }
 
 func (t *testService) peer(id enode.ID) *testPeer {
@@ -161,7 +207,7 @@ func (t *testService) RunTest(p *p2p.Peer, rw p2p.MsgReadWriter) error {
 	}
 
 	// close the testReady channel so that other protocols can run
-	close(peer.testReady)
+	peer.signalTestReady()
 
 	// track the peer
 	atomic.AddInt64(&t.peerCount, 1)
@@ -188,7 +234,7 @@ func (t *testService) RunDum(p *p2p.Peer, rw p2p.MsgReadWriter) error {
 	}
 
 	// close the dumReady channel so that other protocols can run
-	close(peer.dumReady)
+	peer.signalDumReady()
 
 	// block until the peer is dropped
 	for {

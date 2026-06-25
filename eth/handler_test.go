@@ -17,9 +17,11 @@
 package eth
 
 import (
+	"bytes"
 	"math"
 	"math/big"
 	"math/rand"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -35,8 +37,227 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/eth/ethconfig"
 	"github.com/XinFinOrg/XDPoSChain/event"
 	"github.com/XinFinOrg/XDPoSChain/p2p"
+	"github.com/XinFinOrg/XDPoSChain/p2p/enode"
 	"github.com/XinFinOrg/XDPoSChain/params"
+	"github.com/XinFinOrg/XDPoSChain/rlp"
 )
+
+func TestProtocolManagerStopReturnsWithRegisteredPeerHandler(t *testing.T) {
+	pm, _ := newTestProtocolManagerMust(t, downloader.FullSync, 0, nil, nil)
+	pm.Start(10)
+
+	app, net := p2p.MsgPipe()
+	errc := make(chan error, 1)
+	go func() {
+		err := pm.makeProtocol(eth63).Run(p2p.NewPeer(enode.ID{}, "peer", nil), net)
+		errc <- err
+	}()
+
+	var (
+		genesis = pm.blockchain.Genesis()
+		head    = pm.blockchain.CurrentHeader()
+		td      = pm.blockchain.GetTd(head.Hash(), head.Number.Uint64())
+	)
+	msg := &statusData{
+		ProtocolVersion: uint32(eth63),
+		NetworkId:       ethconfig.Defaults.NetworkId,
+		TD:              td,
+		CurrentBlock:    head.Hash(),
+		GenesisBlock:    genesis.Hash(),
+	}
+	if err := p2p.ExpectMsg(app, StatusMsg, msg); err != nil {
+		t.Fatalf("status recv: %v", err)
+	}
+	if err := p2p.Send(app, StatusMsg, msg); err != nil {
+		t.Fatalf("status send: %v", err)
+	}
+
+	deadline := time.After(2 * time.Second)
+	for pm.peers.Len() != 1 {
+		select {
+		case <-deadline:
+			app.Close()
+			t.Fatal("peer was not registered")
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	done := make(chan struct{})
+	go func() {
+		pm.Stop()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(300 * time.Millisecond):
+		app.Close()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+		}
+		t.Fatal("ProtocolManager.Stop blocked with a registered peer handler waiting on ReadMsg")
+	}
+
+	select {
+	case err := <-errc:
+		if err == nil {
+			t.Fatal("expected protocol run to return a shutdown error")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("protocol run did not exit")
+	}
+}
+
+func TestRemovePeerReturnsWithRegisteredPeerHandler(t *testing.T) {
+	pm, _ := newTestProtocolManagerMust(t, downloader.FullSync, 0, nil, nil)
+	pm.Start(10)
+	defer func() {
+		go pm.Stop()
+	}()
+
+	app, net := p2p.MsgPipe()
+	errc := make(chan error, 1)
+	go func() {
+		err := pm.makeProtocol(eth63).Run(p2p.NewPeer(enode.ID{}, "peer", nil), net)
+		errc <- err
+	}()
+
+	var (
+		genesis = pm.blockchain.Genesis()
+		head    = pm.blockchain.CurrentHeader()
+		td      = pm.blockchain.GetTd(head.Hash(), head.Number.Uint64())
+	)
+	msg := &statusData{
+		ProtocolVersion: uint32(eth63),
+		NetworkId:       ethconfig.Defaults.NetworkId,
+		TD:              td,
+		CurrentBlock:    head.Hash(),
+		GenesisBlock:    genesis.Hash(),
+	}
+	if err := p2p.ExpectMsg(app, StatusMsg, msg); err != nil {
+		t.Fatalf("status recv: %v", err)
+	}
+	if err := p2p.Send(app, StatusMsg, msg); err != nil {
+		t.Fatalf("status send: %v", err)
+	}
+
+	deadline := time.After(2 * time.Second)
+	for pm.peers.Len() != 1 {
+		select {
+		case <-deadline:
+			app.Close()
+			t.Fatal("peer was not registered")
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	pm.removePeer("0000000000000000")
+
+	select {
+	case err := <-errc:
+		if err == nil {
+			t.Fatal("expected protocol run to return an error after removePeer")
+		}
+	case <-time.After(300 * time.Millisecond):
+		app.Close()
+		select {
+		case <-errc:
+		case <-time.After(2 * time.Second):
+		}
+		t.Fatal("removePeer did not unblock the registered peer handler")
+	}
+}
+
+func TestRequestMessagesAbortDuringShutdown(t *testing.T) {
+	tests := []struct {
+		name string
+		code uint64
+		data interface{}
+	}{
+		{
+			name: "get block headers",
+			code: GetBlockHeadersMsg,
+			data: &getBlockHeadersData{Origin: hashOrNumber{Number: 0}, Amount: 1},
+		},
+		{
+			name: "get block bodies",
+			code: GetBlockBodiesMsg,
+			data: []common.Hash{{}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pm, _ := newTestProtocolManagerMust(t, downloader.FullSync, 0, nil, nil)
+			peer, errc := newTestPeer("peer", eth63, pm, true)
+			defer peer.close()
+
+			atomic.StoreUint32(&pm.stopping, 1)
+
+			if err := p2p.Send(peer.app, tt.code, tt.data); err != nil {
+				t.Fatalf("send failed: %v", err)
+			}
+
+			select {
+			case err := <-errc:
+				if err == nil {
+					t.Fatal("expected peer handler to abort during shutdown")
+				}
+			case <-time.After(300 * time.Millisecond):
+				t.Fatal("peer handler did not abort request handling during shutdown")
+			}
+		})
+	}
+}
+
+func TestCollectHeadersForQueryAbortsWhenShutdownStartsMidLoop(t *testing.T) {
+	pm := new(ProtocolManager)
+	query := &getBlockHeadersData{Origin: hashOrNumber{Number: 0}, Amount: 3}
+
+	headers := map[uint64]*types.Header{
+		0: {Number: big.NewInt(0)},
+		1: {Number: big.NewInt(1)},
+		2: {Number: big.NewInt(2)},
+	}
+
+	_, err := pm.collectHeadersForQuery(
+		query,
+		func(common.Hash) *types.Header { return nil },
+		func(number uint64) *types.Header {
+			if number == 0 {
+				atomic.StoreUint32(&pm.stopping, 1)
+			}
+			return headers[number]
+		},
+		func(common.Hash, uint64) []common.Hash { return nil },
+	)
+	if err != p2p.DiscQuitting {
+		t.Fatalf("unexpected error: got %v want %v", err, p2p.DiscQuitting)
+	}
+}
+
+func TestCollectBodiesForRequestAbortsWhenShutdownStartsMidLoop(t *testing.T) {
+	pm := new(ProtocolManager)
+	payload, err := rlp.EncodeToBytes([]common.Hash{{}, common.BytesToHash([]byte{1})})
+	if err != nil {
+		t.Fatalf("failed to encode payload: %v", err)
+	}
+	stream := rlp.NewStream(bytes.NewReader(payload), uint64(len(payload)))
+	if _, err := stream.List(); err != nil {
+		t.Fatalf("failed to open list: %v", err)
+	}
+
+	_, err = pm.collectBodiesForRequest(stream, func(hash common.Hash) rlp.RawValue {
+		atomic.StoreUint32(&pm.stopping, 1)
+		return rlp.RawValue(hash[:])
+	})
+	if err != p2p.DiscQuitting {
+		t.Fatalf("unexpected error: got %v want %v", err, p2p.DiscQuitting)
+	}
+}
 
 // Tests that block headers can be retrieved from a remote chain based on user queries.
 func TestGetBlockHeaders62(t *testing.T) { testGetBlockHeaders(t, 62) }

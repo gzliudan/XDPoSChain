@@ -78,6 +78,13 @@ func (rw *meteredMsgReadWriter) Init(version int) {
 	rw.version = version
 }
 
+func (rw *meteredMsgReadWriter) Close() error {
+	if closer, ok := rw.MsgReadWriter.(interface{ Close() error }); ok {
+		return closer.Close()
+	}
+	return nil
+}
+
 func (rw *meteredMsgReadWriter) ReadMsg() (p2p.Msg, error) {
 	// Read the message and short circuit in case of an error
 	msg, err := rw.MsgReadWriter.ReadMsg()

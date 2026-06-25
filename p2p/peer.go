@@ -23,6 +23,7 @@ import (
 	"net"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/XinFinOrg/XDPoSChain/common/mclock"
@@ -145,14 +146,28 @@ const writePriorityStarveLimit = 16
 // constant needs tuning under real load.
 const writeReqQueueSize = 128
 
-// writeSlot is a single-use handshake between a protoRW writer and the
-// per-Peer write arbiter in Peer.run. The writer enqueues a slot on either
-// the high- or low-priority request channel and waits for the arbiter to
-// grant the slot by closing proceed. The writer then performs the actual
-// transport write and reports the result on done.
-type writeSlot struct {
-	proceed chan struct{} // arbiter closes this to grant the write slot
-	done    chan error    // writer reports the write result (buffered, len 1)
+// inflightWriteDrainTimeout bounds how long peer shutdown waits for a single
+// in-flight transport write to complete before forcing teardown to continue.
+// Defaulting to frameWriteTimeout keeps behavior aligned with transport write
+// deadlines while preventing indefinite shutdown stalls.
+var inflightWriteDrainTimeout = frameWriteTimeout
+
+// writeRequest is a single outbound write owned by the peer write arbiter.
+// Writers submit requests through Peer.writeReq and wait for the arbiter to
+// report the final transport result on done.
+type writeRequest struct {
+	msg  Msg
+	high bool
+	done chan error
+	pend *atomic.Int64
+}
+
+func (r *writeRequest) finish(err error) {
+	if r.pend != nil {
+		r.pend.Add(-1)
+		r.pend = nil
+	}
+	r.done <- err
 }
 
 // Peer represents a connected remote node.
@@ -168,12 +183,12 @@ type Peer struct {
 	pingRecv chan struct{}
 	disc     chan DiscReason
 
-	// Write arbitration: protoRW writers submit writeSlot requests on hiReq
-	// (high priority) or loReq (low priority). Peer.run picks one, grants
-	// it, waits for completion, then schedules the next. These channels are
-	// created in newPeer and never reassigned afterwards.
-	hiReq chan *writeSlot
-	loReq chan *writeSlot
+	// Write arbitration: writers submit requests on writeReq. Peer.run owns
+	// the internal high- and low-priority queues and decides which request
+	// reaches the transport next.
+	writeReq chan *writeRequest
+	hiPend   atomic.Int64
+	loPend   atomic.Int64
 
 	// events receives message send / receive events if set
 	events *event.Feed
@@ -250,8 +265,7 @@ func newPeer(conn *conn, protocols []Protocol) *Peer {
 		protoErr: make(chan error, len(protomap)+1), // protocols + pingLoop
 		closed:   make(chan struct{}),
 		pingRecv: make(chan struct{}, 16),
-		hiReq:    make(chan *writeSlot, writeReqQueueSize),
-		loReq:    make(chan *writeSlot, writeReqQueueSize),
+		writeReq: make(chan *writeRequest, writeReqQueueSize),
 		log:      log.New("id", conn.node.ID(), "conn", conn.flags),
 	}
 	return p
@@ -265,8 +279,11 @@ func (p *Peer) run() (remoteRequested bool, err error) {
 	var (
 		readErr    = make(chan error, 1)
 		reason     DiscReason // sent to the peer
-		activeDone chan error // non-nil while a write is in flight
+		activeReq  *writeRequest
+		activeDone chan error // non-nil while a transport write is in flight
 		hiStreak   int        // consecutive hi-priority writes since the last lo
+		hiQueue    = newWriteRequestQueue()
+		loQueue    = newWriteRequestQueue()
 	)
 	p.wg.Go(func() { p.readLoop(readErr) })
 	p.wg.Go(p.pingLoop)
@@ -274,25 +291,13 @@ func (p *Peer) run() (remoteRequested bool, err error) {
 	// Start all protocol handlers.
 	p.startProtocols()
 
-	// Write arbiter loop, folded into the main select. The arbiter accepts
-	// writeSlot requests only when no write is currently in flight
-	// (activeDone == nil), prefers hi over lo, and enforces a starvation
-	// guard that biases lo every writePriorityStarveLimit consecutive hi.
-	//
-	// Note: the hi-over-lo preference is best-effort, not strict. It is
-	// strictly honoured only by the non-blocking probe at the top of the
-	// loop body. In the blocking select below, if both hiReq and loReq
-	// become ready simultaneously the Go runtime picks one at random; the
-	// next iteration will re-apply the hi bias, so a sustained hi load is
-	// still served ahead of lo on average.
+	// Write arbiter loop. Writers submit requests through writeReq; the peer
+	// owns the internal per-priority queues and is solely responsible for
+	// choosing the next request that reaches the transport.
 loop:
 	for {
-		// When no write is in flight, try to pick the next request with a
-		// priority bias before falling into the blocking select.
-		if activeDone == nil {
+		if activeReq == nil {
 			// Control-plane signals must preempt queued writes during teardown.
-			// Otherwise a steady stream of ready write requests can keep this
-			// loop busy long enough to starve Disconnect / read errors.
 			select {
 			case err = <-readErr:
 				if r, ok := err.(DiscReason); ok {
@@ -311,51 +316,37 @@ loop:
 			default:
 			}
 
-			if hiStreak >= writePriorityStarveLimit {
-				// Bias toward lo: try lo non-blocking first; if no lo is
-				// pending, fall through to the blocking select that
-				// accepts either.
-				select {
-				case slot := <-p.loReq:
-					close(slot.proceed)
-					activeDone = slot.done
-					hiStreak = 0
-					continue
-				default:
-				}
-			} else {
-				// Bias toward hi: try hi non-blocking first; if no hi is
-				// pending, fall through to the blocking select that
-				// accepts either.
-				select {
-				case slot := <-p.hiReq:
-					close(slot.proceed)
-					activeDone = slot.done
+			drainWriteRequests(p.writeReq, hiQueue, loQueue)
+
+			if req, high := pickNextWriteRequest(hiQueue, loQueue, hiStreak); req != nil {
+				activeReq = req
+				activeDone = make(chan error, 1)
+				if high {
 					hiStreak++
-					continue
-				default:
+				} else {
+					hiStreak = 0
 				}
+				go func(msg Msg) {
+					activeDone <- p.rw.WriteMsg(msg)
+				}(req.msg)
+				continue
 			}
 		}
 
-		// Only enable the request channels when no write is in flight.
-		var hiReq, loReq <-chan *writeSlot
-		if activeDone == nil {
-			hiReq, loReq = p.hiReq, p.loReq
-		}
-
 		select {
-		case slot := <-hiReq:
-			close(slot.proceed)
-			activeDone = slot.done
-			hiStreak++
-		case slot := <-loReq:
-			close(slot.proceed)
-			activeDone = slot.done
-			hiStreak = 0
+		case req := <-p.writeReq:
+			if req.high {
+				hiQueue.push(req)
+			} else {
+				loQueue.push(req)
+			}
 		case err = <-activeDone:
-			// Active write finished. Allow the next one to be scheduled.
+			req := activeReq
+			activeReq = nil
 			activeDone = nil
+			if req != nil {
+				req.finish(err)
+			}
 			if err != nil {
 				reason = DiscNetworkError
 				break loop
@@ -378,6 +369,20 @@ loop:
 	}
 	close(p.closed)
 	p.rw.close(reason)
+	if activeReq != nil {
+		select {
+		case inflightErr := <-activeDone:
+			activeReq.finish(inflightErr)
+			if err == nil {
+				err = inflightErr
+			}
+		case <-time.After(inflightWriteDrainTimeout):
+			activeReq.finish(ErrShuttingDown)
+		}
+	}
+	failQueuedWriteRequests(ErrShuttingDown, hiQueue)
+	failQueuedWriteRequests(ErrShuttingDown, loQueue)
+	drainQueuedWriteRequests(p.writeReq, ErrShuttingDown)
 	p.wg.Wait()
 	return remoteRequested, err
 }
@@ -404,32 +409,150 @@ func (p *Peer) pingLoop() {
 	}
 }
 
-func writeQueuedSlot(reqCh chan<- *writeSlot, closed <-chan struct{}) (*writeSlot, error) {
-	slot := &writeSlot{
-		proceed: make(chan struct{}),
-		done:    make(chan error, 1),
+type writeRequestQueue struct {
+	items []*writeRequest
+	head  int
+}
+
+func newWriteRequestQueue() *writeRequestQueue {
+	return &writeRequestQueue{}
+}
+
+func (q *writeRequestQueue) len() int {
+	return len(q.items) - q.head
+}
+
+func (q *writeRequestQueue) storageLen() int {
+	return len(q.items)
+}
+
+func (q *writeRequestQueue) push(req *writeRequest) {
+	q.items = append(q.items, req)
+}
+
+func (q *writeRequestQueue) pop() *writeRequest {
+	req := q.items[q.head]
+	q.items[q.head] = nil
+	q.head++
+	if q.head == len(q.items) {
+		q.items = nil
+		q.head = 0
+		return req
 	}
+	if q.head >= 32 && q.head*2 >= len(q.items) {
+		q.compact()
+	}
+	return req
+}
+
+func (q *writeRequestQueue) compact() {
+	copy(q.items, q.items[q.head:])
+	newLen := len(q.items) - q.head
+	for i := newLen; i < len(q.items); i++ {
+		q.items[i] = nil
+	}
+	q.items = q.items[:newLen]
+	q.head = 0
+}
+
+func (q *writeRequestQueue) remaining() []*writeRequest {
+	return q.items[q.head:]
+}
+
+func pickNextWriteRequest(hiQueue, loQueue *writeRequestQueue, hiStreak int) (*writeRequest, bool) {
+	if hiStreak >= writePriorityStarveLimit && loQueue.len() > 0 {
+		return loQueue.pop(), false
+	}
+	if hiQueue.len() > 0 {
+		return hiQueue.pop(), true
+	}
+	if loQueue.len() > 0 {
+		return loQueue.pop(), false
+	}
+	return nil, false
+}
+
+func drainWriteRequests(src <-chan *writeRequest, hiQueue, loQueue *writeRequestQueue) {
+	for {
+		select {
+		case req := <-src:
+			if req.high {
+				hiQueue.push(req)
+			} else {
+				loQueue.push(req)
+			}
+		default:
+			return
+		}
+	}
+}
+
+func failQueuedWriteRequests(err error, queue *writeRequestQueue) {
+	for _, req := range queue.remaining() {
+		if req != nil {
+			req.finish(err)
+		}
+	}
+}
+
+func drainQueuedWriteRequests(src <-chan *writeRequest, err error) {
+	for {
+		select {
+		case req := <-src:
+			if req != nil {
+				req.finish(err)
+			}
+		default:
+			return
+		}
+	}
+}
+
+func enqueueWriteRequest(reqCh chan<- *writeRequest, closed <-chan struct{}, req *writeRequest, blockedMetric *metrics.Meter) error {
+	pend := req.pend
+	if pend != nil {
+		pend.Add(1)
+	}
+	rollback := func() {
+		if pend != nil {
+			pend.Add(-1)
+		}
+	}
+
 	select {
-	case reqCh <- slot:
+	case reqCh <- req:
+		return nil
 	case <-closed:
-		return nil, ErrShuttingDown
+		rollback()
+		return ErrShuttingDown
+	default:
+		if blockedMetric != nil {
+			blockedMetric.Mark(1)
+		}
+		select {
+		case reqCh <- req:
+			return nil
+		case <-closed:
+			rollback()
+			return ErrShuttingDown
+		}
 	}
-	return slot, nil
 }
 
 func (p *Peer) writeMsg(code uint64, payload []interface{}) error {
-	slot, err := writeQueuedSlot(p.loReq, p.closed)
+	size, r, err := rlp.EncodeToReader(payload)
 	if err != nil {
 		return err
 	}
-	select {
-	case <-slot.proceed:
-	case <-p.closed:
-		return ErrShuttingDown
+	req := &writeRequest{
+		msg:  Msg{Code: code, Size: uint32(size), Payload: r},
+		done: make(chan error, 1),
+		pend: &p.loPend,
 	}
-	err = SendItems(p.rw, code, payload...)
-	slot.done <- err
-	return err
+	if err := enqueueWriteRequest(p.writeReq, p.closed, req, nil); err != nil {
+		return err
+	}
+	return <-req.done
 }
 
 func (p *Peer) readLoop(errc chan<- error) {
@@ -510,7 +633,7 @@ outer:
 					offset -= old.Length
 				}
 				// Assign the new match
-				result[cap.Name] = &protoRW{Protocol: proto, offset: offset, in: make(chan Msg), w: rw}
+				result[cap.Name] = &protoRW{Protocol: proto, offset: offset, in: make(chan Msg), w: rw, closing: make(chan struct{})}
 				offset += proto.Length
 
 				continue outer
@@ -523,8 +646,10 @@ outer:
 func (p *Peer) startProtocols() {
 	for _, proto := range p.running {
 		proto.closed = p.closed
-		proto.hiReq = p.hiReq
-		proto.loReq = p.loReq
+		proto.writeReq = p.writeReq
+		proto.hiPend = &p.hiPend
+		proto.loPend = &p.loPend
+		proto.closeErr = p.rw.close
 		var rw MsgReadWriter = proto
 		if p.events != nil {
 			rw = newMsgEventer(rw, p.events, p.ID(), proto.Name, p.RemoteAddr().String(), p.LocalAddr().String())
@@ -556,15 +681,16 @@ func (p *Peer) getProto(code uint64) (*protoRW, error) {
 
 type protoRW struct {
 	Protocol
-	in     chan Msg        // receives read messages
-	closed <-chan struct{} // receives when peer is shutting down
-	// hiReq/loReq are written once by startProtocols before any concurrent
-	// writer is started and are read-only thereafter. Do not reassign them
-	// from goroutines other than the one that called startProtocols.
-	hiReq  chan<- *writeSlot // high-priority write request queue
-	loReq  chan<- *writeSlot // normal-priority write request queue
-	offset uint64
-	w      MsgWriter
+	in        chan Msg           // receives read messages
+	closed    <-chan struct{}    // receives when peer is shutting down
+	closing   chan struct{}      // receives when the protocol reader is force-closed locally
+	writeReq  chan *writeRequest // peer-owned write ingress
+	hiPend    *atomic.Int64
+	loPend    *atomic.Int64
+	offset    uint64
+	w         MsgWriter
+	closeErr  func(error)
+	closeOnce sync.Once
 }
 
 // Compile-time check that protoRW honours the PriorityMsgWriter contract.
@@ -588,43 +714,68 @@ func (rw *protoRW) writeMsg(msg Msg, high bool) (err error) {
 	if msg.Code >= rw.Length {
 		return newPeerError(errInvalidMsgCode, "not handled")
 	}
+	select {
+	case <-rw.closing:
+		return ErrShuttingDown
+	case <-rw.closed:
+		return ErrShuttingDown
+	default:
+	}
 	msg.meterCap = rw.cap()
 	msg.meterCode = msg.Code
 
 	msg.Code += rw.offset
-	reqCh := rw.loReq
 	depthMetric, blockedMetric := writeQueueLoDepth, writeQueueLoBlocked
+	pending := rw.loPend
 	if high {
-		reqCh = rw.hiReq
 		depthMetric, blockedMetric = writeQueueHiDepth, writeQueueHiBlocked
-	}
-	slot, err := writeQueuedSlot(reqCh, rw.closed)
-	if err != nil {
-		return err
+		pending = rw.hiPend
 	}
 	// Sample queue depth before enqueue so the histogram reflects the
-	// back-pressure observed by this writer (slots ahead of it), independent
-	// of how quickly the arbiter drains afterwards. This is still a racy
-	// snapshot under concurrent producers, but it is a meaningful upper
-	// bound on what this writer waited behind, whereas sampling after the
-	// send can be drained to ~0 by the arbiter and underreports congestion.
-	depthMetric.Update(int64(len(reqCh)))
-	// Enqueue the request. Try non-blocking first so we can observe
-	// saturation events; on fallback the writer waits like before.
-	if len(reqCh) == cap(reqCh) {
-		blockedMetric.Mark(1)
+	// same-priority requests already pending ahead of this request across the
+	// peer-owned write model, not just the bounded ingress channel occupancy.
+	if pending != nil {
+		depthMetric.Update(pending.Load())
 	}
-	// Wait for the arbiter to grant the slot.
+	req := &writeRequest{
+		msg:  msg,
+		high: high,
+		done: make(chan error, 1),
+		pend: pending,
+	}
+	if pending != nil {
+		pending.Add(1)
+	}
+	rollback := func() {
+		if pending != nil {
+			pending.Add(-1)
+		}
+	}
+
 	select {
-	case <-slot.proceed:
-	case <-rw.closed:
+	case rw.writeReq <- req:
+	case <-rw.closing:
+		rollback()
 		return ErrShuttingDown
+	case <-rw.closed:
+		rollback()
+		return ErrShuttingDown
+	default:
+		if blockedMetric != nil {
+			blockedMetric.Mark(1)
+		}
+		select {
+		case rw.writeReq <- req:
+		case <-rw.closing:
+			rollback()
+			return ErrShuttingDown
+		case <-rw.closed:
+			rollback()
+			return ErrShuttingDown
+		}
 	}
-	// Perform the actual write and report the result. done is buffered, so
-	// this send never blocks; the arbiter consumes it asynchronously.
-	err = rw.w.WriteMsg(msg)
-	slot.done <- err
-	return err
+
+	return <-req.done
 }
 
 func (rw *protoRW) ReadMsg() (Msg, error) {
@@ -632,9 +783,21 @@ func (rw *protoRW) ReadMsg() (Msg, error) {
 	case msg := <-rw.in:
 		msg.Code -= rw.offset
 		return msg, nil
+	case <-rw.closing:
+		return Msg{}, io.EOF
 	case <-rw.closed:
 		return Msg{}, io.EOF
 	}
+}
+
+func (rw *protoRW) Close() error {
+	rw.closeOnce.Do(func() {
+		close(rw.closing)
+	})
+	if rw.closeErr != nil {
+		rw.closeErr(DiscQuitting)
+	}
+	return nil
 }
 
 // PeerInfo represents a short summary of the information known about a connected

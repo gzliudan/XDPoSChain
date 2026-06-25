@@ -17,8 +17,10 @@
 package p2p
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand"
 	"net"
 	"reflect"
@@ -154,6 +156,108 @@ func TestPeerDisconnect(t *testing.T) {
 	}
 }
 
+func TestProtoRWCloseUnblocksReadMsg(t *testing.T) {
+	rwReady := make(chan interface{ Close() error }, 1)
+	readDone := make(chan error, 1)
+
+	proto := Protocol{
+		Name:   "block",
+		Length: 1,
+		Run: func(peer *Peer, rw MsgReadWriter) error {
+			closer, ok := rw.(interface{ Close() error })
+			if !ok {
+				return errors.New("protocol reader is not closable")
+			}
+			rwReady <- closer
+			_, err := rw.ReadMsg()
+			readDone <- err
+			return err
+		},
+	}
+
+	closer, _, _, errc := testPeer([]Protocol{proto})
+	defer closer()
+
+	var protoCloser interface{ Close() error }
+	select {
+	case protoCloser = <-rwReady:
+	case <-time.After(2 * time.Second):
+		t.Fatal("protocol did not start")
+	}
+	if err := protoCloser.Close(); err != nil {
+		t.Fatalf("close failed: %v", err)
+	}
+
+	select {
+	case err := <-readDone:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("unexpected read error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("protocol read did not unblock")
+	}
+
+	select {
+	case <-errc:
+	case <-time.After(2 * time.Second):
+		t.Fatal("peer run did not exit")
+	}
+}
+
+func TestProtoRWCloseUnblocksReadMsgWithoutPeerClosed(t *testing.T) {
+	rw := &protoRW{
+		in:      make(chan Msg),
+		closed:  make(chan struct{}),
+		closing: make(chan struct{}),
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := rw.ReadMsg()
+		errCh <- err
+	}()
+
+	if err := rw.Close(); err != nil {
+		t.Fatalf("close failed: %v", err)
+	}
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("unexpected read error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ReadMsg did not unblock after protoRW.Close")
+	}
+}
+
+func TestProtoRWCloseUnblocksWriteMsgWithoutPeerClosed(t *testing.T) {
+	rw := &protoRW{
+		Protocol: Protocol{Length: 1},
+		closed:   make(chan struct{}),
+		closing:  make(chan struct{}),
+		writeReq: make(chan *writeRequest),
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- rw.WriteMsg(Msg{Code: 0, Payload: bytes.NewReader(nil)})
+	}()
+
+	if err := rw.Close(); err != nil {
+		t.Fatalf("close failed: %v", err)
+	}
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, ErrShuttingDown) {
+			t.Fatalf("unexpected write error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("WriteMsg did not unblock after protoRW.Close")
+	}
+}
+
 // This test is supposed to verify that Peer can reliably handle
 // multiple causes of disconnection occurring at the same time.
 func TestPeerDisconnectRace(t *testing.T) {
@@ -223,10 +327,16 @@ func TestNewPeer(t *testing.T) {
 }
 
 func TestMatchProtocols(t *testing.T) {
+	type protoExpectation struct {
+		Name    string
+		Version uint
+		offset  uint64
+	}
+
 	tests := []struct {
 		Remote []Cap
 		Local  []Protocol
-		Match  map[string]protoRW
+		Match  map[string]protoExpectation
 	}{
 		{
 			// No remote capabilities
@@ -245,13 +355,13 @@ func TestMatchProtocols(t *testing.T) {
 			// Some matches, some differences
 			Remote: []Cap{{Name: "local"}, {Name: "match1"}, {Name: "match2"}},
 			Local:  []Protocol{{Name: "match1"}, {Name: "match2"}, {Name: "remote"}},
-			Match:  map[string]protoRW{"match1": {Protocol: Protocol{Name: "match1"}}, "match2": {Protocol: Protocol{Name: "match2"}}},
+			Match:  map[string]protoExpectation{"match1": {Name: "match1"}, "match2": {Name: "match2"}},
 		},
 		{
 			// Various alphabetical ordering
 			Remote: []Cap{{Name: "aa"}, {Name: "ab"}, {Name: "bb"}, {Name: "ba"}},
 			Local:  []Protocol{{Name: "ba"}, {Name: "bb"}, {Name: "ab"}, {Name: "aa"}},
-			Match:  map[string]protoRW{"aa": {Protocol: Protocol{Name: "aa"}}, "ab": {Protocol: Protocol{Name: "ab"}}, "ba": {Protocol: Protocol{Name: "ba"}}, "bb": {Protocol: Protocol{Name: "bb"}}},
+			Match:  map[string]protoExpectation{"aa": {Name: "aa"}, "ab": {Name: "ab"}, "ba": {Name: "ba"}, "bb": {Name: "bb"}},
 		},
 		{
 			// No mutual versions
@@ -262,25 +372,25 @@ func TestMatchProtocols(t *testing.T) {
 			// Multiple versions, single common
 			Remote: []Cap{{Version: 1}, {Version: 2}},
 			Local:  []Protocol{{Version: 2}, {Version: 3}},
-			Match:  map[string]protoRW{"": {Protocol: Protocol{Version: 2}}},
+			Match:  map[string]protoExpectation{"": {Version: 2}},
 		},
 		{
 			// Multiple versions, multiple common
 			Remote: []Cap{{Version: 1}, {Version: 2}, {Version: 3}, {Version: 4}},
 			Local:  []Protocol{{Version: 2}, {Version: 3}},
-			Match:  map[string]protoRW{"": {Protocol: Protocol{Version: 3}}},
+			Match:  map[string]protoExpectation{"": {Version: 3}},
 		},
 		{
 			// Various version orderings
 			Remote: []Cap{{Version: 4}, {Version: 1}, {Version: 3}, {Version: 2}},
 			Local:  []Protocol{{Version: 2}, {Version: 3}, {Version: 1}},
-			Match:  map[string]protoRW{"": {Protocol: Protocol{Version: 3}}},
+			Match:  map[string]protoExpectation{"": {Version: 3}},
 		},
 		{
 			// Versions overriding sub-protocol lengths
 			Remote: []Cap{{Version: 1}, {Version: 2}, {Version: 3}, {Name: "a"}},
 			Local:  []Protocol{{Version: 1, Length: 1}, {Version: 2, Length: 2}, {Version: 3, Length: 3}, {Name: "a"}},
-			Match:  map[string]protoRW{"": {Protocol: Protocol{Version: 3}}, "a": {Protocol: Protocol{Name: "a"}, offset: 3}},
+			Match:  map[string]protoExpectation{"": {Version: 3}, "a": {Name: "a", offset: 3}},
 		},
 	}
 

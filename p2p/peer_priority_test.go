@@ -17,12 +17,15 @@
 package p2p
 
 import (
+	"bytes"
 	"io"
+	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/XinFinOrg/XDPoSChain/event"
+	"github.com/XinFinOrg/XDPoSChain/metrics"
 	"github.com/XinFinOrg/XDPoSChain/p2p/enode"
 )
 
@@ -45,6 +48,208 @@ func awaitSignal(t *testing.T, ch <-chan struct{}, label string) {
 	case <-ch:
 	case <-time.After(2 * time.Second):
 		t.Fatalf("timed out waiting for %s", label)
+	}
+}
+
+type discardWriter struct{}
+
+func (discardWriter) WriteMsg(msg Msg) error {
+	if msg.Payload == nil {
+		return nil
+	}
+	return msg.Discard()
+}
+
+func awaitQueueDepth(t *testing.T, ch <-chan *writeRequest, want int, label string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(ch) == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s: got depth %d want %d", label, len(ch), want)
+}
+
+func TestProtoRWWriteQueueDepthSamplesWritersAhead(t *testing.T) {
+	metrics.Enable()
+	writeQueueHiDepth.Clear()
+
+	var hiPend atomic.Int64
+	hiPend.Store(1)
+	writeReq := make(chan *writeRequest, 2)
+	writeReq <- &writeRequest{high: true, done: make(chan error, 1), pend: &hiPend}
+	closed := make(chan struct{})
+	rw := &protoRW{
+		Protocol: Protocol{Length: 1},
+		closed:   closed,
+		writeReq: writeReq,
+		hiPend:   &hiPend,
+		w:        discardWriter{},
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		result <- rw.WriteMsgPriority(Msg{Code: 0, Payload: bytes.NewReader(nil)}, true)
+	}()
+
+	awaitQueueDepth(t, writeReq, 2, "priority queue to contain preload plus new writer")
+	after := writeQueueHiDepth.Snapshot()
+	if got := after.Count(); got != 1 {
+		t.Fatalf("histogram samples: got %d want 1", got)
+	}
+	if got := after.Sum(); got != 1 {
+		t.Fatalf("queued writers ahead: got %d want 1", got)
+	}
+
+	<-writeReq
+	req := <-writeReq
+	req.done <- nil
+	if err := <-result; err != nil {
+		t.Fatalf("WriteMsgPriority: %v", err)
+	}
+	close(closed)
+}
+
+func TestProtoRWWriteQueueDepthIncludesPendingRequestsOutsideIngress(t *testing.T) {
+	metrics.Enable()
+	writeQueueHiDepth.Clear()
+
+	var hiPend atomic.Int64
+	hiPend.Store(1)
+	writeReq := make(chan *writeRequest, 1)
+	closed := make(chan struct{})
+	rw := &protoRW{
+		Protocol: Protocol{Length: 1},
+		closed:   closed,
+		writeReq: writeReq,
+		hiPend:   &hiPend,
+		w:        discardWriter{},
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		result <- rw.WriteMsgPriority(Msg{Code: 0, Payload: bytes.NewReader(nil)}, true)
+	}()
+
+	awaitQueueDepth(t, writeReq, 1, "priority ingress to receive the new writer")
+	after := writeQueueHiDepth.Snapshot()
+	if got := after.Count(); got != 1 {
+		t.Fatalf("histogram samples: got %d want 1", got)
+	}
+	if got := after.Sum(); got != 1 {
+		t.Fatalf("queued writers ahead: got %d want 1", got)
+	}
+
+	req := <-writeReq
+	req.done <- nil
+	if err := <-result; err != nil {
+		t.Fatalf("WriteMsgPriority: %v", err)
+	}
+	close(closed)
+}
+
+func TestProtoRWWriteQueueBlockedMeterCountsFullQueueWait(t *testing.T) {
+	metrics.Enable()
+
+	writeReq := make(chan *writeRequest, 1)
+	writeReq <- &writeRequest{high: true, done: make(chan error, 1)}
+	closed := make(chan struct{})
+	rw := &protoRW{
+		Protocol: Protocol{Length: 1},
+		closed:   closed,
+		writeReq: writeReq,
+		hiPend:   new(atomic.Int64),
+		w:        discardWriter{},
+	}
+
+	before := writeQueueHiBlocked.Snapshot().Count()
+	result := make(chan error, 1)
+	go func() {
+		result <- rw.WriteMsgPriority(Msg{Code: 0, Payload: bytes.NewReader(nil)}, true)
+	}()
+
+	select {
+	case err := <-result:
+		t.Fatalf("WriteMsgPriority returned before queue space was freed: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	requests := make(chan *writeRequest, 1)
+	go func() {
+		<-writeReq
+		requests <- <-writeReq
+	}()
+
+	req := <-requests
+	req.done <- nil
+	if err := <-result; err != nil {
+		t.Fatalf("WriteMsgPriority: %v", err)
+	}
+	after := writeQueueHiBlocked.Snapshot().Count()
+	if got := after - before; got != 1 {
+		t.Fatalf("blocked meter delta: got %d want 1", got)
+	}
+	close(closed)
+}
+
+func TestEnqueueWriteRequestPendingAccountingRace(t *testing.T) {
+	t.Helper()
+
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(2))
+
+	for i := 0; i < 1000; i++ {
+		var pend atomic.Int64
+		reqCh := make(chan *writeRequest)
+		closed := make(chan struct{})
+		req := &writeRequest{done: make(chan error, 1), pend: &pend}
+		finished := make(chan struct{})
+
+		go func() {
+			received := <-reqCh
+			received.finish(nil)
+			close(finished)
+		}()
+
+		if err := enqueueWriteRequest(reqCh, closed, req, nil); err != nil {
+			t.Fatalf("enqueueWriteRequest: %v", err)
+		}
+		<-finished
+		if got := pend.Load(); got != 0 {
+			t.Fatalf("iteration %d: pending count = %d, want 0", i, got)
+		}
+		if err := <-req.done; err != nil {
+			t.Fatalf("iteration %d: completion error = %v", i, err)
+		}
+		close(closed)
+	}
+}
+
+func TestWriteRequestQueuePreservesFIFOAndReusesStorage(t *testing.T) {
+	queue := newWriteRequestQueue()
+	first := &writeRequest{done: make(chan error, 1)}
+	second := &writeRequest{done: make(chan error, 1)}
+	third := &writeRequest{done: make(chan error, 1)}
+
+	queue.push(first)
+	queue.push(second)
+	if got := queue.pop(); got != first {
+		t.Fatalf("first pop: got %p want %p", got, first)
+	}
+	queue.push(third)
+
+	if got := queue.pop(); got != second {
+		t.Fatalf("second pop: got %p want %p", got, second)
+	}
+	if got := queue.pop(); got != third {
+		t.Fatalf("third pop: got %p want %p", got, third)
+	}
+	if got := queue.len(); got != 0 {
+		t.Fatalf("queue length: got %d want 0", got)
+	}
+	if got := queue.storageLen(); got != 0 {
+		t.Fatalf("storage length after draining: got %d want 0", got)
 	}
 }
 
@@ -72,6 +277,59 @@ func (t *writeGateTransport) WriteMsg(msg Msg) error {
 }
 
 func (t *writeGateTransport) unblockFirstWrite() {
+	close(t.release)
+}
+
+type writeNilGateTransport struct {
+	transport
+	started chan struct{}
+	release chan struct{}
+	blocked int32
+}
+
+type stuckWriteTransport struct {
+	transport
+	started chan struct{}
+	block   chan struct{}
+	blocked int32
+}
+
+func newStuckWriteTransport(inner transport) *stuckWriteTransport {
+	return &stuckWriteTransport{
+		transport: inner,
+		started:   make(chan struct{}),
+		block:     make(chan struct{}),
+	}
+}
+
+func (t *stuckWriteTransport) WriteMsg(msg Msg) error {
+	if atomic.CompareAndSwapInt32(&t.blocked, 0, 1) {
+		close(t.started)
+	}
+	<-t.block
+	return t.transport.WriteMsg(msg)
+}
+
+func newWriteNilGateTransport(inner transport) *writeNilGateTransport {
+	return &writeNilGateTransport{
+		transport: inner,
+		started:   make(chan struct{}),
+		release:   make(chan struct{}),
+	}
+}
+
+func (t *writeNilGateTransport) WriteMsg(msg Msg) error {
+	if atomic.CompareAndSwapInt32(&t.blocked, 0, 1) {
+		close(t.started)
+		<-t.release
+	}
+	if msg.Payload != nil {
+		_ = msg.Discard()
+	}
+	return nil
+}
+
+func (t *writeNilGateTransport) unblockFirstWrite() {
 	close(t.release)
 }
 
@@ -118,17 +376,14 @@ type writeQueueHooks struct {
 	loQueued chan struct{}
 	stop     chan struct{}
 	proto    *protoRW
-	origHi   chan<- *writeSlot
-	origLo   chan<- *writeSlot
+	origReq  chan *writeRequest
+	closed   <-chan struct{}
 }
 
-// hookProtoWriteQueues replaces a protoRW's hi/lo request channels with
-// observable proxies, so tests can detect the exact moment a write request
-// is enqueued. It mutates proto.hiReq/loReq directly; this is safe only
-// because the swap happens before any concurrent writer is started in the
-// test (production code writes these fields once in startProtocols and
-// treats them as read-only thereafter).
-func hookProtoWriteQueues(t *testing.T, rw MsgReadWriter) *writeQueueHooks {
+// hookProtoWriteRequests replaces a protoRW's write ingress with an observable
+// proxy, allowing tests to confirm request admission without depending on the
+// peer arbiter's internal per-priority queue representation.
+func hookProtoWriteRequests(t *testing.T, rw MsgReadWriter) *writeQueueHooks {
 	t.Helper()
 
 	proto, ok := rw.(*protoRW)
@@ -140,39 +395,53 @@ func hookProtoWriteQueues(t *testing.T, rw MsgReadWriter) *writeQueueHooks {
 		loQueued: make(chan struct{}, writeReqQueueSize),
 		stop:     make(chan struct{}),
 		proto:    proto,
-		origHi:   proto.hiReq,
-		origLo:   proto.loReq,
+		origReq:  proto.writeReq,
+		closed:   proto.closed,
 	}
-	hiProxy := make(chan *writeSlot, writeReqQueueSize)
-	loProxy := make(chan *writeSlot, writeReqQueueSize)
-	proto.hiReq = hiProxy
-	proto.loReq = loProxy
+	proxy := make(chan *writeRequest, writeReqQueueSize)
+	proto.writeReq = proxy
 
-	go forwardWriteSlots(hiProxy, hooks.origHi, hooks.hiQueued, hooks.stop)
-	go forwardWriteSlots(loProxy, hooks.origLo, hooks.loQueued, hooks.stop)
+	go forwardWriteRequests(proxy, hooks.origReq, hooks.closed, hooks.hiQueued, hooks.loQueued, hooks.stop)
 
 	return hooks
 }
 
-func forwardWriteSlots(in <-chan *writeSlot, out chan<- *writeSlot, ack chan<- struct{}, stop <-chan struct{}) {
+func forwardWriteRequests(in <-chan *writeRequest, out chan *writeRequest, closed <-chan struct{}, hiAck, loAck chan<- struct{}, stop <-chan struct{}) {
 	for {
 		select {
-		case slot := <-in:
+		case req := <-in:
 			select {
-			case out <- slot:
-				ack <- struct{}{}
+			case <-closed:
+				req.done <- ErrShuttingDown
+				continue
+			default:
+			}
+			select {
+			case out <- req:
+				if req.high {
+					hiAck <- struct{}{}
+				} else {
+					loAck <- struct{}{}
+				}
+			case <-closed:
+				req.done <- ErrShuttingDown
 			case <-stop:
+				req.done <- ErrShuttingDown
 				return
 			}
+		case <-closed:
+			drainQueuedWriteRequests(in, ErrShuttingDown)
+			drainQueuedWriteRequests(out, ErrShuttingDown)
+			return
 		case <-stop:
+			drainQueuedWriteRequests(in, ErrShuttingDown)
 			return
 		}
 	}
 }
 
 func (h *writeQueueHooks) close() {
-	h.proto.hiReq = h.origHi
-	h.proto.loReq = h.origLo
+	h.proto.writeReq = h.origReq
 	close(h.stop)
 }
 
@@ -200,7 +469,7 @@ func TestPeerWritePriorityPreemption(t *testing.T) {
 	defer close(stop)
 
 	rw := <-rwc
-	hooks := hookProtoWriteQueues(t, rw)
+	hooks := hookProtoWriteRequests(t, rw)
 	defer hooks.close()
 
 	// Slot 1: low priority. The send blocks at the transport because nobody
@@ -248,9 +517,9 @@ func TestPeerWritePriorityPreemption(t *testing.T) {
 	}
 }
 
-// TestPeerPingLoopUsesQueuedWriteSlot verifies that pingLoop does not write
+// TestPeerPingLoopUsesQueuedWriteRequest verifies that pingLoop does not write
 // directly to the transport while another write is in flight.
-func TestPeerPingLoopUsesQueuedWriteSlot(t *testing.T) {
+func TestPeerPingLoopUsesQueuedWriteRequest(t *testing.T) {
 	rwc := make(chan MsgReadWriter, 1)
 	stop := make(chan struct{})
 	proto := Protocol{
@@ -322,7 +591,7 @@ func TestPeerWriteStarvationGuard(t *testing.T) {
 	defer close(stop)
 
 	rw := <-rwc
-	hooks := hookProtoWriteQueues(t, rw)
+	hooks := hookProtoWriteRequests(t, rw)
 	defer hooks.close()
 
 	// Block the arbiter on an initial low-priority in-flight write so we
@@ -443,7 +712,7 @@ func TestMsgEventerForwardsPriority(t *testing.T) {
 	sub := feed.Subscribe(ch)
 	defer sub.Unsubscribe()
 
-	ev := newMsgEventer(inner, feed, enode.ID{}, "test", "", "")
+	ev := newMsgEventer(inner, feed, enode.ID{}, "test", "remote:30303", "local:30303")
 
 	if _, ok := MsgReadWriter(ev).(PriorityMsgWriter); !ok {
 		t.Fatal("msgEventer does not implement PriorityMsgWriter")
@@ -465,6 +734,12 @@ func TestMsgEventerForwardsPriority(t *testing.T) {
 		if e.Type != PeerEventTypeMsgSend {
 			t.Fatalf("event type: got %v, want %v", e.Type, PeerEventTypeMsgSend)
 		}
+		if e.LocalAddress != "local:30303" {
+			t.Fatalf("local address: got %q, want %q", e.LocalAddress, "local:30303")
+		}
+		if e.RemoteAddress != "remote:30303" {
+			t.Fatalf("remote address: got %q, want %q", e.RemoteAddress, "remote:30303")
+		}
 	case <-time.After(time.Second):
 		t.Fatal("no PeerEventTypeMsgSend emitted")
 	}
@@ -476,9 +751,9 @@ func TestMsgEventerForwardsPriority(t *testing.T) {
 // peer is draining), a single low-priority write is forced through after
 // at most writePriorityStarveLimit consecutive high-priority writes.
 //
-// The deterministic upper bound is writePriorityStarveLimit; we allow a
-// small slack of 2 to absorb any single-iteration race between the
-// arbiter's blocking select and the lo writer's loPending increment.
+// The deterministic upper bound is exactly writePriorityStarveLimit. Once
+// the starvation guard trips and a low-priority write is pending, the next
+// scheduled request must come from the low-priority lane.
 func TestPeerWriteLoEventuallyServedUnderSustainedHiPressure(t *testing.T) {
 	rwc := make(chan MsgReadWriter, 1)
 	stop := make(chan struct{})
@@ -500,7 +775,7 @@ func TestPeerWriteLoEventuallyServedUnderSustainedHiPressure(t *testing.T) {
 	defer close(stop)
 
 	rw := <-rwc
-	hooks := hookProtoWriteQueues(t, rw)
+	hooks := hookProtoWriteRequests(t, rw)
 	defer hooks.close()
 
 	// Park the arbiter on an initial in-flight write so we can pre-load
@@ -557,9 +832,9 @@ func TestPeerWriteLoEventuallyServedUnderSustainedHiPressure(t *testing.T) {
 		t.Fatalf("initial write: %v", err)
 	}
 
-	// Read messages until we see the lo (code 1). The strict guard caps
-	// the wait at writePriorityStarveLimit hi writes; allow +2 slack.
-	const bound = writePriorityStarveLimit + 2
+	// Read messages until we see the lo (code 1). A strict starvation
+	// guard must schedule it after exactly writePriorityStarveLimit hi writes.
+	const bound = writePriorityStarveLimit
 	hiBefore := 0
 	for i := 0; i < bound; i++ {
 		got := readCode(t, remote)
@@ -572,6 +847,141 @@ func TestPeerWriteLoEventuallyServedUnderSustainedHiPressure(t *testing.T) {
 		}
 		hiBefore++
 	}
+	if got := readCode(t, remote); got == baseProtocolLength+1 {
+		close(producerStop)
+		if err := <-loCh; err != nil {
+			t.Fatalf("lo write: %v", err)
+		}
+		return
+	}
 	close(producerStop)
 	t.Fatalf("lo write not served within %d hi writes under sustained hi pressure (saw %d hi)", bound, hiBefore)
+}
+
+func TestPeerWriteShutdownPreservesInflightTransportError(t *testing.T) {
+	rwc := make(chan MsgReadWriter, 1)
+	stop := make(chan struct{})
+	proto := Protocol{
+		Name:   "a",
+		Length: 64,
+		Run: func(p *Peer, rw MsgReadWriter) error {
+			rwc <- rw
+			<-stop
+			return nil
+		},
+	}
+	var gate *writeGateTransport
+	closer, _, peer, _ := testPeerWithTransport([]Protocol{proto}, func(inner transport) transport {
+		gate = newWriteGateTransport(inner)
+		return gate
+	})
+	defer close(stop)
+
+	rw := <-rwc
+
+	first := make(chan error, 1)
+	go func() { first <- SendItems(rw, 1) }()
+	awaitSignal(t, gate.started, "first write to reach the transport")
+
+	secondReq := &writeRequest{
+		msg:  Msg{Code: baseProtocolLength + 2, Size: 0, Payload: bytes.NewReader(nil)},
+		done: make(chan error, 1),
+	}
+	if err := enqueueWriteRequest(peer.writeReq, peer.closed, secondReq, nil); err != nil {
+		t.Fatalf("enqueue second request: %v", err)
+	}
+
+	closer()
+	gate.unblockFirstWrite()
+
+	if err := <-first; err == nil || err == ErrShuttingDown {
+		t.Fatalf("first write error: got %v, want non-nil transport error distinct from %v", err, ErrShuttingDown)
+	}
+	if err := <-secondReq.done; err != ErrShuttingDown {
+		t.Fatalf("second write error: got %v, want %v", err, ErrShuttingDown)
+	}
+}
+
+func TestPeerDisconnectPreservesReasonWhenInflightWriteReturnsNil(t *testing.T) {
+	rwc := make(chan MsgReadWriter, 1)
+	proto := Protocol{
+		Name:   "a",
+		Length: 64,
+		Run: func(p *Peer, rw MsgReadWriter) error {
+			rwc <- rw
+			<-p.closed
+			return nil
+		},
+	}
+
+	var gate *writeNilGateTransport
+	closer, _, peer, errc := testPeerWithTransport([]Protocol{proto}, func(inner transport) transport {
+		gate = newWriteNilGateTransport(inner)
+		return gate
+	})
+	defer closer()
+
+	rw := <-rwc
+	first := make(chan error, 1)
+	go func() { first <- SendItems(rw, 1) }()
+	awaitSignal(t, gate.started, "first write to reach the transport")
+
+	peer.Disconnect(DiscRequested)
+	gate.unblockFirstWrite()
+
+	if err := <-first; err != nil {
+		t.Fatalf("first write error: got %v, want nil", err)
+	}
+	if err := <-errc; err != DiscRequested {
+		t.Fatalf("peer run error: got %v, want %v", err, DiscRequested)
+	}
+}
+
+func TestPeerDisconnectDoesNotHangOnStuckInflightWrite(t *testing.T) {
+	origTimeout := inflightWriteDrainTimeout
+	inflightWriteDrainTimeout = 50 * time.Millisecond
+	defer func() { inflightWriteDrainTimeout = origTimeout }()
+
+	rwc := make(chan MsgReadWriter, 1)
+	proto := Protocol{
+		Name:   "a",
+		Length: 64,
+		Run: func(p *Peer, rw MsgReadWriter) error {
+			rwc <- rw
+			<-p.closed
+			return nil
+		},
+	}
+
+	var gate *stuckWriteTransport
+	closer, _, peer, errc := testPeerWithTransport([]Protocol{proto}, func(inner transport) transport {
+		gate = newStuckWriteTransport(inner)
+		return gate
+	})
+	defer closer()
+
+	rw := <-rwc
+	writeErr := make(chan error, 1)
+	go func() { writeErr <- SendItems(rw, 1) }()
+
+	awaitSignal(t, gate.started, "first write to reach stuck transport")
+	peer.Disconnect(DiscRequested)
+
+	select {
+	case err := <-errc:
+		if err != DiscRequested {
+			t.Fatalf("peer run error: got %v, want %v", err, DiscRequested)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("peer run did not return while in-flight write was stuck")
+	}
+
+	select {
+	case err := <-writeErr:
+		if err != ErrShuttingDown {
+			t.Fatalf("write error: got %v, want %v", err, ErrShuttingDown)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("write call did not return after peer shutdown")
+	}
 }
