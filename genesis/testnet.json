@@ -26,6 +26,10 @@
     "tipXDCXReceiverDisableBlock": 66825000,
     "eip1559Block": 71550000,
     "cancunBlock": 71551800,
+    "pragueBlock": 83600000,
+    "dynamicGasLimitBlock": 83600000,
+    "tipUpgradeRewardBlock": 83600000,
+    "tipUpgradePenaltyBlock": 83600000,
     "trc21IssuerSMC": "0x0E2C88753131CE01c7551B726b28BFD04e44003F",
     "xdcxListingSMC": "0x14B2Bf043b9c31827A472CE4F94294fE9a6277e0",
     "relayerRegistrationSMC": "0xA1996F69f47ba14Cb7f661010A7C31974277958c",
@@ -102,11 +106,11 @@
               "maxExponent": 0
             }
           },
-          "15000000": {
+          "20277000": {
             "maxMasternodes": 108,
             "maxProtectorNodes": 0,
             "maxObserverNodes": 0,
-            "switchRound": 15000000,
+            "switchRound": 20277000,
             "minePeriod": 2,
             "timeoutSyncThreshold": 3,
             "timeoutPeriod": 10,
@@ -117,6 +121,26 @@
             "minimumMinerBlockPerEpoch": 0,
             "limitPenaltyEpoch": 0,
             "minimumSigningTx": 0,
+            "expTimeoutConfig": {
+              "base": 1,
+              "maxExponent": 0
+            }
+          },
+          "27360000": {
+            "maxMasternodes": 25,
+            "maxProtectorNodes": 3,
+            "maxObserverNodes": 2,
+            "switchRound": 27360000,
+            "minePeriod": 2,
+            "timeoutSyncThreshold": 3,
+            "timeoutPeriod": 10,
+            "certificateThreshold": 0.667,
+            "masternodeReward": 63.42,
+            "protectorReward": 50.27,
+            "observerReward": 25.13,
+            "minimumMinerBlockPerEpoch": 5,
+            "limitPenaltyEpoch": 5,
+            "minimumSigningTx": 30,
             "expTimeoutConfig": {
               "base": 1,
               "maxExponent": 0
