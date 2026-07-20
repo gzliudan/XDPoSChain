@@ -30,6 +30,7 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/params"
 	"github.com/XinFinOrg/XDPoSChain/trie"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/singleflight"
 )
 
 type XDPoS_v2 struct {
@@ -41,6 +42,8 @@ type XDPoS_v2 struct {
 	whosTurn     common.Address      // Record waiting for who to mine
 
 	snapshots       *lru.Cache[common.Hash, *SnapshotV2]            // Snapshots for gap block
+	snapshotFlight  singleflight.Group                              // Prevents concurrent snapshot reconstruction for the same gap block
+	failedRebuilds  *lru.Cache[common.Hash, struct{}]               // Gap blocks whose snapshot cannot be rebuilt, never retried
 	signatures      *utils.SigLRU                                   // Signatures of recent blocks to speed up mining
 	epochSwitches   *lru.Cache[common.Hash, *types.EpochSwitchInfo] // infos of epoch: master nodes, epoch switch block info, parent of that info
 	verifiedHeaders *lru.Cache[common.Hash, struct{}]
@@ -78,6 +81,10 @@ type XDPoS_v2 struct {
 	HookReward  func(chain consensus.ChainReader, state vm.StateDB, parentState *state.StateDB, header *types.Header) (map[string]interface{}, error)
 	HookPenalty func(chain consensus.ChainReader, number *big.Int, parentHash common.Hash, candidates []common.Address) ([]common.Address, error)
 
+	// HookSyncing reports whether the node is currently syncing from the network.
+	// It is optional and only used to keep expected-while-syncing logs quiet.
+	HookSyncing func() bool
+
 	ForensicsProcessor *Forensics
 
 	votePoolCollectionTime time.Time
@@ -114,6 +121,7 @@ func New(chainConfig *params.ChainConfig, db ethdb.Database, minePeriodCh chan i
 
 		verifiedHeaders: lru.NewCache[common.Hash, struct{}](utils.InMemorySnapshots),
 		snapshots:       lru.NewCache[common.Hash, *SnapshotV2](utils.InMemorySnapshots),
+		failedRebuilds:  lru.NewCache[common.Hash, struct{}](utils.InMemorySnapshots),
 		epochSwitches:   lru.NewCache[common.Hash, *types.EpochSwitchInfo](int(utils.InMemoryEpochs)),
 		timeoutWorker:   timeoutTimer,
 		BroadcastCh:     make(chan interface{}),
