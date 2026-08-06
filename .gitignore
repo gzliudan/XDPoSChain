@@ -36,3 +36,13 @@ profile.cov
 
 # git worktree
 /.worktrees/
+
+**/yarn-error.log
+coverage.txt
+go.sum
+**/.terraform*
+cicd/devnet/tmp
+cicd/devnet/terraform/node-config.json
+
+# AI
+.claude
