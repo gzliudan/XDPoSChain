@@ -317,6 +317,8 @@ func (pm *ProtocolManager) Start(maxPeers int) {
 
 	// start sync handlers
 	go pm.syncer()
+
+	go pm.syncStatusLogger()
 	go pm.txsyncLoop64() // TODO(karalabe): Legacy initial tx echange, drop with eth/64.
 }
 
