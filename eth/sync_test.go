@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/XinFinOrg/XDPoSChain/common"
+	"github.com/XinFinOrg/XDPoSChain/core/txpool"
 	"github.com/XinFinOrg/XDPoSChain/core/types"
 	"github.com/XinFinOrg/XDPoSChain/eth/downloader"
 	"github.com/XinFinOrg/XDPoSChain/log"
@@ -470,5 +471,458 @@ func testFastSyncDisabling(t *testing.T, protocol int) {
 		case <-ticker.C:
 			pmEmpty.synchronise(pmEmpty.peers.BestPeer())
 		}
+	}
+}
+
+// pendingCountingPool wraps testTxPool and records Pending invocations, so tests
+// can assert that a sync abandoned before the scan never touches the pool.
+type pendingCountingPool struct {
+	*testTxPool
+	calls atomic.Int32
+}
+
+func (p *pendingCountingPool) Pending(filter txpool.PendingFilter) map[common.Address][]*txpool.LazyTransaction {
+	p.calls.Add(1)
+	return p.testTxPool.Pending(filter)
+}
+
+// resolveCountingResolver counts lazy resolve lookups, to observe whether a sync
+// given up on still resolves transactions. When serve is set, Get returns it,
+// so live syncs can be observed resolving a real transaction.
+type resolveCountingResolver struct {
+	calls atomic.Int32
+	serve *types.Transaction
+}
+
+func (r *resolveCountingResolver) Get(hash common.Hash) *types.Transaction {
+	r.calls.Add(1)
+	return r.serve
+}
+
+// stalledTxPool blocks Pending until released and then serves a single lazy
+// transaction whose resolution is observed via the counting resolver.
+type stalledTxPool struct {
+	*testTxPool
+	blocked  chan struct{}
+	entered  chan struct{}
+	resolver *resolveCountingResolver
+}
+
+func (p *stalledTxPool) Pending(filter txpool.PendingFilter) map[common.Address][]*txpool.LazyTransaction {
+	close(p.entered)
+	<-p.blocked
+	return map[common.Address][]*txpool.LazyTransaction{
+		common.HexToAddress("0xdead"): {
+			{Hash: common.HexToHash("0xfeed"), Pool: p.resolver},
+		},
+	}
+}
+
+// lazyTxPool serves a single lazy transaction whose Tx field is nil, so
+// LazyTransaction.Resolve has to go through the counting resolver. Get is
+// overridden to report the same transaction, so the peer's announcement loop
+// accepts the announced hash instead of dropping it as unknown. testTxPool
+// always attaches Tx to its lazy transactions, which short-circuits Resolve
+// and would make the resolver counter unreachable.
+type lazyTxPool struct {
+	*testTxPool
+	resolver *resolveCountingResolver // must have serve set
+}
+
+func (p *lazyTxPool) Get(hash common.Hash) *types.Transaction {
+	return p.resolver.serve
+}
+
+func (p *lazyTxPool) Pending(filter txpool.PendingFilter) map[common.Address][]*txpool.LazyTransaction {
+	return map[common.Address][]*txpool.LazyTransaction{
+		common.HexToAddress("0xdead"): {
+			{Hash: p.resolver.serve.Hash(), Pool: p.resolver},
+		},
+	}
+}
+
+// ghostTxPool serves a pending snapshot entry for a transaction that is no
+// longer in the pool: Pending reports its hash while Get (inherited from
+// testTxPool) returns nil, matching a transaction removed between the pool
+// scan and the announcement assembly.
+type ghostTxPool struct {
+	*testTxPool
+	hash common.Hash
+}
+
+func (p *ghostTxPool) Pending(filter txpool.PendingFilter) map[common.Address][]*txpool.LazyTransaction {
+	return map[common.Address][]*txpool.LazyTransaction{
+		common.HexToAddress("0xdead"): {
+			{Hash: p.hash, Pool: p},
+		},
+	}
+}
+
+// TestSyncTransactionsAbortsForStoppedNodeBeforeScan ensures a sync that starts
+// after the protocol manager began shutting down does not run a full pending
+// scan. quitSync is closed early in Stop, so a sync goroutine scheduled after
+// that point must bail out before touching the pool.
+func TestSyncTransactionsAbortsForStoppedNodeBeforeScan(t *testing.T) {
+	pool := &pendingCountingPool{testTxPool: newTestTxPool()}
+	pm, _, err := newTestProtocolManagerWithTxPool(downloader.FullSync, 4, nil, pool)
+	if err != nil {
+		t.Fatalf("failed to create protocol manager: %v", err)
+	}
+	pm.Stop()
+
+	_, net := p2p.MsgPipe()
+	peer := pm.newPeer(xdc165, p2p.NewPeer(enode.ID{}, "late", nil), net, pm.txpool.Get)
+	defer peer.close()
+
+	pm.syncTransactions(peer)
+
+	if calls := pool.calls.Load(); calls != 0 {
+		t.Fatalf("Pending called %d times for a sync started after shutdown", calls)
+	}
+}
+
+// TestSyncTransactionsAbortsForDroppedPeerBeforeScan ensures a peer dropped
+// before the initial transaction sync runs does not trigger a full pending
+// scan. The scan is expensive when the pool is contended, so it must not run
+// for a peer that is already gone.
+func TestSyncTransactionsAbortsForDroppedPeerBeforeScan(t *testing.T) {
+	pool := &pendingCountingPool{testTxPool: newTestTxPool()}
+	pm, _, err := newTestProtocolManagerWithTxPool(downloader.FullSync, 4, nil, pool)
+	if err != nil {
+		t.Fatalf("failed to create protocol manager: %v", err)
+	}
+	defer pm.Stop()
+
+	_, net := p2p.MsgPipe()
+	peer := pm.newPeer(xdc165, p2p.NewPeer(enode.ID{}, "dropped", nil), net, pm.txpool.Get)
+	peer.close()
+
+	pm.syncTransactions(peer)
+
+	if calls := pool.calls.Load(); calls != 0 {
+		t.Fatalf("Pending called %d times for a peer dropped before the scan", calls)
+	}
+}
+
+// TestSyncTransactionsFiltersTxsMarkedDuringScan ensures the known-transaction
+// filter is decided after the pending scan, not before it: a transaction the
+// peer sends us while the pool is being scanned must not be echoed back. This
+// pins the ordering the cardinality short-circuit depends on, since a filter
+// evaluated before the scan would skip the check for a peer that knew nothing
+// when the sync started.
+func TestSyncTransactionsFiltersTxsMarkedDuringScan(t *testing.T) {
+	pool := &stalledTxPool{
+		testTxPool: newTestTxPool(),
+		blocked:    make(chan struct{}),
+		entered:    make(chan struct{}),
+		resolver:   &resolveCountingResolver{},
+	}
+	pm, _, err := newTestProtocolManagerWithTxPool(downloader.FullSync, 4, nil, pool)
+	if err != nil {
+		t.Fatalf("failed to create protocol manager: %v", err)
+	}
+	defer pm.Stop()
+
+	// The announce loop is intentionally not running, so an attempted echo would
+	// block in AsyncSendPooledTransactionHashes until the timeout below trips.
+	_, net := p2p.MsgPipe()
+	peer := pm.newPeer(xdc165, p2p.NewPeer(enode.ID{}, "marker", nil), net, pm.txpool.Get)
+	defer peer.close()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		pm.syncTransactions(peer)
+	}()
+
+	select {
+	case <-pool.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("initial transaction sync never entered Pending")
+	}
+	peer.MarkTransaction(common.HexToHash("0xfeed"))
+	close(pool.blocked)
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("initial transaction sync echoed a transaction marked during the scan")
+	}
+}
+
+// TestSyncTransactionsAbortsForPeerDroppedDuringScan ensures a peer dropped
+// while the pending scan is in flight does not get its transactions resolved
+// and sent. Dropping the peer closes p.term, which the sync must observe right
+// after Pending returns, skipping the useless resolve and send work.
+func TestSyncTransactionsAbortsForPeerDroppedDuringScan(t *testing.T) {
+	pool := &stalledTxPool{
+		testTxPool: newTestTxPool(),
+		blocked:    make(chan struct{}),
+		entered:    make(chan struct{}),
+		resolver:   &resolveCountingResolver{},
+	}
+	pm, _, err := newTestProtocolManagerWithTxPool(downloader.FullSync, 4, nil, pool)
+	if err != nil {
+		t.Fatalf("failed to create protocol manager: %v", err)
+	}
+	defer pm.Stop()
+
+	_, net := p2p.MsgPipe()
+	peer := pm.newPeer(xdc165, p2p.NewPeer(enode.ID{}, "dropped", nil), net, pm.txpool.Get)
+
+	done := make(chan struct{})
+	go func() {
+		pm.syncTransactions(peer)
+		close(done)
+	}()
+
+	// Wait until the sync goroutine is inside Pending, then drop the peer and
+	// unblock the pool. The sync must return without resolving the transaction.
+	// Close the peer before unblocking the pool so syncTransactions observes the
+	// closed term channel as soon as Pending returns.
+	select {
+	case <-pool.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("initial transaction sync never entered Pending")
+	}
+	peer.close()
+	close(pool.blocked)
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("initial transaction sync did not return after the peer was dropped")
+	}
+	if calls := pool.resolver.calls.Load(); calls != 0 {
+		t.Fatalf("transaction resolved %d times for a peer dropped during the scan", calls)
+	}
+}
+
+// txsyncPeer is an unregistered peer wired to a message pipe, used to drive
+// txsyncLoop64 directly. The app side of the pipe is closed on test cleanup,
+// releasing any pack writer still blocked on delivery.
+type txsyncPeer struct {
+	p   *peer
+	app *p2p.MsgPipeRW
+}
+
+func newTxsyncPeer(t *testing.T, pm *ProtocolManager, version int, name string) *txsyncPeer {
+	t.Helper()
+	app, net := p2p.MsgPipe()
+	id := randomPeerID(t)
+	p := pm.newPeer(version, p2p.NewPeer(id, name, nil), net, pm.txpool.Get)
+	t.Cleanup(func() {
+		p.close()
+		app.Close()
+	})
+	return &txsyncPeer{p: p, app: app}
+}
+
+// submitTxsync queues an initial sync carrying the given transactions, failing
+// the test if the sync loop does not take it.
+func submitTxsync(t *testing.T, pm *ProtocolManager, p *peer, txs types.Transactions) {
+	t.Helper()
+	select {
+	case pm.txsyncCh <- &txsync{p: p, txs: txs}:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("initial sync for peer %v was never accepted", p.ID())
+	}
+}
+
+// expectTransactionMsg reads one TransactionMsg from the app side of a test
+// peer's pipe and fails the test unless it carries exactly the wanted
+// transactions.
+func expectTransactionMsg(t *testing.T, app *p2p.MsgPipeRW, want types.Transactions) {
+	t.Helper()
+	errc := make(chan error, 1)
+	go func() { errc <- p2p.ExpectMsg(app, TransactionMsg, want) }()
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatalf("transaction delivery mismatch: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for the transaction delivery")
+	}
+}
+
+// expectNoMsg fails the test if any message arrives on the app side of a test
+// peer's pipe within the grace window. The lingering read is released by the
+// pipe close registered at peer creation.
+func expectNoMsg(t *testing.T, app *p2p.MsgPipeRW, grace time.Duration) {
+	t.Helper()
+	errc := make(chan error, 1)
+	go func() {
+		_, err := app.ReadMsg()
+		errc <- err
+	}()
+	select {
+	case err := <-errc:
+		t.Fatalf("unexpected message delivered: %v", err)
+	case <-time.After(grace):
+	}
+}
+
+// TestSyncTransactionsAnnouncesWithoutResolving ensures the xdc/165 initial
+// sync announces the lazy hashes straight from the pending snapshot without
+// resolving a single transaction from the pool, while the legacy path still
+// resolves. The positive control proves the resolver counter actually fires,
+// so the zero on the announcement path is meaningful rather than a broken
+// counter passing vacuously.
+func TestSyncTransactionsAnnouncesWithoutResolving(t *testing.T) {
+	tx := newTestTransaction(testBankKey, 0, 100)
+	resolver := &resolveCountingResolver{serve: tx}
+	pool := &lazyTxPool{testTxPool: newTestTxPool(), resolver: resolver}
+	pm, _, err := newTestProtocolManagerWithTxPool(downloader.FullSync, 4, nil, pool)
+	if err != nil {
+		t.Fatalf("failed to create protocol manager: %v", err)
+	}
+	defer pm.Stop()
+
+	// xdc/165 announces the pending hash without touching the pool. The
+	// announcement reader is required, because txAnnounce is unbuffered and
+	// the sync would block on queueing otherwise.
+	app, net := p2p.MsgPipe()
+	id := randomPeerID(t)
+	announce := pm.newPeer(xdc165, p2p.NewPeer(id, "announce", nil), net, pm.txpool.Get)
+	go announce.announceTransactions()
+	defer announce.close()
+	defer app.Close()
+
+	pm.syncTransactions(announce)
+
+	errc := make(chan error, 1)
+	go func() { errc <- p2p.ExpectMsg(app, NewPooledTransactionHashesMsg, []common.Hash{tx.Hash()}) }()
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatalf("initial sync announcement failed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("initial sync never announced the pending transaction")
+	}
+	if calls := resolver.calls.Load(); calls != 0 {
+		t.Fatalf("announcement path resolved %d transactions, want 0", calls)
+	}
+
+	// Control: the legacy path must resolve, proving the counter is wired to
+	// LazyTransaction.Resolve and the zero above is not a dead counter.
+	app100, net100 := p2p.MsgPipe()
+	id100 := randomPeerID(t)
+	legacy := pm.newPeer(xdc100, p2p.NewPeer(id100, "legacy", nil), net100, pm.txpool.Get)
+	defer legacy.close()
+	defer app100.Close()
+
+	pm.syncTransactions(legacy)
+	if calls := resolver.calls.Load(); calls == 0 {
+		t.Fatal("legacy sync never resolved the pending transaction")
+	}
+	// Drain the pack the legacy syncer delivers, so its writer is not left
+	// blocked on the pipe until cleanup.
+	errc = make(chan error, 1)
+	go func() { errc <- p2p.ExpectMsg(app100, TransactionMsg, types.Transactions{tx}) }()
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatalf("legacy initial sync delivery failed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("legacy sync never delivered the pending transaction")
+	}
+}
+
+// TestSyncTransactionsSkipsTxsVanishedFromPool ensures the xdc/165 initial
+// sync neither announces nor marks known a transaction that was removed from
+// the pool between the pending snapshot and the announcement assembly. The
+// async announcer drops vanished hashes without sending them, but the queueing
+// handoff marks them known first, leaving a ghost entry that would suppress
+// later announcements if the transaction re-entered the pool.
+func TestSyncTransactionsSkipsTxsVanishedFromPool(t *testing.T) {
+	hash := common.HexToHash("0xdeadbeef")
+	pool := &ghostTxPool{testTxPool: newTestTxPool(), hash: hash}
+	pm, _, err := newTestProtocolManagerWithTxPool(downloader.FullSync, 4, nil, pool)
+	if err != nil {
+		t.Fatalf("failed to create protocol manager: %v", err)
+	}
+	defer pm.Stop()
+
+	// The announce loop must run for the guard to be observable: txAnnounce is
+	// unbuffered, so only a completed handoff can pollute knownTxs. The
+	// announcer drops the hash on its existence check, so nothing may reach
+	// the wire either way.
+	app, net := p2p.MsgPipe()
+	id := randomPeerID(t)
+	peer := pm.newPeer(xdc165, p2p.NewPeer(id, "ghost", nil), net, pm.txpool.Get)
+	go peer.announceTransactions()
+	defer peer.close()
+	defer app.Close()
+
+	pm.syncTransactions(peer)
+
+	if peer.knownTxs.Contains(hash) {
+		t.Fatal("transaction removed from the pool was marked known")
+	}
+	expectNoMsg(t, app, time.Second)
+}
+
+// TestTxsyncSkipsKnownTxsAtPackTime ensures the legacy syncer filters a peer's
+// known transactions when it finally packs the queued sync. The peer can learn
+// a transaction while its initial sync waits behind another peer's in-flight
+// pack, and the packer must then drop it instead of echoing it back.
+func TestTxsyncSkipsKnownTxsAtPackTime(t *testing.T) {
+	pm, _ := newTestProtocolManagerMust(t, downloader.FullSync, 4, nil, nil)
+	defer pm.Stop()
+
+	// The blocker occupies the single in-flight pack; its delivery blocks on
+	// the unread pipe until the test drains it below.
+	blocker := newTxsyncPeer(t, pm, xdc100, "blocker")
+	blockerTxs := types.Transactions{newTestTransaction(testBankKey, 0, 100)}
+	submitTxsync(t, pm, blocker.p, blockerTxs)
+
+	// The target's sync is queued behind the blocker with the transaction
+	// still unknown, and the peer learns it while parked.
+	target := newTxsyncPeer(t, pm, xdc100, "target")
+	targetTxs := types.Transactions{newTestTransaction(testBankKey, 1, 100)}
+	submitTxsync(t, pm, target.p, targetTxs)
+	target.p.MarkTransaction(targetTxs[0].Hash())
+
+	// Draining the blocker's pack is the only way to release the loop, which
+	// must then skip the target's now fully known sync.
+	expectTransactionMsg(t, blocker.app, blockerTxs)
+	expectNoMsg(t, target.app, time.Second)
+}
+
+// TestTxsyncEmptyPackDoesNotStarveOthers ensures syncs that drained to nothing
+// while queued are skipped without stalling the loop: the peers parked behind
+// them must still be served even though an empty pack never produces the
+// completion event a busy loop would wait for.
+func TestTxsyncEmptyPackDoesNotStarveOthers(t *testing.T) {
+	pm, _ := newTestProtocolManagerMust(t, downloader.FullSync, 4, nil, nil)
+	defer pm.Stop()
+
+	blocker := newTxsyncPeer(t, pm, xdc100, "blocker")
+	blockerTxs := types.Transactions{newTestTransaction(testBankKey, 0, 100)}
+	submitTxsync(t, pm, blocker.p, blockerTxs)
+
+	// Two syncs whose whole payload becomes known while parked, plus one that
+	// still has something to deliver.
+	var drained []*txsyncPeer
+	for i := 0; i < 2; i++ {
+		p := newTxsyncPeer(t, pm, xdc100, fmt.Sprintf("drained-%d", i))
+		txs := types.Transactions{newTestTransaction(testBankKey, uint64(i+1), 100)}
+		submitTxsync(t, pm, p.p, txs)
+		p.p.MarkTransaction(txs[0].Hash())
+		drained = append(drained, p)
+	}
+	lucky := newTxsyncPeer(t, pm, xdc100, "lucky")
+	luckyTxs := types.Transactions{newTestTransaction(testBankKey, 9, 100)}
+	submitTxsync(t, pm, lucky.p, luckyTxs)
+
+	// Release the blocker's pack by draining it; the loop must skip the two
+	// drained syncs and deliver the lucky peer's transaction.
+	expectTransactionMsg(t, blocker.app, blockerTxs)
+	expectTransactionMsg(t, lucky.app, luckyTxs)
+	for _, p := range drained {
+		expectNoMsg(t, p.app, time.Second)
 	}
 }

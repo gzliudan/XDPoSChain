@@ -50,16 +50,87 @@ type txsync struct {
 
 // syncTransactions starts sending all currently pending transactions to the given peer.
 func (pm *ProtocolManager) syncTransactions(p *peer) {
+	abandoned := func() bool {
+		select {
+		case <-p.term:
+			return true
+		case <-pm.quitSync:
+			return true
+		default:
+			return false
+		}
+	}
+	// Bail out if the peer was already dropped or the node began shutting down,
+	// so neither a removed peer nor a stopping node triggers a full, potentially
+	// expensive pool scan. The sync now runs concurrently with the message
+	// loop, so both can happen at any point.
+	if abandoned() {
+		return
+	}
+
 	// Assemble the set of transaction to broadcast or announce to the remote
 	// peer. Fun fact, this is quite an expensive operation as it needs to sort
 	// the transactions if the sorting is not cached yet. However, with a random
 	// order, insertions could overflow the non-executable queues and get dropped.
 	//
 	// TODO(karalabe): Figure out if we could get away with random order somehow
-	var txs types.Transactions
 	pending := pm.txpool.Pending(txpool.PendingFilter{})
+
+	// Abandon the sync if shutdown started or the peer was dropped while the
+	// pool was being scanned, so no useless resolve and send work is done.
+	if abandoned() {
+		return
+	}
+
+	// Skip transactions the peer already has. The sync now runs concurrently
+	// with the message loop, so transactions received from this peer since
+	// registration are marked known and must not be echoed back to it. The
+	// known set is shared with the message loop, so a single cardinality read
+	// replaces one lock acquisition per pending transaction; a freshly
+	// registered peer knows nothing, which is the common case.
+	//
+	// The read happens after the scan, so anything marked while the pool was
+	// being scanned is still filtered. Only a transaction marked during the
+	// filtering itself, on a peer that knew nothing when the loop started, can
+	// slip through and be echoed back once.
+	filter := p.knownTxs.Cardinality() > 0
+
+	// The xdc/165 protocol introduces proper transaction announcements, so instead
+	// of dripping transactions across multiple peers, just send the entire list as
+	// an announcement and let the remote side decide what they need (likely nothing).
+	// Only the hashes are needed, so the pending snapshot is filtered once and
+	// the full transactions are never sent. Each hash is checked against the
+	// live pool first: queueing marks hashes as known before the announcer
+	// drops the vanished ones, so announcing a transaction removed after the
+	// snapshot would leave a ghost entry suppressing later announcements of
+	// the same transaction.
+	if p.version >= xdc165 {
+		var hashes []common.Hash
+		for _, batch := range pending {
+			for _, lazy := range batch {
+				if filter && p.knownTxs.Contains(lazy.Hash) {
+					continue
+				}
+				if p.getPooledTx(lazy.Hash) == nil {
+					continue
+				}
+				hashes = append(hashes, lazy.Hash)
+			}
+		}
+		if len(hashes) > 0 {
+			p.AsyncSendPooledTransactionHashes(hashes)
+		}
+		return
+	}
+	// Out of luck, peer is running legacy protocols, drop the txs over. The
+	// full transactions are needed here, so resolve them, skipping the ones
+	// the peer already has.
+	var txs types.Transactions
 	for _, batch := range pending {
 		for _, lazy := range batch {
+			if filter && p.knownTxs.Contains(lazy.Hash) {
+				continue
+			}
 			if tx := lazy.Resolve(); tx != nil {
 				txs = append(txs, tx)
 			}
@@ -68,21 +139,13 @@ func (pm *ProtocolManager) syncTransactions(p *peer) {
 	if len(txs) == 0 {
 		return
 	}
-	// The xdc/165 protocol introduces proper transaction announcements, so instead
-	// of dripping transactions across multiple peers, just send the entire list as
-	// an announcement and let the remote side decide what they need (likely nothing).
-	if p.version >= xdc165 {
-		hashes := make([]common.Hash, len(txs))
-		for i, tx := range txs {
-			hashes[i] = tx.Hash()
-		}
-		p.AsyncSendPooledTransactionHashes(hashes)
-		return
-	}
-	// Out of luck, peer is running legacy protocols, drop the txs over
+	// The peer might have been dropped while the pool was being scanned, in
+	// which case the sync must not wait for the txsync loop to pick up the
+	// batch.
 	select {
 	case pm.txsyncCh <- &txsync{p, txs}:
 	case <-pm.quitSync:
+	case <-p.term:
 	}
 }
 
@@ -97,28 +160,45 @@ func (pm *ProtocolManager) txsyncLoop64() {
 		pack    = new(txsync)         // the pack that is being sent
 		done    = make(chan error, 1) // result of the send
 	)
-	// send starts a sending a pack of transactions from the sync.
-	send := func(s *txsync) {
+	// send packs the unknown transactions of the sync and starts delivering
+	// the pack in the background, reporting whether a pack was scheduled. A
+	// sync whose transactions all became known while it sat in the queue
+	// drains to an empty pack; reporting false lets the caller move on to the
+	// next peer instead of waiting for a completion event that never arrives.
+	send := func(s *txsync) bool {
 		if s.p.version >= xdc165 {
 			panic("initial transaction syncer running on xdc/165+")
 		}
-		// Fill pack with transactions up to the target size.
+		// Fill pack with transactions up to the target size, skipping the ones
+		// the peer came to know about while the sync was queued. The empty-pack
+		// clause keeps a single oversized transaction eligible.
 		size := common.StorageSize(0)
-		pack.p = s.p
+		filter := s.p.knownTxs.Cardinality() > 0
 		pack.txs = pack.txs[:0]
-		for i := 0; i < len(s.txs) && size < txsyncPackSize; i++ {
-			pack.txs = append(pack.txs, s.txs[i])
-			size += common.StorageSize(s.txs[i].Size())
+		for len(s.txs) > 0 && (len(pack.txs) == 0 || size < txsyncPackSize) {
+			tx := s.txs[0]
+			s.txs = s.txs[1:]
+			if filter && s.p.knownTxs.Contains(tx.Hash()) {
+				continue
+			}
+			pack.txs = append(pack.txs, tx)
+			size += common.StorageSize(tx.Size())
 		}
-		// Remove the transactions that will be sent.
-		s.txs = s.txs[:copy(s.txs, s.txs[len(pack.txs):])]
+		// Drop the sync once drained, whether anything was packed or not.
 		if len(s.txs) == 0 {
 			delete(pending, s.p.ID())
 		}
+		if len(pack.txs) == 0 {
+			return false
+		}
+		// pack.p is only set for a real send, so the done branch never observes
+		// the peer of a sync that filtered down to nothing.
+		pack.p = s.p
 		// Send the pack in the background.
 		s.p.Log().Trace("Sending batch of transactions", "count", len(pack.txs), "bytes", size)
 		sending = true
 		go func() { done <- pack.p.SendTransactions64(pack.txs) }()
+		return true
 	}
 
 	// pick chooses the next pending sync.
@@ -135,12 +215,24 @@ func (pm *ProtocolManager) txsyncLoop64() {
 		return nil
 	}
 
+	// schedule keeps picking pending syncs until one produces a real pack or
+	// the queue is exhausted, so syncs that filtered down to nothing cannot
+	// starve the peers parked behind them.
+	schedule := func() {
+		for {
+			s := pick()
+			if s == nil || send(s) {
+				return
+			}
+		}
+	}
+
 	for {
 		select {
 		case s := <-pm.txsyncCh:
 			pending[s.p.ID()] = s
 			if !sending {
-				send(s)
+				schedule()
 			}
 		case err := <-done:
 			sending = false
@@ -150,9 +242,7 @@ func (pm *ProtocolManager) txsyncLoop64() {
 				delete(pending, pack.p.ID())
 			}
 			// Schedule the next send.
-			if s := pick(); s != nil {
-				send(s)
-			}
+			schedule()
 		case <-pm.quitSync:
 			return
 		}

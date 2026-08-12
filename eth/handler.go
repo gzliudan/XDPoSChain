@@ -105,6 +105,11 @@ type ProtocolManager struct {
 	// and processing
 	wg sync.WaitGroup
 
+	// stopMu guards stopping, which gates goroutines started off the peer
+	// handler path so none is added to wg once Stop began waiting on it
+	stopMu   sync.RWMutex
+	stopping bool
+
 	// Test fields or hooks
 	broadcastTxAnnouncesOnly bool // Testing field, disable transaction propagation
 
@@ -256,7 +261,9 @@ func (pm *ProtocolManager) makeProtocol(version uint) p2p.Protocol {
 			peer := pm.newPeer(int(version), p, rw, pm.txpool.Get)
 			select {
 			case pm.newPeerCh <- peer:
-				pm.wg.Add(1)
+				if !pm.enterTracked() {
+					return p2p.DiscQuitting
+				}
 				defer pm.wg.Done()
 				return pm.handle(peer)
 			case <-pm.quitSync:
@@ -371,9 +378,42 @@ func (pm *ProtocolManager) Stop() {
 	pm.peers.Close()
 
 	// Wait for all peer handler goroutines and the loops to come down.
+	// Flip the gate first: a peer handshake racing with the shutdown must not
+	// add to the wait group once it is being waited on.
+	pm.stopMu.Lock()
+	pm.stopping = true
+	pm.stopMu.Unlock()
 	pm.wg.Wait()
 
 	log.Info("Ethereum protocol stopped")
+}
+
+// goTracked runs fn in a goroutine tracked by pm.wg, reporting whether it was
+// started. Work requested after Stop began waiting is dropped instead, since
+// growing the wait group at that point races with the wait itself.
+func (pm *ProtocolManager) goTracked(fn func()) bool {
+	if !pm.enterTracked() {
+		return false
+	}
+	go func() {
+		defer pm.wg.Done()
+		fn()
+	}()
+	return true
+}
+
+// enterTracked adds the caller to pm.wg, reporting whether it was admitted. A
+// caller that was not must return without calling pm.wg.Done, since Stop is
+// already waiting on the group and growing it now races with that wait.
+func (pm *ProtocolManager) enterTracked() bool {
+	pm.stopMu.RLock()
+	defer pm.stopMu.RUnlock()
+
+	if pm.stopping {
+		return false
+	}
+	pm.wg.Add(1)
+	return true
 }
 
 func (pm *ProtocolManager) newPeer(pv int, p *p2p.Peer, rw p2p.MsgReadWriter, getPooledTx func(hash common.Hash) *types.Transaction) *peer {
@@ -418,8 +458,11 @@ func (pm *ProtocolManager) handle(p *peer) error {
 	}
 	p.Log().Info("Register peer", "nodeid", p.ID().String(), "version", p.version, "addr", p.RemoteAddr())
 	// Propagate existing transactions. new transactions appearing
-	// after this will be sent via broadcasts.
-	pm.syncTransactions(p)
+	// after this will be sent via broadcasts. Kept off the handshake path so a
+	// contended txpool cannot keep the peer out of its message loop.
+	pm.goTracked(func() {
+		pm.syncTransactions(p)
+	})
 
 	// If we're DAO hard-fork aware, validate any remote peer with regard to the hard-fork
 	if daoBlock := pm.blockchain.Config().DAOForkBlock; daoBlock != nil {

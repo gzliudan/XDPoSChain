@@ -925,3 +925,287 @@ func TestRegisterDownloaderPeerUndoesRacedRemoval(t *testing.T) {
 	}
 	pm.downloader.UnregisterPeer(p.id)
 }
+
+// TestPeerServesRequestsWhileTxPoolIsBlocked ensures a contended transaction pool cannot
+// keep a freshly registered peer out of its message loop. When the initial transaction
+// sync ran on the handshake path, a stalled Pending call left every peer unable to answer
+// requests, which timed out the downloader and froze the node. Both the legacy (xdc/100)
+// txsync path and the xdc/165+ announcement path are exercised.
+func TestPeerServesRequestsWhileTxPoolIsBlocked(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		version int
+		seed    types.Transactions // txs pre-loaded into the pool before pm startup
+	}{
+		{
+			name:    "legacy-xdc100",
+			version: xdc100,
+			seed: types.Transactions{
+				newTestTransaction(testBankKey, 0, 100),
+				newTestTransaction(testBankKey, 1, 100),
+			},
+		},
+		{
+			name:    "announce-xdc165",
+			version: xdc165,
+			seed: types.Transactions{
+				newTestTransaction(testBankKey, 0, 100),
+				newTestTransaction(testBankKey, 1, 100),
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			base := newTestTxPool()
+			if len(tt.seed) > 0 {
+				base.Add(tt.seed, false)
+			}
+			pool := &blockingTxPool{testTxPool: base, release: make(chan struct{})}
+			var releaseOnce sync.Once
+			release := func() { releaseOnce.Do(func() { close(pool.release) }) }
+
+			pm, _, err := newTestProtocolManagerWithTxPool(downloader.FullSync, 4, nil, pool)
+			if err != nil {
+				t.Fatalf("failed to create protocol manager: %v", err)
+			}
+			defer pm.Stop()
+			defer release()
+
+			peer, _ := newTestPeer("peer", tt.version, pm, true)
+			defer peer.close()
+
+			header := pm.blockchain.GetBlockByNumber(1).Header()
+
+			// MsgPipe is unbuffered, so the send blocks too until the peer reads it.
+			errc := make(chan error, 1)
+			go func() {
+				if err := p2p.Send(peer.app, GetBlockHeadersMsg, &getBlockHeadersData{Origin: hashOrNumber{Number: 1}, Amount: 1}); err != nil {
+					errc <- err
+					return
+				}
+				errc <- p2p.ExpectMsg(peer.app, BlockHeadersMsg, []*types.Header{header})
+			}()
+			select {
+			case err := <-errc:
+				if err != nil {
+					t.Fatalf("header request failed: %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("peer never answered while the txpool was blocked")
+			}
+			// The deferred initial sync must still run to completion once the pool
+			// unblocks: xdc/165+ announces the pending hashes, the legacy path
+			// delivers the transactions themselves through the txsync loop.
+			release()
+
+			want, msg := any(types.Transactions(tt.seed)), uint64(TransactionMsg)
+			if tt.version >= xdc165 {
+				want, msg = []common.Hash{tt.seed[0].Hash(), tt.seed[1].Hash()}, NewPooledTransactionHashesMsg
+			}
+			delivered := make(chan error, 1)
+			go func() {
+				delivered <- p2p.ExpectMsg(peer.app, msg, want)
+			}()
+			select {
+			case err := <-delivered:
+				if err != nil {
+					t.Fatalf("initial sync delivery failed: %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("initial sync never delivered the pending transactions")
+			}
+		})
+	}
+}
+
+// TestSyncTransactionsSkipsKnownTxs ensures the initial transaction sync does not echo a
+// transaction back to the peer it was received from. Because the sync now runs concurrently
+// with the peer message loop, a transaction sent by the peer can be picked up by the pending
+// snapshot; it must be filtered against the peer's known transaction set before sending.
+func TestSyncTransactionsSkipsKnownTxs(t *testing.T) {
+	pool := newTestTxPool()
+	tx := newTestTransaction(testBankKey, 0, 100)
+	pool.Add([]*types.Transaction{tx}, false)
+
+	pm, _, err := newTestProtocolManagerWithTxPool(downloader.FullSync, 4, nil, pool)
+	if err != nil {
+		t.Fatalf("failed to create protocol manager: %v", err)
+	}
+	defer pm.Stop()
+
+	// A peer that already sent us the pooled transaction must not get it back. The
+	// announce loop is intentionally not running, so an attempted echo would block
+	// on the unbuffered p.txAnnounce handoff in syncTransactions until the timeout
+	// below trips.
+	//
+	// Note this guard relies on p.txAnnounce being unbuffered (see newPeer): a
+	// buffered channel would swallow the echo and the timeout would never fire.
+	// The capacity is pinned here so buffering it later fails this test loudly
+	// instead of silently voiding the echo detection.
+	_, net := p2p.MsgPipe()
+	id := randomPeerID(t)
+	known := pm.newPeer(xdc165, p2p.NewPeer(id, "known", nil), net, pm.txpool.Get)
+	if cap(known.txAnnounce) != 0 {
+		t.Fatalf("txAnnounce must stay unbuffered for the echo guard, capacity %d", cap(known.txAnnounce))
+	}
+	known.MarkTransaction(tx.Hash())
+	defer known.close()
+
+	done := make(chan struct{})
+	go func() {
+		pm.syncTransactions(known)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("initial transaction sync echoed a transaction the peer already has")
+	}
+
+	// Control: a peer without prior knowledge of the transaction must still receive
+	// its announcement.
+	app, net := p2p.MsgPipe()
+	id2 := randomPeerID(t)
+	fresh := pm.newPeer(xdc165, p2p.NewPeer(id2, "fresh", nil), net, pm.txpool.Get)
+	go fresh.announceTransactions()
+	defer fresh.close()
+
+	go pm.syncTransactions(fresh)
+	errc := make(chan error, 1)
+	go func() {
+		errc <- p2p.ExpectMsg(app, NewPooledTransactionHashesMsg, []common.Hash{tx.Hash()})
+	}()
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatalf("initial sync announcement failed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("initial sync never announced the pending transaction")
+	}
+}
+
+// TestTrackedGateClosesOnShutdown covers the gate that keeps pm.wg.Add out of the
+// window in which Stop waits on the group. Without it, a peer handshake racing
+// with the shutdown panics with "WaitGroup misuse: Add called concurrently with
+// Wait".
+func TestTrackedGateClosesOnShutdown(t *testing.T) {
+	pm := &ProtocolManager{}
+
+	if !pm.enterTracked() {
+		t.Fatal("enterTracked refused entry before shutdown")
+	}
+	pm.wg.Done()
+
+	ran := make(chan struct{})
+	if !pm.goTracked(func() { close(ran) }) {
+		t.Fatal("goTracked refused to start work before shutdown")
+	}
+	select {
+	case <-ran:
+	case <-time.After(time.Second):
+		t.Fatal("goTracked did not run the work it accepted")
+	}
+	pm.wg.Wait()
+
+	pm.stopMu.Lock()
+	pm.stopping = true
+	pm.stopMu.Unlock()
+
+	if pm.enterTracked() {
+		pm.wg.Done()
+		t.Fatal("enterTracked admitted a caller after shutdown began")
+	}
+	started := make(chan struct{})
+	if pm.goTracked(func() { close(started) }) {
+		t.Fatal("goTracked started work after shutdown began")
+	}
+	// The work must not be running in the background either: nothing was added
+	// to the wait group, so Stop would not wait for it.
+	time.Sleep(10 * time.Millisecond)
+	select {
+	case <-started:
+		t.Fatal("goTracked ran the work it reported as rejected")
+	default:
+	}
+	// The gate must leave the group balanced, otherwise Stop blocks forever.
+	pm.wg.Wait()
+}
+
+// TestProtocolManagerStopWaitsForInitialTxScan pins the shutdown contract of
+// the asynchronous initial transaction sync: once a sync has entered the
+// pool's Pending scan, Stop must stay blocked until the scan returns, and the
+// sync must then abandon delivery instead of resolving or sending
+// transactions after the protocol manager has stopped. On the handshake-path
+// sync this test fails from the other side: a wedged pool stalled the peer
+// handler, Stop did not wait for the scan, and the snapshot was delivered
+// regardless of the shutdown.
+func TestProtocolManagerStopWaitsForInitialTxScan(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		version int
+	}{
+		{name: "legacy-xdc100", version: xdc100},
+		{name: "announce-xdc165", version: xdc165},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			pool := &stalledTxPool{
+				testTxPool: newTestTxPool(),
+				blocked:    make(chan struct{}),
+				entered:    make(chan struct{}),
+				resolver:   &resolveCountingResolver{},
+			}
+			pm, _, err := newTestProtocolManagerWithTxPool(downloader.FullSync, 4, nil, pool)
+			if err != nil {
+				t.Fatalf("failed to create protocol manager: %v", err)
+			}
+
+			peer, _ := newTestPeer("stopping", tt.version, pm, true)
+			defer peer.close()
+			// Close the pipe on cleanup so the lingering reader of the silence
+			// check below and the peer's message loop are released.
+			defer peer.app.Close()
+			// A failing case must not leave the Stop goroutine and the sync
+			// parked inside the pool scan behind.
+			var releaseOnce sync.Once
+			defer releaseOnce.Do(func() { close(pool.blocked) })
+
+			// Wait until the initial sync is parked inside the pool's Pending
+			// scan before initiating shutdown.
+			select {
+			case <-pool.entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("initial transaction sync never entered Pending")
+			}
+
+			stopped := make(chan struct{})
+			go func() {
+				defer close(stopped)
+				pm.Stop()
+			}()
+
+			// The sync is tracked by the protocol wait group and Pending cannot
+			// be cancelled, so Stop must stay blocked while the scan is in
+			// flight instead of declaring the protocol stopped with a live
+			// transaction-pool reader.
+			select {
+			case <-stopped:
+				t.Fatal("Stop returned while the initial sync was blocked in Pending")
+			case <-time.After(500 * time.Millisecond):
+			}
+
+			// Release the scan. The sync must observe the shutdown and abandon
+			// delivery: nothing may be resolved for the legacy path, and no
+			// announcement may reach the wire for xdc/165+.
+			releaseOnce.Do(func() { close(pool.blocked) })
+			select {
+			case <-stopped:
+			case <-time.After(5 * time.Second):
+				t.Fatal("Stop did not complete after the pending scan was released")
+			}
+			if calls := pool.resolver.calls.Load(); calls != 0 {
+				t.Fatalf("post-scan sync resolved %d transactions after shutdown", calls)
+			}
+			expectNoMsg(t, peer.app, 500*time.Millisecond)
+		})
+	}
+}

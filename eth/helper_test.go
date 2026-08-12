@@ -52,10 +52,25 @@ var (
 	testBank       = crypto.PubkeyToAddress(testBankKey.PublicKey)
 )
 
+func randomPeerID(t *testing.T) enode.ID {
+	t.Helper()
+	var id enode.ID
+	if _, err := rand.Read(id[:]); err != nil {
+		t.Fatalf("failed to generate peer ID: %v", err)
+	}
+	return id
+}
+
 // newTestProtocolManager creates a new protocol manager for testing purposes,
 // with the given number of blocks already known, and potential notification
 // channels for different events.
 func newTestProtocolManager(mode downloader.SyncMode, blocks int, generator func(int, *core.BlockGen), newtx chan<- []*types.Transaction) (*ProtocolManager, ethdb.Database, error) {
+	return newTestProtocolManagerWithTxPool(mode, blocks, generator, &testTxPool{added: newtx, pool: make(map[common.Hash]*types.Transaction)})
+}
+
+// newTestProtocolManagerWithTxPool is newTestProtocolManager with a caller supplied
+// transaction pool.
+func newTestProtocolManagerWithTxPool(mode downloader.SyncMode, blocks int, generator func(int, *core.BlockGen), pool txPool) (*ProtocolManager, ethdb.Database, error) {
 	var (
 		evmux  = new(event.TypeMux)
 		engine = ethash.NewFaker()
@@ -72,9 +87,7 @@ func newTestProtocolManager(mode downloader.SyncMode, blocks int, generator func
 		panic(err)
 	}
 
-	txpool := newTestTxPool()
-	txpool.added = newtx
-	pm, err := NewProtocolManager(gspec.Config, mode, ethconfig.Defaults.NetworkId, evmux, &testTxPool{added: newtx, pool: make(map[common.Hash]*types.Transaction)}, engine, blockchain, db)
+	pm, err := NewProtocolManager(gspec.Config, mode, ethconfig.Defaults.NetworkId, evmux, pool, engine, blockchain, db)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -182,6 +195,17 @@ func (p *testTxPool) SubscribeTransactions(ch chan<- core.NewTxsEvent, reorgs bo
 // send events to the given channel.
 func (p *testTxPool) SubscribeNewTxsEvent(ch chan<- core.NewTxsEvent) event.Subscription {
 	return p.SubscribeTransactions(ch, false)
+}
+
+// blockingTxPool stalls Pending until release is closed, modelling a contended pool.
+type blockingTxPool struct {
+	*testTxPool
+	release chan struct{}
+}
+
+func (p *blockingTxPool) Pending(filter txpool.PendingFilter) map[common.Address][]*txpool.LazyTransaction {
+	<-p.release
+	return p.testTxPool.Pending(filter)
 }
 
 // newTestTransaction create a new dummy transaction.
