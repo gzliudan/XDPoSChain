@@ -75,6 +75,12 @@ type downloadTester struct {
 
 	insertHeaderChainHook func([]*types.Header) error
 
+	// missingTdLookups counts GetTd lookups that return nil, i.e. the hits of
+	// the nil-TD guard in the stalling-peer checks. Counting per tester keeps
+	// test assertions independent of the shared process-wide metric, which
+	// parallel test siblings would otherwise advance as well.
+	missingTdLookups uint64
+
 	// headHeaderCap, when non-zero, caps the height reported by CurrentHeader.
 	// It models the real chain, where importing blocks moves the header head
 	// back to the block being inserted. It must be set below the length of the
@@ -256,7 +262,11 @@ func (dl *downloadTester) GetTd(hash common.Hash, number uint64) *big.Int {
 // ancients or own blocks).
 // This method assumes that the caller holds at least the read-lock (dl.lock)
 func (dl *downloadTester) getTd(hash common.Hash) *big.Int {
-	return dl.ownChainTd[hash]
+	td := dl.ownChainTd[hash]
+	if td == nil {
+		atomic.AddUint64(&dl.missingTdLookups, 1)
+	}
+	return td
 }
 
 // InsertHeaderChain injects a new batch of headers into the simulated chain.
@@ -1148,6 +1158,64 @@ func testHighTDStarvationAttack(t *testing.T, protocol int, mode SyncMode) {
 		t.Fatalf("synchronisation error mismatch: have %v, want %v", err, errStallingPeer)
 	}
 	tester.terminate()
+}
+
+// Tests that a missing local TD for the chain head neither crashes the
+// stalling-peer checks nor silently accepts an unverifiable TD promise.
+// GetTd returns nil when the TD is absent from the database (e.g. legacy
+// chaindata), which td.Cmp(nil) would turn into a panic. The promised TD
+// cannot be checked against a local value, so the peer is conservatively
+// treated as stalling and the sync fails instead of succeeding.
+func TestMissingLocalTd100Full(t *testing.T)  { testMissingLocalTd(t, xdc100, FullSync) }
+func TestMissingLocalTd100Fast(t *testing.T)  { testMissingLocalTd(t, xdc100, FastSync) }
+func TestMissingLocalTd164Full(t *testing.T)  { testMissingLocalTd(t, xdc164, FullSync) }
+func TestMissingLocalTd164Fast(t *testing.T)  { testMissingLocalTd(t, xdc164, FastSync) }
+func TestMissingLocalTd164Light(t *testing.T) { testMissingLocalTd(t, xdc164, LightSync) }
+func TestMissingLocalTd165Full(t *testing.T)  { testMissingLocalTd(t, xdc165, FullSync) }
+func TestMissingLocalTd165Fast(t *testing.T)  { testMissingLocalTd(t, xdc165, FastSync) }
+func TestMissingLocalTd165Light(t *testing.T) { testMissingLocalTd(t, xdc165, LightSync) }
+
+func testMissingLocalTd(t *testing.T, protocol int, mode SyncMode) {
+	t.Parallel()
+
+	tester := newTester()
+	defer tester.terminate()
+
+	// Drop the TD of the genesis head, simulating chaindata without a TD entry
+	// for the header the stalling-peer checks resolve to. The peer chain must
+	// stay genesis-only: the harness derives TDs from the parent header on
+	// insertion, so any delivered header would make InsertHeaderChain panic on
+	// the missing parent TD.
+	delete(tester.ownChainTd, tester.genesis.Hash())
+
+	chain := testChainBase.shorten(1)
+	tester.newPeer("peer", protocol, chain)
+	// The promised TD is set far above the local genesis TD, so the
+	// stalling-peer check must fire even though the local TD is unknown.
+	// Sync twice: the second cycle repeats the missing-TD path and must
+	// not panic or change the outcome. Each cycle must advance the
+	// tester's nil-TD lookup count, proving the guard was taken instead of
+	// the comparison crashing. Counting on the tester itself keeps the
+	// assertion independent of the shared process-wide metric, which
+	// parallel tests would otherwise advance as well.
+	for i := 0; i < 2; i++ {
+		tdBefore := atomic.LoadUint64(&tester.missingTdLookups)
+		if err := tester.sync("peer", big.NewInt(1000000), mode); !errors.Is(err, errStallingPeer) {
+			t.Fatalf("Synchronisation error mismatch (cycle %d): have %v, want errStallingPeer", i, err)
+		}
+		if atomic.LoadUint64(&tester.missingTdLookups) == tdBefore {
+			t.Fatalf("Missing TD guard not taken in cycle %d: nil-TD lookup count did not advance", i)
+		}
+	}
+	// The public synchronisation entry point drops the peer on
+	// errStallingPeer, so a lying peer cannot be re-selected by later
+	// forced syncs.
+	if err := tester.downloader.Synchronise("peer", tester.genesis.Hash(), big.NewInt(1000000), FullSync); !errors.Is(err, errStallingPeer) {
+		t.Fatalf("Synchronisation error mismatch (public entry): have %v, want errStallingPeer", err)
+	}
+	if _, ok := tester.peers["peer"]; ok {
+		t.Fatalf("peer not dropped after stalling detection")
+	}
 }
 
 // Tests that a header head lagging behind the headers the peer already delivered

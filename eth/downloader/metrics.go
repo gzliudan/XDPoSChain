@@ -42,4 +42,6 @@ var (
 	stateDropMeter = metrics.NewRegisteredMeter("eth/downloader/states/drop", nil)
 
 	throttleCounter = metrics.NewRegisteredCounter("eth/downloader/throttle", nil)
+
+	missingTdCounter = metrics.NewRegisteredCounter("eth/downloader/headers/missingtd", nil)
 )

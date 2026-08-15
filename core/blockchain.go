@@ -1441,7 +1441,12 @@ func (bc *BlockChain) InsertReceiptChain(blockChain types.Blocks, receiptChain [
 	head := blockChain[len(blockChain)-1]
 	if td := bc.GetTd(head.Hash(), head.NumberU64()); td != nil { // Rewind may have occurred, skip in that case
 		currentSnapBlock := bc.CurrentSnapBlock()
-		if bc.GetTd(currentSnapBlock.Hash(), currentSnapBlock.Number.Uint64()).Cmp(td) < 0 {
+		snapTd := bc.GetTd(currentSnapBlock.Hash(), currentSnapBlock.Number.Uint64())
+		if snapTd == nil {
+			// See writeBlockWithState: a missing local TD is treated as zero.
+			snapTd = new(big.Int)
+		}
+		if snapTd.Cmp(td) < 0 {
 			rawdb.WriteHeadFastBlockHash(bc.db, head.Hash())
 			bc.currentSnapBlock.Store(head.Header())
 			headFastBlockGauge.Update(int64(head.NumberU64()))
@@ -1481,6 +1486,98 @@ func (bc *BlockChain) writeBlockWithoutState(block *types.Block, td *big.Int) (e
 	return nil
 }
 
+// RepairMissingTd reconstructs and persists the total difficulty entries for
+// the canonical chain segment leading to the given head, which may be missing
+// on legacy XDPoS chaindata that predates the TD index. It walks the canonical
+// parents from the head down to the nearest ancestor with a known TD entry
+// (or genesis, which always has one) and writes back the accumulated values.
+//
+// Total difficulty values are immutable chain facts, so the repair does not
+// need to hold the chain mutex: concurrent inserts can only ever write the
+// same value for the same block, and the head is snapshotted at entry. The
+// method returns the head's total difficulty, or nil if the head is unknown
+// or the node is shutting down.
+func (bc *BlockChain) RepairMissingTd(headHash common.Hash, headNumber uint64) *big.Int {
+	start := time.Now()
+
+	// Fast path: nothing to repair.
+	if td := bc.GetTd(headHash, headNumber); td != nil {
+		return td
+	}
+	// Walk the canonical parent chain collecting the segment with missing TDs,
+	// stopping at the first ancestor with a known entry.
+	type missingTd struct {
+		hash       common.Hash
+		number     uint64
+		difficulty *big.Int
+	}
+	var (
+		segment []missingTd
+		base    *big.Int
+		visited int
+	)
+	for hash, number := headHash, headNumber; ; {
+		header := bc.GetHeader(hash, number)
+		if header == nil {
+			return nil
+		}
+		if td := bc.GetTd(hash, number); td != nil {
+			base = td
+			break
+		}
+		segment = append(segment, missingTd{hash: hash, number: number, difficulty: header.Difficulty})
+		visited++
+		if visited%100000 == 0 {
+			log.Info("Repairing missing total difficulties", "blocks", visited, "number", number, "head", headNumber, "elapsed", common.PrettyDuration(time.Since(start)))
+		}
+		if number == 0 {
+			// Genesis reached without any known TD: anchor at zero so the
+			// genesis entry becomes its own difficulty.
+			base = new(big.Int)
+			break
+		}
+		hash, number = header.ParentHash, number-1
+	}
+	// Reconstruct the TDs from the anchor back towards the head, persisting
+	// them in chunks to bound memory usage.
+	const tdWriteChunk = 50000
+	var (
+		batch   = bc.db.NewBatch()
+		written int
+		acc     = new(big.Int).Set(base)
+	)
+	flush := func() {
+		if written == 0 {
+			return
+		}
+		if err := batch.Write(); err != nil {
+			log.Crit("Failed to write repaired total difficulties", "err", err)
+		}
+		batch = bc.db.NewBatch()
+		written = 0
+	}
+	for i := len(segment) - 1; i >= 0; i-- {
+		if bc.insertStopped() {
+			// Shutting down: persist the partial result (entries are immutable
+			// facts) and report the repair as incomplete.
+			flush()
+			log.Warn("Total difficulty repair interrupted", "blocks", len(segment)-i-1, "head", headNumber)
+			return nil
+		}
+		entry := segment[i]
+		acc.Add(acc, entry.difficulty)
+		rawdb.WriteTd(batch, entry.hash, entry.number, new(big.Int).Set(acc))
+		bc.hc.tdCache.Add(entry.hash, new(big.Int).Set(acc))
+		written++
+		if written >= tdWriteChunk {
+			flush()
+		}
+	}
+	flush()
+	log.Info("Repaired missing total difficulties", "blocks", len(segment), "head", headNumber, "elapsed", common.PrettyDuration(time.Since(start)))
+	return acc
+}
+
 // WriteBlockWithState writes the block and all associated state to the database.
 func (bc *BlockChain) WriteBlockWithState(block *types.Block, receipts []*types.Receipt, state *state.StateDB, tradingState *tradingstate.TradingStateDB, lendingState *lendingstate.LendingStateDB) (status WriteStatus, err error) {
 	if !bc.chainmu.TryLock() {
@@ -1505,6 +1602,13 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 	// Make sure no inconsistent state is leaked during insertion
 	currentBlock := bc.CurrentBlock()
 	localTd := bc.GetTd(currentBlock.Hash(), currentBlock.Number.Uint64())
+	if localTd == nil {
+		// Legacy XDPoS chaindata may predate the TD index, leaving the
+		// current head without a TD entry. The sync layer repairs the entry
+		// before downloading, but a still-missing value is treated as zero
+		// (i.e. lower than any real TD) to avoid a nil comparison panic.
+		localTd = new(big.Int)
+	}
 	externTd := new(big.Int).Add(block.Difficulty(), ptd)
 
 	// Irrelevant of the canonical status, write the block itself to the database.
@@ -2106,6 +2210,10 @@ func (bc *BlockChain) insertSidechain(block *types.Block, it *insertIterator) (i
 	// If the externTd was larger than our local TD, we now need to reimport the previous
 	// blocks to regenerate the required state
 	localTd := bc.GetTd(bc.CurrentBlock().Hash(), current)
+	if localTd == nil {
+		// See writeBlockWithState: a missing local TD is treated as zero.
+		localTd = new(big.Int)
+	}
 	if localTd.Cmp(externTd) > 0 {
 		log.Info("Sidechain written to disk", "start", it.first().NumberU64(), "end", it.previous().Number, "sidetd", externTd, "localtd", localTd)
 		return it.index, nil, nil, err
@@ -2236,6 +2344,10 @@ func (bc *BlockChain) getResultBlock(block *types.Block, verifiedM2 bool) (*Resu
 		// until the competitor TD goes above the canonical TD
 		currentBlock := bc.CurrentBlock()
 		localTd := bc.GetTd(currentBlock.Hash(), currentBlock.Number.Uint64())
+		if localTd == nil {
+			// See writeBlockWithState: a missing local TD is treated as zero.
+			localTd = new(big.Int)
+		}
 		externTd := new(big.Int).Add(bc.GetTd(block.ParentHash(), block.NumberU64()-1), block.Difficulty())
 		if localTd.Cmp(externTd) > 0 {
 			return nil, err

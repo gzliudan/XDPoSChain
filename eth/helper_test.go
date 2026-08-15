@@ -26,6 +26,7 @@ import (
 	"math/big"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/XinFinOrg/XDPoSChain/common"
@@ -56,6 +57,38 @@ var (
 // with the given number of blocks already known, and potential notification
 // channels for different events.
 func newTestProtocolManager(mode downloader.SyncMode, blocks int, generator func(int, *core.BlockGen), newtx chan<- []*types.Transaction) (*ProtocolManager, ethdb.Database, error) {
+	pm, db, err := buildTestProtocolManager(mode, blocks, generator, newtx)
+	if err != nil {
+		return nil, nil, err
+	}
+	pm.Start(1000)
+	return pm, db, nil
+}
+
+// newTestProtocolManagerPassive is like newTestProtocolManager, except that the
+// background loops are not started. The manager only serves protocol requests
+// and never initiates a synchronization of its own, which makes it usable as
+// the remote side of a synchronization test.
+//
+// The returned manager must not be torn down with ProtocolManager.Stop: its
+// event subscriptions are nil without Start and would crash the teardown.
+// Terminating the downloader is sufficient cleanup.
+func newTestProtocolManagerPassive(mode downloader.SyncMode, blocks int, generator func(int, *core.BlockGen), newtx chan<- []*types.Transaction) (*ProtocolManager, ethdb.Database, error) {
+	pm, db, err := buildTestProtocolManager(mode, blocks, generator, newtx)
+	if err != nil {
+		return nil, nil, err
+	}
+	// The background loops are intentionally left unstarted, but the peer
+	// limit must be set so that handle accepts incoming connections.
+	pm.maxPeers = 1000
+	return pm, db, nil
+}
+
+// buildTestProtocolManager creates a new protocol manager for testing purposes,
+// with the given number of blocks already known. The background loops are left
+// unstarted, so the caller can choose between newTestProtocolManager and
+// newTestProtocolManagerPassive.
+func buildTestProtocolManager(mode downloader.SyncMode, blocks int, generator func(int, *core.BlockGen), newtx chan<- []*types.Transaction) (*ProtocolManager, ethdb.Database, error) {
 	var (
 		evmux  = new(event.TypeMux)
 		engine = ethash.NewFaker()
@@ -78,7 +111,6 @@ func newTestProtocolManager(mode downloader.SyncMode, blocks int, generator func
 	if err != nil {
 		return nil, nil, err
 	}
-	pm.Start(1000)
 	return pm, db, nil
 }
 
@@ -91,6 +123,108 @@ func newTestProtocolManagerMust(t *testing.T, mode downloader.SyncMode, blocks i
 	if err != nil {
 		t.Fatalf("Failed to create protocol manager: %v", err)
 	}
+	return pm, db
+}
+
+// newTestProtocolManagerPassiveMust creates a new passive protocol manager for
+// testing purposes, with the given number of blocks already known, and
+// potential notification channels for different events. In case of an error,
+// the constructor force-fails the test.
+func newTestProtocolManagerPassiveMust(t *testing.T, mode downloader.SyncMode, blocks int, generator func(int, *core.BlockGen), newtx chan<- []*types.Transaction) (*ProtocolManager, ethdb.Database) {
+	pm, db, err := newTestProtocolManagerPassive(mode, blocks, generator, newtx)
+	if err != nil {
+		t.Fatalf("Failed to create protocol manager: %v", err)
+	}
+	return pm, db
+}
+
+// newTestProtocolManagerWithMissingHeadTd creates a protocol manager whose
+// current head has no TD entry in the database, simulating legacy XDPoS
+// chaindata that predates the TD index. The chain is imported normally, the
+// head TD is then deleted, and a fresh blockchain is loaded from the mutated
+// database so the in-memory TD cache cannot mask the missing entry.
+func newTestProtocolManagerWithMissingHeadTd(t *testing.T, mode downloader.SyncMode, blocks int) (*ProtocolManager, ethdb.Database) {
+	var (
+		evmux  = new(event.TypeMux)
+		engine = ethash.NewFaker()
+		db     = rawdb.NewMemoryDatabase()
+		gspec  = &core.Genesis{
+			Alloc:  types.GenesisAlloc{testBank: {Balance: new(big.Int).SetUint64(10000000000000000000)}},
+			Config: params.TestChainConfig,
+		}
+	)
+	genesis := gspec.MustCommit(db)
+	blockchain, err := core.NewBlockChain(db, nil, gspec, engine, vm.Config{})
+	if err != nil {
+		t.Fatalf("Failed to create test blockchain: %v", err)
+	}
+	chain, _ := core.GenerateChain(gspec.Config, genesis, ethash.NewFaker(), db, blocks, nil)
+	if _, err := blockchain.InsertChain(chain); err != nil {
+		t.Fatalf("Failed to insert test chain: %v", err)
+	}
+	head := blockchain.CurrentBlock()
+	rawdb.DeleteTd(db, head.Hash(), head.Number.Uint64())
+
+	// Reload a fresh blockchain from the mutated database: the previous
+	// instance cached the head TD in memory, which would mask the deletion.
+	blockchain, err = core.NewBlockChain(db, nil, gspec, engine, vm.Config{})
+	if err != nil {
+		t.Fatalf("Failed to reload test blockchain: %v", err)
+	}
+	pm, err := NewProtocolManager(gspec.Config, mode, ethconfig.Defaults.NetworkId, evmux, &testTxPool{pool: make(map[common.Hash]*types.Transaction)}, engine, blockchain, db)
+	if err != nil {
+		t.Fatalf("Failed to create protocol manager: %v", err)
+	}
+	pm.Start(1000)
+	return pm, db
+}
+
+// newTestProtocolManagerWithUnrepairableSnapTd creates a fast sync protocol
+// manager whose snap head TD is missing and cannot be reconstructed. The fast
+// head points at a block whose TD entry and parent header were deleted from
+// the database, so RepairMissingTd walks into a dead end and fails while the
+// canonical block head keeps its TD entry. Fast sync mode is re-enabled
+// explicitly: NewProtocolManager disables it on non-empty chains, and the
+// snap branch under test is only reachable with fast sync active.
+func newTestProtocolManagerWithUnrepairableSnapTd(t *testing.T) (*ProtocolManager, ethdb.Database) {
+	var (
+		evmux  = new(event.TypeMux)
+		engine = ethash.NewFaker()
+		db     = rawdb.NewMemoryDatabase()
+		gspec  = &core.Genesis{
+			Alloc:  types.GenesisAlloc{testBank: {Balance: new(big.Int).SetUint64(10000000000000000000)}},
+			Config: params.TestChainConfig,
+		}
+	)
+	genesis := gspec.MustCommit(db)
+	blockchain, err := core.NewBlockChain(db, nil, gspec, engine, vm.Config{})
+	if err != nil {
+		t.Fatalf("Failed to create test blockchain: %v", err)
+	}
+	chain, _ := core.GenerateChain(gspec.Config, genesis, ethash.NewFaker(), db, 512, nil)
+	if _, err := blockchain.InsertChain(chain); err != nil {
+		t.Fatalf("Failed to insert test chain: %v", err)
+	}
+	// Point the fast head at block 256 and make its TD irreparable: the TD
+	// entry is gone and so is the parent's header, so the repair walk fails
+	// at block 255 while the block head (512) keeps its TD entry.
+	snap := chain[255]
+	rawdb.WriteHeadFastBlockHash(db, snap.Hash())
+	rawdb.DeleteTd(db, snap.Hash(), snap.NumberU64())
+	rawdb.DeleteHeader(db, snap.ParentHash(), snap.NumberU64()-1)
+
+	// Reload a fresh blockchain from the mutated database so the in-memory
+	// caches cannot mask the deleted entries.
+	blockchain, err = core.NewBlockChain(db, nil, gspec, engine, vm.Config{})
+	if err != nil {
+		t.Fatalf("Failed to reload test blockchain: %v", err)
+	}
+	pm, err := NewProtocolManager(gspec.Config, downloader.FastSync, ethconfig.Defaults.NetworkId, evmux, &testTxPool{pool: make(map[common.Hash]*types.Transaction)}, engine, blockchain, db)
+	if err != nil {
+		t.Fatalf("Failed to create protocol manager: %v", err)
+	}
+	atomic.StoreUint32(&pm.snapSync, 1)
+	pm.Start(1000)
 	return pm, db
 }
 

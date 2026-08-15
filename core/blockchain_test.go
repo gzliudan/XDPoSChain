@@ -2890,3 +2890,143 @@ func TestDeleteCreateRevert(t *testing.T) {
 		t.Fatalf("block %d: failed to insert into chain: %v", n, err)
 	}
 }
+
+// TestWriteHeaderMissingLocalTd exercises the defensive nil handling in
+// HeaderChain.WriteHeader: a fork rooted below the head must be importable
+// when the current head's total difficulty entry is missing (legacy chaindata
+// predating the TD index), without panicking in the fork-choice comparison.
+func TestWriteHeaderMissingLocalTd(t *testing.T) {
+	engine := ethash.NewFaker()
+	db, _, blockchain, err := newCanonical(engine, 5, false)
+	if err != nil {
+		t.Fatalf("failed to create canonical header chain: %v", err)
+	}
+	defer blockchain.Stop()
+
+	// Build a side fork rooted at block 3, so the fork parent has a TD entry
+	// while the canonical head's entry has been removed below.
+	fork := makeHeaderChain(blockchain.chainConfig, blockchain.GetHeaderByNumber(3), 2, engine, db, forkSeed)
+
+	head := blockchain.CurrentHeader()
+	rawdb.DeleteTd(blockchain.ChainDb(), head.Hash(), head.Number.Uint64())
+	blockchain.hc.tdCache.Purge()
+
+	if _, err := blockchain.InsertHeaderChain(fork, 1); err != nil {
+		t.Fatalf("failed to insert fork with missing local TD: %v", err)
+	}
+	if got := blockchain.CurrentHeader().Hash(); got != fork[len(fork)-1].Hash() {
+		t.Errorf("canonical head mismatch: have %v, want %v", got, fork[len(fork)-1].Hash())
+	}
+}
+
+// TestWriteBlockWithStateMissingLocalTd exercises the defensive nil handling
+// in writeBlockWithState: importing a fork rooted below the head must not
+// panic when the current head's TD entry is missing (legacy chaindata
+// predating the TD index).
+func TestWriteBlockWithStateMissingLocalTd(t *testing.T) {
+	engine := ethash.NewFaker()
+	db, _, blockchain, err := newCanonical(engine, 5, true)
+	if err != nil {
+		t.Fatalf("failed to create canonical block chain: %v", err)
+	}
+	defer blockchain.Stop()
+
+	fork := makeBlockChain(blockchain.chainConfig, blockchain.GetBlockByNumber(3), 2, engine, db, forkSeed)
+
+	head := blockchain.CurrentBlock()
+	rawdb.DeleteTd(blockchain.ChainDb(), head.Hash(), head.Number.Uint64())
+	blockchain.hc.tdCache.Purge()
+
+	if _, err := blockchain.InsertChain(fork); err != nil {
+		t.Fatalf("failed to insert fork with missing local TD: %v", err)
+	}
+	if got := blockchain.CurrentBlock().Hash(); got != fork[len(fork)-1].Hash() {
+		t.Errorf("canonical head mismatch: have %v, want %v", got, fork[len(fork)-1].Hash())
+	}
+}
+
+// TestRepairMissingTd verifies that RepairMissingTd rebuilds the missing TD
+// entries along the canonical chain leading to the head, stopping at the
+// nearest ancestor with a known TD, and that the operation is idempotent.
+func TestRepairMissingTd(t *testing.T) {
+	engine := ethash.NewFaker()
+	_, _, blockchain, err := newCanonical(engine, 8, true)
+	if err != nil {
+		t.Fatalf("failed to create canonical block chain: %v", err)
+	}
+	defer blockchain.Stop()
+
+	head := blockchain.CurrentBlock()
+	want := blockchain.GetTd(head.Hash(), head.Number.Uint64())
+	if want == nil {
+		t.Fatalf("expected a TD entry before deletion")
+	}
+	// Simulate legacy chaindata: drop the TD entries of the last three blocks.
+	for num := head.Number.Uint64(); num > head.Number.Uint64()-3; num-- {
+		block := blockchain.GetBlockByNumber(num)
+		rawdb.DeleteTd(blockchain.ChainDb(), block.Hash(), num)
+	}
+	blockchain.hc.tdCache.Purge()
+
+	got := blockchain.RepairMissingTd(head.Hash(), head.Number.Uint64())
+	if got == nil || got.Cmp(want) != 0 {
+		t.Fatalf("repaired head TD mismatch: have %v, want %v", got, want)
+	}
+	// The repaired head TD must be persisted.
+	if td := blockchain.GetTd(head.Hash(), head.Number.Uint64()); td == nil || td.Cmp(want) != 0 {
+		t.Fatalf("head TD not persisted after repair: have %v, want %v", td, want)
+	}
+	// The intermediate ancestors must have been repaired as well.
+	for num := head.Number.Uint64() - 2; num <= head.Number.Uint64(); num++ {
+		block := blockchain.GetBlockByNumber(num)
+		if td := blockchain.GetTd(block.Hash(), num); td == nil {
+			t.Errorf("ancestor %d TD not repaired", num)
+		}
+	}
+	// A second call is a no-op returning the same value.
+	if again := blockchain.RepairMissingTd(head.Hash(), head.Number.Uint64()); again == nil || again.Cmp(want) != 0 {
+		t.Fatalf("idempotent repair mismatch: have %v, want %v", again, want)
+	}
+}
+
+// TestRepairMissingTdHeaderChain verifies repair on a header-only chain, the
+// shape used by the snap-sync header phase.
+func TestRepairMissingTdHeaderChain(t *testing.T) {
+	engine := ethash.NewFaker()
+	_, _, blockchain, err := newCanonical(engine, 8, false)
+	if err != nil {
+		t.Fatalf("failed to create canonical header chain: %v", err)
+	}
+	defer blockchain.Stop()
+
+	head := blockchain.CurrentHeader()
+	want := blockchain.GetTd(head.Hash(), head.Number.Uint64())
+	if want == nil {
+		t.Fatalf("expected a TD entry before deletion")
+	}
+	for num := head.Number.Uint64(); num > head.Number.Uint64()-3; num-- {
+		header := blockchain.GetHeaderByNumber(num)
+		rawdb.DeleteTd(blockchain.ChainDb(), header.Hash(), num)
+	}
+	blockchain.hc.tdCache.Purge()
+
+	got := blockchain.RepairMissingTd(head.Hash(), head.Number.Uint64())
+	if got == nil || got.Cmp(want) != 0 {
+		t.Fatalf("repaired head TD mismatch: have %v, want %v", got, want)
+	}
+}
+
+// TestRepairMissingTdUnknownHead verifies that RepairMissingTd reports failure
+// for an unknown head instead of panicking or corrupting the database.
+func TestRepairMissingTdUnknownHead(t *testing.T) {
+	engine := ethash.NewFaker()
+	_, _, blockchain, err := newCanonical(engine, 2, true)
+	if err != nil {
+		t.Fatalf("failed to create canonical block chain: %v", err)
+	}
+	defer blockchain.Stop()
+
+	if td := blockchain.RepairMissingTd(common.Hash{1}, 12345); td != nil {
+		t.Fatalf("expected nil for unknown head, got %v", td)
+	}
+}

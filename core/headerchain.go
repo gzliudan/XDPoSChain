@@ -147,6 +147,13 @@ func (hc *HeaderChain) WriteHeader(header *types.Header) (status WriteStatus, er
 		return NonStatTy, consensus.ErrUnknownAncestor
 	}
 	localTd := hc.GetTd(hc.currentHeaderHash, hc.CurrentHeader().Number.Uint64())
+	if localTd == nil {
+		// Legacy XDPoS chaindata may predate the TD index, leaving the
+		// current head without a TD entry. The sync layer repairs the entry
+		// before downloading, but a still-missing value is treated as zero
+		// (i.e. lower than any real TD) to avoid a nil comparison panic.
+		localTd = new(big.Int)
+	}
 	externTd := new(big.Int).Add(header.Difficulty, ptd)
 
 	// Irrelevant of the canonical status, write the td and header to the database

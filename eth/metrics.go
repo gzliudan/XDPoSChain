@@ -54,6 +54,10 @@ var (
 	miscInTrafficMeter        = metrics.NewRegisteredMeter("eth/misc/in/traffic", nil)
 	miscOutPacketsMeter       = metrics.NewRegisteredMeter("eth/misc/out/packets", nil)
 	miscOutTrafficMeter       = metrics.NewRegisteredMeter("eth/misc/out/traffic", nil)
+
+	missingTdCounter = metrics.NewRegisteredCounter("eth/sync/missingtd", nil)
+
+	missingTdRepairedCounter = metrics.NewRegisteredCounter("eth/sync/missingtd_repaired", nil)
 )
 
 // meteredMsgReadWriter is a wrapper around a p2p.MsgReadWriter, capable of

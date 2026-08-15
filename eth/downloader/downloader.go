@@ -126,6 +126,11 @@ type Downloader struct {
 	synchronising   int32
 	notified        int32
 	committed       int32
+	// missingTdWarned is set after the missing-TD warning was logged once and is
+	// deliberately never reset, so the warning fires at most once per downloader
+	// lifetime. missingTdCounter keeps counting every occurrence, leaving
+	// operators an ongoing signal for a persistent condition.
+	missingTdWarned uint32
 
 	// Pivot block configuration (set before sync starts)
 	pivotNumber uint64      // Fixed pivot block number (0 = use default calculation)
@@ -1352,6 +1357,41 @@ func (d *Downloader) fetchParts(deliveryCh chan dataPack, deliver func(dataPack)
 	}
 }
 
+// warnMissingTd reports a missing local total difficulty entry that made the
+// stalling-peer check unverifiable, causing the peer to be treated as
+// stalling. Header insertion writes TDs atomically with the headers, so this
+// only happens when the peer delivered nothing and the local head predates
+// the TD index (legacy XDPoS chaindata). The occurrence is counted on every
+// cycle so operators can still observe a persistent condition, but the
+// warning is logged only once per downloader lifetime to avoid spamming each
+// sync cycle.
+func (d *Downloader) warnMissingTd(number uint64, hash common.Hash) {
+	missingTdCounter.Inc(1)
+	if atomic.CompareAndSwapUint32(&d.missingTdWarned, 0, 1) {
+		log.Warn("Treating peer as stalling, local TD missing", "number", number, "hash", hash)
+	} else {
+		log.Debug("Treating peer as stalling, local TD missing", "number", number, "hash", hash)
+	}
+}
+
+// checkStallingPeer returns errStallingPeer if the promised total difficulty
+// exceeds the local TD of the given head, i.e. the peer bailed out of
+// delivering the chain it promised. A missing local TD entry (legacy XDPoS
+// chaindata predating the TD index) makes the promise unverifiable; the
+// condition is reported via warnMissingTd and conservatively treated as
+// stalling, since returning success would silently accept an unverifiable TD
+// promise (and td.Cmp(nil) would panic).
+func (d *Downloader) checkStallingPeer(td, localTD *big.Int, head *types.Header) error {
+	if localTD == nil {
+		d.warnMissingTd(head.Number.Uint64(), head.Hash())
+		return errStallingPeer
+	}
+	if td.Cmp(localTD) > 0 {
+		return errStallingPeer
+	}
+	return nil
+}
+
 // processHeaders takes batches of retrieved headers from an input channel and
 // keeps processing and scheduling them into the header chain and downloader's
 // queue until the stream ends or a failure occurs.
@@ -1425,8 +1465,15 @@ func (d *Downloader) processHeaders(origin uint64, pivot uint64, td *big.Int) er
 				// R: Nothing to give
 				if mode != LightSync {
 					head := d.blockchain.CurrentBlock()
-					if !gotHeaders && td.Cmp(d.blockchain.GetTd(head.Hash(), head.Number.Uint64())) > 0 {
-						return errStallingPeer
+					if !gotHeaders {
+						// A missing TD is only possible on legacy XDPoS chaindata that
+						// predates the TD index; upstream geth assumes it always exists.
+						// This branch only runs when the peer delivered nothing, so
+						// treating the unverifiable promise as stalling cannot penalise
+						// a peer that fed headers.
+						if err := d.checkStallingPeer(td, d.blockchain.GetTd(head.Hash(), head.Number.Uint64()), head); err != nil {
+							return err
+						}
 					}
 				}
 				// If fast or light syncing, ensure promised headers are indeed delivered. This is
@@ -1441,8 +1488,14 @@ func (d *Downloader) processHeaders(origin uint64, pivot uint64, td *big.Int) er
 					if lastInserted != nil && lastInserted.Number.Uint64() > head.Number.Uint64() {
 						head = lastInserted
 					}
-					if td.Cmp(d.lightchain.GetTd(head.Hash(), head.Number.Uint64())) > 0 {
-						return errStallingPeer
+					// Header insertion writes the TD atomically with the header, so a
+					// missing TD only triggers when no headers were delivered this
+					// cycle and the current head predates the TD index (legacy XDPoS
+					// chaindata); the peer is then treated as stalling. The post-pivot
+					// attack detection is unaffected whenever the peer delivered
+					// anything.
+					if err := d.checkStallingPeer(td, d.lightchain.GetTd(head.Hash(), head.Number.Uint64()), head); err != nil {
+						return err
 					}
 				}
 				// Disable any rollback and return

@@ -74,6 +74,11 @@ type ProtocolManager struct {
 	snapSync  uint32 // Flag whether snap sync is enabled (gets disabled if we already have blocks)
 	acceptTxs uint32 // Flag whether we're considered synchronised (enables transaction processing)
 
+	// missingTdWarned is set after the missing-TD warning was logged once and
+	// is deliberately never reset, so the warning fires at most once per
+	// protocol manager lifetime.
+	missingTdWarned uint32
+
 	txpool      txPool
 	orderpool   orderPool
 	lendingpool lendingPool

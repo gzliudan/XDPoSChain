@@ -223,17 +223,43 @@ func (pm *ProtocolManager) syncStatusLogger() {
 	}
 }
 
+// warnMissingTd reports a missing total difficulty entry for the given chain
+// head after the sync-layer repair attempt has failed. Legacy XDPoS chaindata
+// predates the TD index, so the local TD may be unknown; synchronise tries to
+// reconstruct it via RepairMissingTd first and only falls back to skipping
+// the sync threshold checks if that fails. The occurrence is counted on every
+// call so operators can observe a persistent condition, while the warning
+// fires once per protocol manager lifetime to avoid spamming the logs.
+func (pm *ProtocolManager) warnMissingTd(number uint64, hash common.Hash) {
+	missingTdCounter.Inc(1)
+	if atomic.CompareAndSwapUint32(&pm.missingTdWarned, 0, 1) {
+		log.Warn("Missing local total difficulty, sync threshold checks skipped", "number", number, "hash", hash)
+	}
+}
+
 // synchronise tries to sync up our local block chain with a remote peer.
 func (pm *ProtocolManager) synchronise(peer *peer) {
 	// Short circuit if no peers are available
 	if peer == nil {
 		return
 	}
-	// Make sure the peer's TD is higher than our own
+	// Make sure the peer's TD is higher than our own. A missing local TD
+	// (legacy XDPoS chaindata predating the TD index) is reconstructed from
+	// the canonical chain first, so the comparison can run against a real
+	// value. If the reconstruction fails, the cycle is skipped; the condition
+	// is reported once per node lifetime, see warnMissingTd.
 	currentBlock := pm.blockchain.CurrentBlock()
 	td := pm.blockchain.GetTd(currentBlock.Hash(), currentBlock.Number.Uint64())
 	pHead, pTd := peer.Head()
-	if pTd.Cmp(td) <= 0 {
+	if td == nil {
+		if repaired := pm.blockchain.RepairMissingTd(currentBlock.Hash(), currentBlock.Number.Uint64()); repaired != nil {
+			td = repaired
+			missingTdRepairedCounter.Inc(1)
+		} else {
+			pm.warnMissingTd(currentBlock.Number.Uint64(), currentBlock.Hash())
+		}
+	}
+	if td == nil || pTd.Cmp(td) <= 0 {
 		return
 	}
 	// Otherwise try to sync with the downloader
@@ -253,7 +279,21 @@ func (pm *ProtocolManager) synchronise(peer *peer) {
 
 	if mode == downloader.FastSync {
 		// Make sure the peer's total difficulty we are synchronizing is higher.
-		if pm.blockchain.GetTdByHash(pm.blockchain.CurrentSnapBlock().Hash()).Cmp(pTd) >= 0 {
+		// A missing local TD is reconstructed first, mirroring the head TD
+		// handling above. If the reconstruction fails, the cycle is skipped:
+		// proceeding would hand the downloader an unverifiable TD promise and
+		// it would conservatively treat the peer as stalling.
+		snapHead := pm.blockchain.CurrentSnapBlock()
+		snapTd := pm.blockchain.GetTdByHash(snapHead.Hash())
+		if snapTd == nil {
+			if repaired := pm.blockchain.RepairMissingTd(snapHead.Hash(), snapHead.Number.Uint64()); repaired != nil {
+				snapTd = repaired
+				missingTdRepairedCounter.Inc(1)
+			} else {
+				pm.warnMissingTd(snapHead.Number.Uint64(), snapHead.Hash())
+			}
+		}
+		if snapTd == nil || snapTd.Cmp(pTd) >= 0 {
 			return
 		}
 	}
