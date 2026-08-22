@@ -614,6 +614,48 @@ func TestInsertChainSucceedsForFullBatch(t *testing.T) {
 	}
 }
 
+// TestInsertChainAdvancesHeadOverKnownBlocks covers blocks that are already stored
+// with their state but sit above the head, which happens after a rollback or when
+// a side chain segment was executed without being adopted. They carry no work to
+// redo, but they still have to move the head instead of halting the import.
+func TestInsertChainAdvancesHeadOverKnownBlocks(t *testing.T) {
+	var (
+		key, _  = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
+		address = crypto.PubkeyToAddress(key.PublicKey)
+		funds   = big.NewInt(1000000000000000)
+		gspec   = &Genesis{
+			Alloc:   types.GenesisAlloc{address: {Balance: funds}},
+			BaseFee: big.NewInt(params.InitialBaseFee),
+			Config:  params.TestChainConfig,
+		}
+	)
+	db := rawdb.NewMemoryDatabase()
+	chain, err := NewBlockChain(db, nil, gspec, ethash.NewFaker(), vm.Config{})
+	if err != nil {
+		t.Fatalf("failed to create chain: %v", err)
+	}
+	defer chain.Stop()
+
+	_, blocks, _ := GenerateChainWithGenesis(gspec, ethash.NewFaker(), 10, nil)
+	if n, err := chain.InsertChain(blocks); err != nil {
+		t.Fatalf("failed to insert block %d: %v", n, err)
+	}
+
+	// Move the head back while leaving the blocks and their state on disk.
+	rollback := blocks[4]
+	chain.writeHeadBlock(rollback, false)
+	if have, want := chain.CurrentBlock().Number.Uint64(), rollback.NumberU64(); have != want {
+		t.Fatalf("unexpected head after rollback: have %d want %d", have, want)
+	}
+
+	if _, err := chain.InsertChain(blocks[5:]); err != nil {
+		t.Fatalf("failed to re-insert known blocks: %v", err)
+	}
+	if have, want := chain.CurrentBlock().Number.Uint64(), blocks[len(blocks)-1].NumberU64(); have != want {
+		t.Fatalf("head did not advance over known blocks: have %d want %d", have, want)
+	}
+}
+
 // TestNewBlockChainRepairsMissingHeadStateConsistently tests new block chain repairs missing head state consistently.
 func TestNewBlockChainRepairsMissingHeadStateConsistently(t *testing.T) {
 	var (

@@ -1490,6 +1490,27 @@ func (bc *BlockChain) WriteBlockWithState(block *types.Block, receipts []*types.
 	return bc.writeBlockWithState(block, receipts, state, tradingState, lendingState)
 }
 
+// writeKnownBlock makes an already stored and executed block the chain head,
+// reorganising the chain if it does not sit on top of the current head.
+func (bc *BlockChain) writeKnownBlock(block *types.Block) error {
+	current := bc.CurrentBlock()
+	if block.ParentHash() != current.Hash() {
+		if err := bc.reorg(current, block.Header()); err != nil {
+			return err
+		}
+	}
+	// WriteBlock has already been called for a known block, no need to write again
+	bc.writeHeadBlock(block, false)
+	// Mirrors writeBlockWithState: a gap block reaching the head must refresh the
+	// masternode set, otherwise its snapshot is never written.
+	if bc.chainConfig.XDPoS != nil && ((block.NumberU64() % bc.chainConfig.XDPoS.Epoch) == (bc.chainConfig.XDPoS.Epoch - bc.chainConfig.XDPoS.Gap)) {
+		if err := bc.UpdateM1(); err != nil {
+			return fmt.Errorf("fail to update masternodes for known block %d (%s): %w", block.NumberU64(), block.Hash().Hex(), err)
+		}
+	}
+	return nil
+}
+
 // writeBlockWithState writes the block and all associated state to the database,
 // but is expects the chain mutex to be held.
 func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.Receipt, state *state.StateDB, tradingState *tradingstate.TradingStateDB, lendingState *lendingstate.LendingStateDB) (status WriteStatus, err error) {
@@ -1845,7 +1866,7 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, []
 	}
 
 	// No validation errors for the first block (or chain prefix skipped)
-	for ; block != nil && err == nil; block, err = it.next() {
+	for ; block != nil && (err == nil || errors.Is(err, ErrKnownBlock)); block, err = it.next() {
 		// If the chain is terminating, stop processing blocks
 		if bc.insertStopped() {
 			log.Debug("Premature abort during blocks processing")
@@ -1855,6 +1876,17 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, []
 		if BadHashes[block.Hash()] {
 			bc.reportBlock(block, nil, ErrDenylistedHash)
 			return it.index, events, coalescedLogs, ErrDenylistedHash
+		}
+		// The block and its state are already stored, so re-executing it would only
+		// reproduce what is on disk; it still has to become the head.
+		if errors.Is(err, ErrKnownBlock) {
+			log.Debug("Writing previously known block", "number", block.Number(), "hash", block.Hash())
+			if err := bc.writeKnownBlock(block); err != nil {
+				return it.index, events, coalescedLogs, err
+			}
+			stats.processed++
+			lastCanon = block
+			continue
 		}
 		// Retrieve the parent block and it's state to execute on top
 		start := time.Now()
