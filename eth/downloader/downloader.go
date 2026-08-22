@@ -722,6 +722,24 @@ func calculateRequestSpan(remoteHeight, localHeight uint64) (int64, int, int, ui
 	return int64(from), count, span - 1, uint64(max)
 }
 
+// hasAncestor reports whether a remote block may be used as the common ancestor.
+// Blocks above the local head are rejected even when their body is on disk:
+// side chain blocks written ahead of the head are known by hash, and accepting
+// one as the ancestor skips the range the chain still has to import.
+func (d *Downloader) hasAncestor(mode SyncMode, hash common.Hash, number, localHeight uint64) bool {
+	if number > localHeight {
+		return false
+	}
+	switch mode {
+	case FullSync:
+		return d.blockchain.HasBlock(hash, number)
+	case FastSync:
+		return d.blockchain.HasFastBlock(hash, number)
+	default:
+		return d.lightchain.HasHeader(hash, number)
+	}
+}
+
 // findAncestor tries to locate the common ancestor link of the local chain and
 // a remote peers blockchain. In the general case when our node was in sync and
 // on the correct chain, checking the top N links should already get us a match.
@@ -795,16 +813,7 @@ func (d *Downloader) findAncestor(p *peerConnection, remoteHeader *types.Header)
 				h := headers[i].Hash()
 				n := headers[i].Number.Uint64()
 
-				var known bool
-				switch mode {
-				case FullSync:
-					known = d.blockchain.HasBlock(h, n)
-				case FastSync:
-					known = d.blockchain.HasFastBlock(h, n)
-				default:
-					known = d.lightchain.HasHeader(h, n)
-				}
-				if known {
+				if d.hasAncestor(mode, h, n, localHeight) {
 					number, hash = n, h
 					break
 				}
@@ -868,16 +877,7 @@ func (d *Downloader) findAncestor(p *peerConnection, remoteHeader *types.Header)
 				h := headers[0].Hash()
 				n := headers[0].Number.Uint64()
 
-				var known bool
-				switch mode {
-				case FullSync:
-					known = d.blockchain.HasBlock(h, n)
-				case FastSync:
-					known = d.blockchain.HasFastBlock(h, n)
-				default:
-					known = d.lightchain.HasHeader(h, n)
-				}
-				if !known {
+				if !d.hasAncestor(mode, h, n, localHeight) {
 					end = check
 					break
 				}

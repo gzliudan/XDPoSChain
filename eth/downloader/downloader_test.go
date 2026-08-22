@@ -322,6 +322,20 @@ func (dl *downloadTester) InsertChain(blocks types.Blocks) (i int, err error) {
 	return len(blocks), nil
 }
 
+// writeBlockWithoutState mirrors core.BlockChain.writeBlockWithoutState: the block
+// becomes known by hash, but without state it cannot become the chain head.
+func (dl *downloadTester) writeBlockWithoutState(block *types.Block) {
+	dl.lock.Lock()
+	defer dl.lock.Unlock()
+
+	if _, ok := dl.ownHeaders[block.Hash()]; !ok {
+		dl.ownHashes = append(dl.ownHashes, block.Hash())
+		dl.ownHeaders[block.Hash()] = block.Header()
+	}
+	dl.ownBlocks[block.Hash()] = block
+	dl.ownChainTd[block.Hash()] = new(big.Int).Add(dl.ownChainTd[block.ParentHash()], block.Difficulty())
+}
+
 // InsertReceiptChain injects a new batch of receipts into the simulated chain.
 func (dl *downloadTester) InsertReceiptChain(blocks types.Blocks, receipts []types.Receipts) (i int, err error) {
 	dl.lock.Lock()
@@ -550,6 +564,45 @@ func testCanonicalSynchronisation(t *testing.T, protocol int, mode SyncMode) {
 		t.Fatalf("failed to synchronise blocks: %v", err)
 	}
 	assertOwnChain(t, tester, chain.len())
+}
+
+// TestFindAncestorIgnoresBlocksAboveHead checks that blocks stored ahead of the
+// chain head are not accepted as the common ancestor. Side chain blocks are
+// written by hash without state, so accepting one resumes the sync above the
+// head and leaves the range in between permanently unimported.
+func TestFindAncestorIgnoresBlocksAboveHead(t *testing.T) {
+	t.Parallel()
+
+	tester := newTester()
+	defer tester.terminate()
+
+	chain := testChainBase.shorten(64)
+	tester.newPeer("peer", xdc165, chain)
+
+	const headHeight = 32
+	imported := make([]*types.Block, 0, headHeight)
+	for i := 1; i <= headHeight; i++ {
+		imported = append(imported, chain.blockm[chain.chain[i]])
+	}
+	if _, err := tester.InsertChain(imported); err != nil {
+		t.Fatalf("failed to import blocks: %v", err)
+	}
+	for i := headHeight + 1; i < chain.len(); i++ {
+		tester.writeBlockWithoutState(chain.blockm[chain.chain[i]])
+	}
+	if have := tester.CurrentBlock().Number.Uint64(); have != headHeight {
+		t.Fatalf("unexpected head: have %d want %d", have, headHeight)
+	}
+
+	var origin uint64
+	tester.downloader.syncInitHook = func(from, _ uint64) { origin = from }
+
+	if err := tester.sync("peer", nil, FullSync); err != nil {
+		t.Fatalf("failed to synchronise blocks: %v", err)
+	}
+	if origin != headHeight {
+		t.Fatalf("sync resumed above the head: origin %d want %d", origin, headHeight)
+	}
 }
 
 // Tests that if a large batch of blocks are being downloaded, it is throttled
