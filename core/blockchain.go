@@ -1954,7 +1954,11 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, []
 		log.Debug("New ChainHeadEvent ", "number", lastCanon.NumberU64(), "hash", lastCanon.Hash())
 		events = append(events, ChainHeadEvent{lastCanon})
 	}
-	return it.index, events, coalescedLogs, nil
+	// The blocks are already on disk, so stopping on them is not an import failure.
+	if errors.Is(err, ErrKnownBlock) {
+		err = nil
+	}
+	return it.index, events, coalescedLogs, err
 }
 
 // blockProcessingResult is a summary of block processing

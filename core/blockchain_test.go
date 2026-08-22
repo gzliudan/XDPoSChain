@@ -518,6 +518,102 @@ func TestInsertChainWithoutTRC21Issuer(t *testing.T) {
 	}
 }
 
+// failVerifyEngine fails header verification for a single block number, so a batch
+// can be made to fail in the middle instead of at its first block.
+type failVerifyEngine struct {
+	consensus.Engine
+	failNumber uint64
+	failErr    error
+}
+
+func (e *failVerifyEngine) VerifyHeaders(chain consensus.ChainReader, headers []*types.Header, seals []bool) (chan<- struct{}, <-chan error) {
+	abort := make(chan struct{})
+	results := make(chan error, len(headers))
+	go func() {
+		for _, header := range headers {
+			var err error
+			if header.Number.Uint64() == e.failNumber {
+				err = e.failErr
+			}
+			select {
+			case <-abort:
+				return
+			case results <- err:
+			}
+		}
+	}()
+	return abort, results
+}
+
+// TestInsertChainReportsMidBatchFailure guards against reporting a partially
+// imported batch as a success, which lets the downloader advance past blocks the
+// node never imported.
+func TestInsertChainReportsMidBatchFailure(t *testing.T) {
+	var (
+		key, _  = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
+		address = crypto.PubkeyToAddress(key.PublicKey)
+		funds   = big.NewInt(1000000000000000)
+		gspec   = &Genesis{
+			Alloc:   types.GenesisAlloc{address: {Balance: funds}},
+			BaseFee: big.NewInt(params.InitialBaseFee),
+			Config:  params.TestChainConfig,
+		}
+	)
+	_, blocks, _ := GenerateChainWithGenesis(gspec, ethash.NewFaker(), 5, nil)
+
+	failErr := errors.New("simulated mid-batch verification failure")
+	engine := &failVerifyEngine{Engine: ethash.NewFaker(), failNumber: 3, failErr: failErr}
+
+	chain, err := NewBlockChain(rawdb.NewMemoryDatabase(), nil, gspec, engine, vm.Config{})
+	if err != nil {
+		t.Fatalf("failed to create tester chain: %v", err)
+	}
+	defer chain.Stop()
+
+	n, err := chain.InsertChain(blocks)
+	if err == nil {
+		t.Fatal("InsertChain reported success for a partially imported batch")
+	}
+	if !errors.Is(err, failErr) {
+		t.Fatalf("unexpected error: have %v want %v", err, failErr)
+	}
+	if want := uint64(2); chain.CurrentBlock().Number.Uint64() != want {
+		t.Fatalf("unexpected head number: have %d want %d", chain.CurrentBlock().Number.Uint64(), want)
+	}
+	if want := 2; n != want {
+		t.Fatalf("unexpected failing index: have %d want %d", n, want)
+	}
+}
+
+// TestInsertChainSucceedsForFullBatch is the counterpart of the mid-batch failure
+// guard: a batch that verifies end to end must still report success.
+func TestInsertChainSucceedsForFullBatch(t *testing.T) {
+	var (
+		key, _  = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
+		address = crypto.PubkeyToAddress(key.PublicKey)
+		funds   = big.NewInt(1000000000000000)
+		gspec   = &Genesis{
+			Alloc:   types.GenesisAlloc{address: {Balance: funds}},
+			BaseFee: big.NewInt(params.InitialBaseFee),
+			Config:  params.TestChainConfig,
+		}
+	)
+	_, blocks, _ := GenerateChainWithGenesis(gspec, ethash.NewFaker(), 5, nil)
+
+	chain, err := NewBlockChain(rawdb.NewMemoryDatabase(), nil, gspec, ethash.NewFaker(), vm.Config{})
+	if err != nil {
+		t.Fatalf("failed to create tester chain: %v", err)
+	}
+	defer chain.Stop()
+
+	if n, err := chain.InsertChain(blocks); err != nil {
+		t.Fatalf("block %d: failed to insert into chain: %v", n, err)
+	}
+	if want := uint64(5); chain.CurrentBlock().Number.Uint64() != want {
+		t.Fatalf("unexpected head number: have %d want %d", chain.CurrentBlock().Number.Uint64(), want)
+	}
+}
+
 // TestNewBlockChainRepairsMissingHeadStateConsistently tests new block chain repairs missing head state consistently.
 func TestNewBlockChainRepairsMissingHeadStateConsistently(t *testing.T) {
 	var (
