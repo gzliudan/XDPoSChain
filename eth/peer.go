@@ -107,7 +107,9 @@ type peer struct {
 
 	getPooledTx func(common.Hash) *types.Transaction // Callback used to retrieve transaction from txpool
 
-	term chan struct{} // Termination channel to stop the broadcaster
+	term        chan struct{}  // Termination channel to stop the broadcaster
+	broadcastWg sync.WaitGroup // Tracks the broadcaster goroutines so they can be awaited
+	closeOnce   sync.Once      // Ensures term is closed exactly once
 
 	knownVote     mapset.Set[common.Hash] // Set of BFT Vote known to be known by this peer
 	knownTimeout  mapset.Set[common.Hash] // Set of BFT timeout known to be known by this peer
@@ -166,9 +168,10 @@ func (p *peer) broadcastBlocks() {
 // node internals and at the same time rate limits queued data.
 func (p *peer) broadcastTransactions() {
 	var (
-		queue []common.Hash      // Queue of hashes to broadcast as full transactions
-		done  chan struct{}      // Non-nil if background broadcaster is running
-		fail  = make(chan error) // Channel used to receive network error
+		queue  []common.Hash         // Queue of hashes to broadcast as full transactions
+		done   chan struct{}         // Non-nil if background broadcaster is running
+		fail   = make(chan error, 1) // Channel used to receive network error
+		failed bool                  // Keep draining the queue once sending is hopeless
 	)
 	for {
 		// If there's no in-flight broadcast running, check if a new one is needed
@@ -204,6 +207,10 @@ func (p *peer) broadcastTransactions() {
 		// Transfer goroutine may or may not have been started, listen for events
 		select {
 		case hashes := <-p.txBroadcast:
+			// If the connection failed, discard all transaction events
+			if failed {
+				continue
+			}
 			// New batch of transactions to be broadcast, queue them (with cap)
 			queue = append(queue, hashes...)
 			if len(queue) > maxQueuedTxs {
@@ -214,8 +221,13 @@ func (p *peer) broadcastTransactions() {
 		case <-done:
 			done = nil
 
-		case <-fail:
-			return
+		case err := <-fail:
+			// p.term is only closed when the peer is removed from the peer set
+			// (removePeer -> Unregister -> close), which may lag the connection
+			// failure. Stay around as a reader, or
+			// AsyncSendTransactions would block forever.
+			failed, queue, done = true, nil, nil
+			p.Log().Debug("Transaction broadcast send failed, draining queued events", "err", err)
 
 		case <-p.term:
 			return
@@ -228,9 +240,10 @@ func (p *peer) broadcastTransactions() {
 // node internals and at the same time rate limits queued data.
 func (p *peer) announceTransactions() {
 	var (
-		queue []common.Hash      // Queue of hashes to announce as transaction stubs
-		done  chan struct{}      // Non-nil if background announcer is running
-		fail  = make(chan error) // Channel used to receive network error
+		queue  []common.Hash         // Queue of hashes to announce as transaction stubs
+		done   chan struct{}         // Non-nil if background announcer is running
+		fail   = make(chan error, 1) // Channel used to receive network error
+		failed bool                  // Keep draining the queue once sending is hopeless
 	)
 	for {
 		// If there's no in-flight announce running, check if a new one is needed
@@ -266,6 +279,10 @@ func (p *peer) announceTransactions() {
 		// Transfer goroutine may or may not have been started, listen for events
 		select {
 		case hashes := <-p.txAnnounce:
+			// If the connection failed, discard all transaction events
+			if failed {
+				continue
+			}
 			// New batch of transactions to be broadcast, queue them (with cap)
 			queue = append(queue, hashes...)
 			if len(queue) > maxQueuedTxAnns {
@@ -276,8 +293,13 @@ func (p *peer) announceTransactions() {
 		case <-done:
 			done = nil
 
-		case <-fail:
-			return
+		case err := <-fail:
+			// p.term is only closed when the peer is removed from the peer set
+			// (removePeer -> Unregister -> close), which may lag the connection
+			// failure. Stay around as a reader, or
+			// AsyncSendPooledTransactionHashes would block forever.
+			failed, queue, done = true, nil, nil
+			p.Log().Debug("Transaction announcement send failed, draining queued events", "err", err)
 
 		case <-p.term:
 			return
@@ -285,9 +307,10 @@ func (p *peer) announceTransactions() {
 	}
 }
 
-// close signals the broadcast goroutine to terminate.
+// close signals the broadcast goroutine to terminate. It is safe for
+// concurrent and repeated calls: only the first call closes term.
 func (p *peer) close() {
-	close(p.term)
+	p.closeOnce.Do(func() { close(p.term) })
 }
 
 // Info gathers and returns a collection of metadata known about a peer.
@@ -847,24 +870,33 @@ func (ps *peerSet) Register(p *peer) error {
 	}
 	ps.peers[p.id] = p
 
-	go p.broadcastBlocks()
-	go p.broadcastTransactions()
+	p.broadcastWg.Go(func() {
+		p.broadcastBlocks()
+	})
+	p.broadcastWg.Go(func() {
+		p.broadcastTransactions()
+	})
 	if p.version >= xdc165 {
-		go p.announceTransactions()
+		p.broadcastWg.Go(func() {
+			p.announceTransactions()
+		})
 	}
 	return nil
 }
 
 // Unregister removes a remote peer from the active set, disabling any further
-// actions to/from that particular entity.
+// actions to/from that particular entity. It also terminates the peer's
+// broadcast goroutines, so they cannot leak once the peer is removed.
 func (ps *peerSet) Unregister(id string) error {
 	ps.lock.Lock()
 	defer ps.lock.Unlock()
 
-	if _, ok := ps.peers[id]; !ok {
+	p, ok := ps.peers[id]
+	if !ok {
 		return errNotRegistered
 	}
 	delete(ps.peers, id)
+	p.close()
 	return nil
 }
 
