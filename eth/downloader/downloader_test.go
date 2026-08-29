@@ -397,6 +397,13 @@ type downloadTesterPeer struct {
 	id            string
 	chain         *testChain
 	missingStates map[common.Hash]bool // State entries that fast sync should not return
+	// strayHook, when set, injects one misattributed header response (a reply
+	// that does not start at the requested origin) for the first matching
+	// by-number request, before falling back to the real chain.
+	strayHook func(origin uint64, amount, skip int) bool
+	// strayHashHook does the same for by-hash requests (the head fetch).
+	// Returning true suppresses the real reply and leaves it to the hook.
+	strayHashHook func(origin common.Hash, amount, skip int) bool
 }
 
 // Head constructs a function to retrieve a peer's current head hash
@@ -413,6 +420,9 @@ func (dlp *downloadTesterPeer) RequestHeadersByHash(origin common.Hash, amount i
 	if reverse {
 		panic("reverse header requests not supported")
 	}
+	if dlp.strayHashHook != nil && dlp.strayHashHook(origin, amount, skip) {
+		return nil
+	}
 
 	result := dlp.chain.headersByHash(origin, amount, skip)
 	go dlp.dl.downloader.DeliverHeaders(dlp.id, result)
@@ -425,6 +435,9 @@ func (dlp *downloadTesterPeer) RequestHeadersByHash(origin common.Hash, amount i
 func (dlp *downloadTesterPeer) RequestHeadersByNumber(origin uint64, amount int, skip int, reverse bool) error {
 	if reverse {
 		panic("reverse header requests not supported")
+	}
+	if dlp.strayHook != nil && dlp.strayHook(origin, amount, skip) {
+		return nil
 	}
 
 	result := dlp.chain.headersByNumber(origin, amount, skip)
@@ -1290,6 +1303,522 @@ func TestSyncBatchNoAncestorErrKeepPeer(t *testing.T) {
 				t.Fatalf("peer should not be dropped on successful sync")
 			}
 		})
+	}
+}
+
+// Tests that a misattributed header response is discarded and retried at every
+// consumption site: the ancestor span search, the ancestor binary probe and
+// the full header phase, as an off-origin batch and as an empty packet - the
+// latter in the skeleton phase too, which has to survive it and keep going.
+//
+// A completed sync doubles as the peer-survival assertion: Synchronise drops a
+// peer based solely on the error class, and a nil error leaves it in place.
+func TestSyncToleratesMisattributedHeaderResponses(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name              string
+		match             func(origin uint64, amount, skip int) bool
+		afterSkeleton     bool // injection must wait for the skeleton phase to end
+		empty             bool // inject an empty reply instead of a stray batch
+		flood             bool // inject for every matching request, not just the first
+		seed              int  // blocks to sync into the local chain before the run
+		batch             int  // number of headers in the injected stray batch
+		skeletonContinues bool // the skeleton phase must survive the stray and keep requesting
+	}{
+		{
+			// findAncestor span search: a skipped batch with a small stride.
+			name:  "ancestor-search",
+			match: func(origin uint64, amount, skip int) bool { return skip > 0 && skip != MaxHeaderFetch-1 },
+			batch: 1,
+		},
+		{
+			// findAncestor binary search: a single-header request answered
+			// with a batch of two.
+			name:  "ancestor-binary-search",
+			match: func(origin uint64, amount, skip int) bool { return amount == 1 && skip == 0 },
+			batch: 2,
+		},
+		{
+			// findAncestor span search answered empty: every requested
+			// number is below the remote head.
+			name:  "ancestor-search-empty",
+			match: func(origin uint64, amount, skip int) bool { return skip > 0 && skip != MaxHeaderFetch-1 },
+			empty: true,
+		},
+		{
+			// findAncestor binary search with every probe answered
+			// off-number: once the budget is exhausted the probe has to count
+			// as "not an ancestor", walking the search down to a real
+			// ancestor instead of failing the sync. Seeding the local chain
+			// first keeps the pre-fix code from reaching the same verdict.
+			name:  "ancestor-binary-search-flood",
+			match: func(origin uint64, amount, skip int) bool { return amount == 1 && skip == 0 },
+			flood: true,
+			seed:  50,
+			batch: 1,
+		},
+		{
+			// findAncestor binary search with every probe answered empty: a
+			// probe asks below the remote head, so an empty reply means the
+			// peer's head sits below the probe - the same "missing header"
+			// case as an off-number reply.
+			name:  "ancestor-binary-search-empty",
+			match: func(origin uint64, amount, skip int) bool { return amount == 1 && skip == 0 },
+			flood: true,
+			empty: true,
+		},
+		{
+			// fetchHeaders skeleton phase: the anchor batch, one header per
+			// stride of MaxHeaderFetch. The last request runs past the chain
+			// head and is answered empty, which ends the phase.
+			name: "skeleton-phase",
+			match: func(origin uint64, amount, skip int) bool {
+				return amount == MaxSkeletonSize && skip == MaxHeaderFetch-1
+			},
+			batch: 1,
+		},
+		{
+			// fetchHeaders skeleton phase answered empty below the remote
+			// head, where an honest peer always has the anchor: the phase
+			// must survive it and keep requesting.
+			name: "skeleton-phase-empty",
+			match: func(origin uint64, amount, skip int) bool {
+				return amount == MaxSkeletonSize && skip == MaxHeaderFetch-1
+			},
+			empty:             true,
+			skeletonContinues: true,
+		},
+		{
+			// fetchHeaders full phase: a contiguous batch. The skeleton fill
+			// requests share the shape, so wait for the skeleton to end.
+			name:          "full-header-phase",
+			match:         func(origin uint64, amount, skip int) bool { return amount == MaxHeaderFetch && skip == 0 },
+			afterSkeleton: true,
+			batch:         1,
+		},
+		{
+			// fetchHeaders full phase answered empty below the remote head,
+			// where an honest peer always has the header: the round must
+			// complete at full length instead of being truncated.
+			name:          "full-header-phase-empty",
+			match:         func(origin uint64, amount, skip int) bool { return amount == MaxHeaderFetch && skip == 0 },
+			afterSkeleton: true,
+			empty:         true,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			tester := newTester()
+			defer tester.terminate()
+
+			if tt.seed > 0 {
+				tester.newPeer("seed", xdc164, testChainBase.shorten(tt.seed))
+				if err := tester.sync("seed", nil, FullSync); err != nil {
+					t.Fatalf("failed to seed the local chain: %v", err)
+				}
+			}
+			chain := testChainBase.shorten(blockCacheMaxItems - 15)
+			tester.newPeer("peer", xdc164, chain)
+			// The hook runs on the request goroutine, so shared state is atomic.
+			inject, skeletonDone := new(atomic.Bool), new(atomic.Bool)
+			skeletonRequests := new(atomic.Int32)
+			tester.peers["peer"].strayHook = func(origin uint64, amount, skip int) bool {
+				if amount == MaxSkeletonSize && skip == MaxHeaderFetch-1 {
+					skeletonRequests.Add(1)
+					if origin >= uint64(chain.len()) {
+						skeletonDone.Store(true) // final skeleton request, came back empty
+						return false
+					}
+				}
+				if (!tt.flood && inject.Load()) || (tt.afterSkeleton && !skeletonDone.Load()) || !tt.match(origin, amount, skip) {
+					return false
+				}
+				inject.Store(true)
+				switch {
+				case tt.empty:
+					// An empty reply that does not answer the request.
+					go tester.downloader.DeliverHeaders("peer", nil)
+				default:
+					// Headers that do not start at the requested origin.
+					go tester.downloader.DeliverHeaders("peer", chain.headersByNumber(1, tt.batch, 0))
+				}
+				return true
+			}
+
+			if err := tester.sync("peer", nil, FullSync); err != nil {
+				t.Fatalf("failed to synchronise blocks: %v", err)
+			}
+			assertOwnChain(t, tester, chain.len())
+			if !inject.Load() {
+				t.Fatalf("no misattributed header response was injected")
+			}
+			if tt.skeletonContinues && skeletonRequests.Load() < 2 {
+				t.Fatalf("skeleton phase ended on the stray empty response after %d skeleton request(s)", skeletonRequests.Load())
+			}
+		})
+	}
+}
+
+// strayBudgetRequests is the number of header requests a flood consumes before
+// the sync gives up on the peer: the initial request plus one retry per
+// tolerated stray. Spelled out rather than derived from maxStrayHeaderPackets
+// so that shrinking the tolerance fails the tests instead of moving the
+// expectation along with it.
+const strayBudgetRequests = 4
+
+// Tests that the tolerance for misattributed header responses stays bounded: a
+// peer that answers every by-number request with headers from another origin
+// fails the sync with an error class that Synchronise drops the peer for,
+// instead of being retried forever.
+func TestSyncRejectsMisattributedHeaderFlood(t *testing.T) {
+	t.Parallel()
+
+	tester := newTester()
+	defer tester.terminate()
+
+	chain := testChainBase.shorten(blockCacheMaxItems - 15)
+	tester.newPeer("peer", xdc164, chain)
+	// The hook runs on the request goroutine, so shared state is atomic.
+	requests := new(atomic.Int32)
+	tester.peers["peer"].strayHook = func(origin uint64, amount, skip int) bool {
+		requests.Add(1)
+		// Headers that do not start at the requested origin.
+		go tester.downloader.DeliverHeaders("peer", chain.headersByNumber(1, 1, 0))
+		return true
+	}
+
+	err := tester.sync("peer", nil, FullSync)
+	if err == nil {
+		t.Fatalf("synchronised blocks despite uninterrupted misattributed header responses")
+	}
+	if !errors.Is(err, errInvalidChain) {
+		t.Fatalf("sync error mismatch: have %v, want wrapped %v", err, errInvalidChain)
+	}
+	// The stray was retried, but only within the tolerated budget.
+	if n := int(requests.Load()); n != strayBudgetRequests {
+		t.Fatalf("header requests mismatch: have %d, want %d", n, strayBudgetRequests)
+	}
+}
+
+// Tests that the tolerance stays bounded in the header download: a peer that
+// answers every skeleton request with headers from another origin fails the
+// sync with an error class that Synchronise drops the peer for.
+//
+// The hook only matches the skeleton shape, so the ancestor search preceding
+// the download is left alone and only the fetchHeaders budget is exercised.
+func TestSyncRejectsMisattributedHeaderFloodInFetchHeaders(t *testing.T) {
+	t.Parallel()
+
+	tester := newTester()
+	defer tester.terminate()
+
+	chain := testChainBase.shorten(blockCacheMaxItems - 15)
+	tester.newPeer("peer", xdc164, chain)
+	// The hook runs on the request goroutine, so shared state is atomic.
+	requests := new(atomic.Int32)
+	tester.peers["peer"].strayHook = func(origin uint64, amount, skip int) bool {
+		// Only the skeleton phase asks for a full stride of MaxSkeletonSize
+		// headers; the ancestor span search uses far shorter spans, and the
+		// full header phase asks for one contiguous batch of MaxHeaderFetch.
+		if amount != MaxSkeletonSize || skip != MaxHeaderFetch-1 {
+			return false
+		}
+		requests.Add(1)
+		// Headers that do not start at the requested origin.
+		go tester.downloader.DeliverHeaders("peer", chain.headersByNumber(1, 1, 0))
+		return true
+	}
+
+	err := tester.sync("peer", nil, FullSync)
+	if err == nil {
+		t.Fatalf("synchronised blocks despite uninterrupted misattributed header responses")
+	}
+	if !errors.Is(err, errBadPeer) {
+		t.Fatalf("sync error mismatch: have %v, want wrapped %v", err, errBadPeer)
+	}
+	// The stray was retried, but only within the tolerated budget.
+	if n := int(requests.Load()); n != strayBudgetRequests {
+		t.Fatalf("header requests mismatch: have %d, want %d", n, strayBudgetRequests)
+	}
+}
+
+// Tests that the tolerance stays bounded in the full header download phase: a
+// peer that answers every contiguous batch with headers from another origin
+// fails the sync with an error class that Synchronise drops the peer for.
+//
+// The hook only starts matching once the skeleton phase has ended: contiguous
+// batches also fill the skeleton, and flooding them would starve the fill
+// instead of the download.
+func TestSyncRejectsMisattributedHeaderFloodInFullPhase(t *testing.T) {
+	t.Parallel()
+
+	tester := newTester()
+	defer tester.terminate()
+
+	chain := testChainBase.shorten(blockCacheMaxItems - 15)
+	tester.newPeer("peer", xdc164, chain)
+	// The hook runs on the request goroutine, so shared state is atomic.
+	requests, skeletonDone := new(atomic.Int32), new(atomic.Bool)
+	tester.peers["peer"].strayHook = func(origin uint64, amount, skip int) bool {
+		if amount == MaxSkeletonSize && skip == MaxHeaderFetch-1 {
+			if origin >= uint64(chain.len()) {
+				skeletonDone.Store(true) // final skeleton request, came back empty
+			}
+			return false
+		}
+		if !skeletonDone.Load() || amount != MaxHeaderFetch || skip != 0 {
+			return false
+		}
+		requests.Add(1)
+		// Headers that do not start at the requested origin.
+		go tester.downloader.DeliverHeaders("peer", chain.headersByNumber(1, 1, 0))
+		return true
+	}
+
+	err := tester.sync("peer", nil, FullSync)
+	if err == nil {
+		t.Fatalf("synchronised blocks despite uninterrupted misattributed header responses")
+	}
+	if !errors.Is(err, errBadPeer) {
+		t.Fatalf("sync error mismatch: have %v, want wrapped %v", err, errBadPeer)
+	}
+	// The stray was retried, but only within the tolerated budget.
+	if n := int(requests.Load()); n != strayBudgetRequests {
+		t.Fatalf("header requests mismatch: have %d, want %d", n, strayBudgetRequests)
+	}
+}
+
+// Tests that a misattributed header response to the head fetch (a by-hash
+// request, answered with a header at another hash) is discarded and retried
+// without failing the sync.
+func TestSyncToleratesMisattributedHeadHeader(t *testing.T) {
+	t.Parallel()
+
+	tester := newTester()
+	defer tester.terminate()
+
+	chain := testChainBase.shorten(blockCacheMaxItems - 15)
+	tester.newPeer("peer", xdc164, chain)
+	// The hook runs on the request goroutine, so shared state is atomic.
+	inject := new(atomic.Bool)
+	stray := chain.headersByNumber(1, 1, 0)
+	tester.peers["peer"].strayHashHook = func(origin common.Hash, amount, skip int) bool {
+		if inject.Load() {
+			return false
+		}
+		inject.Store(true)
+		// A single header that does not answer the requested hash.
+		go tester.downloader.DeliverHeaders("peer", stray)
+		return true
+	}
+
+	if err := tester.sync("peer", nil, FullSync); err != nil {
+		t.Fatalf("failed to synchronise blocks: %v", err)
+	}
+	assertOwnChain(t, tester, chain.len())
+	if !inject.Load() {
+		t.Fatalf("no misattributed head header was injected")
+	}
+}
+
+// Tests that the tolerance for misattributed head headers stays bounded: a
+// peer that answers every head fetch with a header at another hash fails the
+// sync with an error class that Synchronise drops the peer for, instead of
+// being retried forever.
+func TestSyncRejectsMisattributedHeadHeaderFlood(t *testing.T) {
+	t.Parallel()
+
+	tester := newTester()
+	defer tester.terminate()
+
+	chain := testChainBase.shorten(blockCacheMaxItems - 15)
+	tester.newPeer("peer", xdc164, chain)
+	// The hook runs on the request goroutine, so shared state is atomic.
+	requests := new(atomic.Int32)
+	stray := chain.headersByNumber(1, 1, 0)
+	tester.peers["peer"].strayHashHook = func(origin common.Hash, amount, skip int) bool {
+		requests.Add(1)
+		// A single header that does not answer the requested hash.
+		go tester.downloader.DeliverHeaders("peer", stray)
+		return true
+	}
+
+	err := tester.sync("peer", nil, FullSync)
+	if err == nil {
+		t.Fatalf("synchronised blocks despite uninterrupted misattributed head headers")
+	}
+	if !errors.Is(err, errBadPeer) {
+		t.Fatalf("sync error mismatch: have %v, want wrapped %v", err, errBadPeer)
+	}
+	// The stray was retried, but only within the tolerated budget.
+	if n := int(requests.Load()); n != strayBudgetRequests {
+		t.Fatalf("header requests mismatch: have %d, want %d", n, strayBudgetRequests)
+	}
+}
+
+// Tests the other shape a misattributed head header can take: a batch where a
+// single header is expected. A batch is a protocol violation no conforming
+// peer can produce, so exhausting the stray budget has to fail the sync with
+// an error class that Synchronise drops the peer for.
+func TestSyncRejectsMisattributedHeadHeaderBatchFlood(t *testing.T) {
+	t.Parallel()
+
+	tester := newTester()
+	defer tester.terminate()
+
+	chain := testChainBase.shorten(blockCacheMaxItems - 15)
+	tester.newPeer("peer", xdc164, chain)
+	// The hook runs on the request goroutine, so shared state is atomic.
+	requests := new(atomic.Int32)
+	stray := chain.headersByNumber(1, 2, 0)
+	tester.peers["peer"].strayHashHook = func(origin common.Hash, amount, skip int) bool {
+		requests.Add(1)
+		// A batch that does not answer the requested hash.
+		go tester.downloader.DeliverHeaders("peer", stray)
+		return true
+	}
+
+	err := tester.sync("peer", nil, FullSync)
+	if err == nil {
+		t.Fatalf("synchronised blocks despite uninterrupted misattributed head headers")
+	}
+	if !errors.Is(err, errBadPeer) {
+		t.Fatalf("sync error mismatch: have %v, want wrapped %v", err, errBadPeer)
+	}
+	// The stray was retried, but only within the tolerated budget.
+	if n := int(requests.Load()); n != strayBudgetRequests {
+		t.Fatalf("header requests mismatch: have %d, want %d", n, strayBudgetRequests)
+	}
+}
+
+// Tests the third shape a misattributed head header can take: an empty set
+// where a single header is expected. All three shapes are plain errBadPeer, so
+// the message is what tells this branch apart from the batch and off-hash ones.
+func TestSyncRejectsMisattributedHeadHeaderEmptyFlood(t *testing.T) {
+	t.Parallel()
+
+	tester := newTester()
+	defer tester.terminate()
+
+	chain := testChainBase.shorten(blockCacheMaxItems - 15)
+	tester.newPeer("peer", xdc164, chain)
+	// The hook runs on the request goroutine, so shared state is atomic.
+	requests := new(atomic.Int32)
+	tester.peers["peer"].strayHashHook = func(origin common.Hash, amount, skip int) bool {
+		requests.Add(1)
+		// An empty reply that does not answer the requested hash.
+		go tester.downloader.DeliverHeaders("peer", nil)
+		return true
+	}
+
+	err := tester.sync("peer", nil, FullSync)
+	if err == nil {
+		t.Fatalf("synchronised blocks despite uninterrupted empty head headers")
+	}
+	if !errors.Is(err, errBadPeer) {
+		t.Fatalf("sync error mismatch: have %v, want wrapped %v", err, errBadPeer)
+	}
+	if !strings.Contains(err.Error(), "head header answered empty") {
+		t.Fatalf("sync error mismatch: have %v, want head header answered empty", err)
+	}
+	// The stray was retried, but only within the tolerated budget.
+	if n := int(requests.Load()); n != strayBudgetRequests {
+		t.Fatalf("header requests mismatch: have %d, want %d", n, strayBudgetRequests)
+	}
+}
+
+// Tests that the tolerance for empty header sets below the advertised head
+// stays bounded: once the budget runs out the advertised head is re-probed,
+// and a peer that still serves it - one whose chain did not actually shrink -
+// is dropped for the flood.
+func TestSyncRejectsEmptyHeaderFloodBelowAdvertisedHead(t *testing.T) {
+	t.Parallel()
+
+	tester := newTester()
+	defer tester.terminate()
+
+	chain := testChainBase.shorten(blockCacheMaxItems - 15)
+	tester.newPeer("peer", xdc164, chain)
+	// The hook runs on the request goroutine, so shared state is atomic.
+	requests, probes := new(atomic.Int32), new(atomic.Int32)
+	tester.peers["peer"].strayHook = func(origin uint64, amount, skip int) bool {
+		// The head re-probe: a single header at the advertised head. The
+		// ancestor probe asks at strictly lower numbers, hence the origin.
+		if amount == 1 && skip == 0 && origin == uint64(chain.len()-1) {
+			probes.Add(1)
+			// The peer still has the block it advertised.
+			go tester.downloader.DeliverHeaders("peer", chain.headersByNumber(origin, 1, 0))
+			return true
+		}
+		// Every skeleton request below the advertised head answered empty.
+		if amount == MaxSkeletonSize && skip == MaxHeaderFetch-1 {
+			requests.Add(1)
+			go tester.downloader.DeliverHeaders("peer", nil)
+			return true
+		}
+		return false
+	}
+
+	err := tester.sync("peer", nil, FullSync)
+	if !errors.Is(err, errEmptyHeaderSet) {
+		t.Fatalf("sync error mismatch: have %v, want %v", err, errEmptyHeaderSet)
+	}
+	// The stray was retried, but only within the tolerated budget.
+	if n := int(requests.Load()); n != strayBudgetRequests {
+		t.Fatalf("skeleton requests mismatch: have %d, want %d", n, strayBudgetRequests)
+	}
+	if n := int(probes.Load()); n != 1 {
+		t.Fatalf("head probes mismatch: have %d, want 1", n)
+	}
+	// errEmptyHeaderSet is a drop-class error: Synchronise drops the peer for it.
+}
+
+// Tests that a peer whose head moved below its advertisement mid-sync - a
+// reorg onto a shorter chain - is not dropped for answering empty there: the
+// re-probe falls back to end-of-chain semantics, and the next sync round
+// re-anchors on the peer's new head.
+func TestSyncToleratesMidSyncShorterChain(t *testing.T) {
+	t.Parallel()
+
+	tester := newTester()
+	defer tester.terminate()
+
+	chain := testChainBase.shorten(blockCacheMaxItems - 15)
+	tester.newPeer("peer", xdc164, chain)
+	// The hook runs on the request goroutine, so shared state is atomic.
+	requests, probes := new(atomic.Int32), new(atomic.Int32)
+	tester.peers["peer"].strayHook = func(origin uint64, amount, skip int) bool {
+		if amount == 1 && skip == 0 && origin == uint64(chain.len()-1) {
+			probes.Add(1)
+			// The peer no longer serves the head it advertised.
+			go tester.downloader.DeliverHeaders("peer", nil)
+			return true
+		}
+		if amount == MaxSkeletonSize && skip == MaxHeaderFetch-1 {
+			// Answer the first strayBudgetRequests skeleton requests with
+			// empty sets, like a peer that keeps missing its anchors.
+			if n := requests.Add(1); n <= strayBudgetRequests {
+				go tester.downloader.DeliverHeaders("peer", nil)
+				return true
+			}
+		}
+		return false
+	}
+
+	if err := tester.sync("peer", nil, FullSync); err != nil {
+		t.Fatalf("failed to synchronise blocks: %v", err)
+	}
+	assertOwnChain(t, tester, chain.len())
+	// A nil error is never a drop-class error, so the peer survived.
+	if n := int(requests.Load()); n != strayBudgetRequests {
+		t.Fatalf("skeleton requests mismatch: have %d, want %d", n, strayBudgetRequests)
+	}
+	if n := int(probes.Load()); n != 1 {
+		t.Fatalf("head probes mismatch: have %d, want 1", n)
 	}
 }
 

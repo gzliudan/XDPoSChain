@@ -69,6 +69,14 @@ var (
 	reorgProtThreshold   = 48 // Threshold number of recent blocks to disable mini reorg protection
 	reorgProtHeaderDelay = 2  // Number of headers to delay delivering to cover mini reorgs
 
+	// maxStrayHeaderPackets bounds the misattributed header responses tolerated
+	// per head fetch, ancestor span search, ancestor probe and phase of the
+	// header download. The wire protocol carries no request ids, so a stray
+	// reply to another request of the same peer happens once in a while; a
+	// stream of them is a misbehaving peer. The binary search resets the
+	// budget per probe, so it is not charged for its number of rounds.
+	maxStrayHeaderPackets = 3
+
 	// Fast sync choose not to verify headers before the pivot, hence fsHeaderCheckFrequency = 0. Notice that blocks are full verified after pivot.
 	fsHeaderCheckFrequency = 0               // Verification frequency of the downloaded headers during fast sync
 	fsHeaderSafetyNet      = 2048            // Number of headers to discard in case a chain violation is detected
@@ -544,9 +552,9 @@ func (d *Downloader) syncWithPeer(p *peerConnection, hash common.Hash, td *big.I
 	}
 
 	fetchers := []func() error{
-		func() error { return d.fetchHeaders(p, origin+1, pivot) }, // Headers are always retrieved
-		func() error { return d.fetchBodies(origin + 1) },          // Bodies are retrieved during normal and fast sync
-		func() error { return d.fetchReceipts(origin + 1) },        // Receipts are retrieved during fast sync
+		func() error { return d.fetchHeaders(p, origin+1, pivot, height) }, // Headers are always retrieved
+		func() error { return d.fetchBodies(origin + 1) },                  // Bodies are retrieved during normal and fast sync
+		func() error { return d.fetchReceipts(origin + 1) },                // Receipts are retrieved during fast sync
 		func() error { return d.processHeaders(origin+1, pivot, td) },
 	}
 	if mode == FastSync {
@@ -628,6 +636,15 @@ func (d *Downloader) Terminate() {
 	d.Cancel()
 }
 
+// firstHeaderLabel describes the first header of a response for logging, or
+// "none" if the response carries none.
+func firstHeaderLabel(headers []*types.Header) string {
+	if len(headers) == 0 {
+		return "none"
+	}
+	return fmt.Sprintf("#%d %s", headers[0].Number, headers[0].Hash().TerminalString())
+}
+
 // fetchHeight retrieves the head header of the remote peer to aid in estimating
 // the total time a pending synchronisation would take.
 func (d *Downloader) fetchHeight(p *peerConnection, hash common.Hash) (*types.Header, error) {
@@ -636,6 +653,8 @@ func (d *Downloader) fetchHeight(p *peerConnection, hash common.Hash) (*types.He
 
 	ttl := d.requestTTL()
 	timeout := time.After(ttl)
+
+	strays := 0 // misattributed header responses seen for this head fetch
 	for {
 		select {
 		case <-d.cancelCh:
@@ -647,11 +666,31 @@ func (d *Downloader) fetchHeight(p *peerConnection, hash common.Hash) (*types.He
 				log.Debug("Received headers from incorrect peer", "peer", packet.PeerId())
 				break
 			}
-			// Make sure the peer actually gave something valid
+			// A conforming reply carries exactly one header at the requested
+			// hash; the wire protocol carries no request ids, so anything else
+			// is a stray reply to another request of this peer. Discard and
+			// retry instead of dropping the peer for it.
 			headers := packet.(*headerPack).headers
-			if len(headers) != 1 {
-				p.log.Warn("Multiple headers for single request", "headers", len(headers))
-				return nil, fmt.Errorf("%w: multiple headers (%d) for single request", errBadPeer, len(headers))
+			if len(headers) != 1 || headers[0].Hash() != hash {
+				strays++
+				headerStrayMeter.Mark(1)
+				if strays > maxStrayHeaderPackets {
+					// No fallback here: the sync is anchored on this hash.
+					if len(headers) == 0 {
+						p.log.Warn("Head header answered empty", "requested", hash)
+						return nil, fmt.Errorf("%w: head header answered empty", errBadPeer)
+					}
+					if len(headers) != 1 {
+						p.log.Warn("Head header answered with a batch", "requested", hash, "count", len(headers))
+						return nil, fmt.Errorf("%w: multiple headers (%d) for single request", errBadPeer, len(headers))
+					}
+					p.log.Warn("Head header answered off-hash", "requested", hash, "received", headers[0].Hash())
+					return nil, fmt.Errorf("%w: non-requested head header", errBadPeer)
+				}
+				p.log.Debug("Misattributed header response", "requested", hash, "count", len(headers), "received", firstHeaderLabel(headers))
+				timeout = time.After(ttl)
+				go p.peer.RequestHeadersByHash(hash, 1, 0, false)
+				break
 			}
 			head := headers[0]
 			p.log.Debug("Remote head header identified", "number", head.Number, "hash", head.Hash())
@@ -759,6 +798,7 @@ func (d *Downloader) findAncestor(p *peerConnection, remoteHeader *types.Header)
 	ttl := d.requestTTL()
 	timeout := time.After(ttl)
 
+	strays := 0 // misattributed header responses seen in this span search
 	for finished := false; !finished; {
 		select {
 		case <-d.cancelCh:
@@ -773,16 +813,47 @@ func (d *Downloader) findAncestor(p *peerConnection, remoteHeader *types.Header)
 			// Make sure the peer actually gave something valid
 			headers := packet.(*headerPack).headers
 			if len(headers) == 0 {
-				p.log.Warn("Empty head header set")
-				return 0, errEmptyHeaderSet
+				// The span only asks for numbers below the remote head, so a
+				// conforming reply carries data: an empty packet is a stray.
+				strays++
+				headerStrayMeter.Mark(1)
+				if strays > maxStrayHeaderPackets {
+					p.log.Warn("Empty head header sets exceeded", "requested", from)
+					return 0, errEmptyHeaderSet
+				}
+				p.log.Debug("Empty head header set, discarding as stray", "requested", from)
+				timeout = time.After(ttl)
+				go p.peer.RequestHeadersByNumber(uint64(from), count, skip, false)
+				break
 			}
 			// Make sure the peer's reply conforms to the request
+			var (
+				misorderIdx  int
+				misorderWant int64
+				misorderGot  int64
+			)
+			misordered := false
 			for i, header := range headers {
 				expectNumber := from + int64(i)*int64((skip+1))
 				if number := header.Number.Int64(); number != expectNumber {
-					p.log.Warn("Head headers broke chain ordering", "index", i, "requested", expectNumber, "received", number)
+					misorderIdx, misorderWant, misorderGot = i, expectNumber, number
+					misordered = true
+					break
+				}
+			}
+			if misordered {
+				// Stray response to another request of this peer: discard and
+				// retry instead of dropping the peer for it.
+				strays++
+				headerStrayMeter.Mark(1)
+				if strays > maxStrayHeaderPackets {
+					p.log.Warn("Misordered head headers exceeded", "requested", from, "index", misorderIdx, "received", misorderGot)
 					return 0, fmt.Errorf("%w: %v", errInvalidChain, errors.New("head headers broke chain ordering"))
 				}
+				p.log.Debug("Head headers broke chain ordering, discarding as stray", "index", misorderIdx, "requested", misorderWant, "received", misorderGot)
+				timeout = time.After(ttl)
+				go p.peer.RequestHeadersByNumber(uint64(from), count, skip, false)
+				break
 			}
 			// Check if a common ancestor was found
 			finished = true
@@ -841,6 +912,7 @@ func (d *Downloader) findAncestor(p *peerConnection, remoteHeader *types.Header)
 
 		ttl := d.requestTTL()
 		timeout := time.After(ttl)
+		strays = 0 // every probe gets its own stray budget
 
 		go p.peer.RequestHeadersByNumber(check, 1, 0, false)
 
@@ -856,11 +928,36 @@ func (d *Downloader) findAncestor(p *peerConnection, remoteHeader *types.Header)
 					log.Debug("Received headers from incorrect peer", "peer", packer.PeerId())
 					break
 				}
-				// Make sure the peer actually gave something valid
+				// A conforming reply carries exactly one header at the
+				// requested number; anything else is a stray reply to another
+				// request of this peer. Discard and retry.
 				headers := packer.(*headerPack).headers
-				if len(headers) != 1 {
-					p.log.Warn("Multiple headers for single request", "headers", len(headers))
-					return 0, fmt.Errorf("%w: multiple headers (%d) for single request", errBadPeer, len(headers))
+				if len(headers) != 1 || headers[0].Number.Uint64() != check {
+					strays++
+					headerStrayMeter.Mark(1)
+					if strays > maxStrayHeaderPackets {
+						// Out of budget. A missing header degrades to a plain
+						// "not an ancestor" verdict, which only extends the
+						// search downward, where every header is verified
+						// anyway. Only a batch of the wrong shape remains a
+						// protocol violation.
+						if len(headers) > 1 {
+							p.log.Warn("Ancestor probe answered with a batch", "requested", check, "count", len(headers))
+							return 0, fmt.Errorf("%w: multiple headers (%d) for single request", errBadPeer, len(headers))
+						}
+						if len(headers) == 1 {
+							p.log.Warn("Ancestor probe answered off-number", "requested", check, "received", headers[0].Number)
+						} else {
+							p.log.Warn("Ancestor probe answered empty", "requested", check)
+						}
+						arrived = true // the answer counts as a plain "not an ancestor"
+						end = check
+						break
+					}
+					p.log.Debug("Misattributed header response", "requested", check, "count", len(headers), "received", firstHeaderLabel(headers))
+					timeout = time.After(ttl)
+					go p.peer.RequestHeadersByNumber(check, 1, 0, false)
+					break
 				}
 				arrived = true
 
@@ -880,11 +977,6 @@ func (d *Downloader) findAncestor(p *peerConnection, remoteHeader *types.Header)
 				if !known {
 					end = check
 					break
-				}
-				header := d.lightchain.GetHeaderByHash(h) // Independent of sync mode, header surely exists
-				if header.Number.Uint64() != check {
-					p.log.Warn("Received non requested header", "number", header.Number, "hash", header.Hash(), "request", check)
-					return 0, fmt.Errorf("%w: non-requested header (%d)", errBadPeer, header.Number)
 				}
 				start = check
 				hash = h
@@ -908,6 +1000,59 @@ func (d *Downloader) findAncestor(p *peerConnection, remoteHeader *types.Header)
 	return start, nil
 }
 
+// skeletonOrigin is the first block number requested for the skeleton phase
+// anchored at from: one header per stride, a full stride ahead of the anchor.
+// fetchHeaders validates responses against the same origin.
+func skeletonOrigin(from uint64) uint64 { return from + uint64(MaxHeaderFetch) - 1 }
+
+// confirmAdvertisedHead asks the peer whether it still serves the head it
+// advertised when the sync started. An empty reply means its head moved below
+// the advertisement, i.e. a reorg onto a shorter chain mid-sync.
+func (d *Downloader) confirmAdvertisedHead(p *peerConnection, number uint64) (bool, error) {
+	ttl := d.requestTTL()
+	timeout := time.After(ttl)
+	go p.peer.RequestHeadersByNumber(number, 1, 0, false)
+
+	for strays := 0; ; {
+		select {
+		case <-d.cancelCh:
+			return false, errCanceled
+
+		case packet := <-d.headerCh:
+			// Discard anything not from the origin peer
+			if packet.PeerId() != p.id {
+				log.Debug("Received headers from incorrect peer", "peer", packet.PeerId())
+				break
+			}
+			headers := packet.(*headerPack).headers
+			if len(headers) == 1 && headers[0].Number.Uint64() == number {
+				return true, nil
+			}
+			if len(headers) == 0 {
+				return false, nil // head moved below the advertisement
+			}
+			// Anything else is a stray reply to another request of this peer.
+			strays++
+			headerStrayMeter.Mark(1)
+			if strays > maxStrayHeaderPackets {
+				p.log.Warn("Head re-probe kept answering misattributed", "requested", number)
+				return false, fmt.Errorf("%w: head re-probe misattributed", errBadPeer)
+			}
+			p.log.Debug("Misattributed header response", "requested", number, "count", len(headers), "received", firstHeaderLabel(headers))
+			timeout = time.After(ttl)
+			go p.peer.RequestHeadersByNumber(number, 1, 0, false)
+
+		case <-timeout:
+			p.log.Debug("Waiting for head re-probe timed out", "elapsed", ttl)
+			return false, errTimeout
+
+		case <-d.bodyCh:
+		case <-d.receiptCh:
+			// Out of bounds delivery, ignore
+		}
+	}
+}
+
 // fetchHeaders keeps retrieving headers concurrently from the number
 // requested, until no more are returned, potentially throttling on the way. To
 // facilitate concurrency but still protect against malicious nodes sending bad
@@ -916,7 +1061,15 @@ func (d *Downloader) findAncestor(p *peerConnection, remoteHeader *types.Header)
 // other peers are only accepted if they map cleanly to the skeleton. If no one
 // can fill in the skeleton - not even the origin peer - it's assumed invalid and
 // the origin is dropped.
-func (d *Downloader) fetchHeaders(p *peerConnection, from uint64, pivot uint64) error {
+//
+// remoteHeight is the head the origin peer advertised when the sync started.
+// Below it an honest peer always has the requested header, so an empty reply
+// there is a stray; only past it does an empty reply mean the end of the
+// chain. A peer that reorged onto a shorter chain mid-sync also answers empty
+// below it, so once the stray budget runs out the advertised head is
+// re-probed: a peer that still serves it is flooding (errEmptyHeaderSet), one
+// whose head moved below it falls back to end-of-chain semantics.
+func (d *Downloader) fetchHeaders(p *peerConnection, from uint64, pivot uint64, remoteHeight uint64) error {
 	p.log.Debug("Directing header downloads", "origin", from)
 	defer p.log.Debug("Header download terminated")
 
@@ -926,6 +1079,7 @@ func (d *Downloader) fetchHeaders(p *peerConnection, from uint64, pivot uint64) 
 	timeout := time.NewTimer(0) // timer to dump a non-responsive active peer
 	<-timeout.C                 // timeout channel should be initially empty
 	defer timeout.Stop()
+	strays := 0 // misattributed header responses seen since the last valid one
 
 	var ttl time.Duration
 	getHeaders := func(from uint64) {
@@ -936,7 +1090,7 @@ func (d *Downloader) fetchHeaders(p *peerConnection, from uint64, pivot uint64) 
 
 		if skeleton {
 			p.log.Trace("Fetching skeleton headers", "count", MaxHeaderFetch, "from", from)
-			go p.peer.RequestHeadersByNumber(from+uint64(MaxHeaderFetch)-1, MaxSkeletonSize, MaxHeaderFetch-1, false)
+			go p.peer.RequestHeadersByNumber(skeletonOrigin(from), MaxSkeletonSize, MaxHeaderFetch-1, false)
 		} else {
 			p.log.Trace("Fetching full headers", "count", MaxHeaderFetch, "from", from)
 			go p.peer.RequestHeadersByNumber(from, MaxHeaderFetch, 0, false)
@@ -957,12 +1111,48 @@ func (d *Downloader) fetchHeaders(p *peerConnection, from uint64, pivot uint64) 
 				log.Debug("Received skeleton from incorrect peer", "peer", packet.PeerId())
 				break
 			}
-			headerReqTimer.UpdateSince(request)
+			// Sample latency only for packets that answer the outstanding
+			// request: a stray carries someone else's round trip time.
+			elapsed := time.Since(request)
 			timeout.Stop()
 
 			// If the skeleton's finished, pull any remaining head headers directly from the origin
 			if packet.Items() == 0 && skeleton {
+				// Below the advertised head an honest peer always has the
+				// requested anchor, so an empty packet is a stray. Ending the
+				// skeleton phase on it would serialize the rest of the
+				// download on the origin peer.
+				if skeletonOrigin(from) <= remoteHeight {
+					strays++
+					headerStrayMeter.Mark(1)
+					if strays > maxStrayHeaderPackets {
+						p.log.Warn("Empty skeleton header sets exceeded", "requested", skeletonOrigin(from), "advertised", remoteHeight)
+						// A reorg onto a shorter chain also answers empty below
+						// the advertisement: check it before dropping the peer.
+						kept, err := d.confirmAdvertisedHead(p, remoteHeight)
+						if err != nil {
+							return err
+						}
+						if !kept {
+							p.log.Warn("Peer head moved below advertisement", "advertised", remoteHeight, "origin", from)
+							// End-of-chain semantics from here: the next empty
+							// reply ends the round, and the next sync re-anchors
+							// on the peer's new head.
+							remoteHeight = from - 1
+							skeleton = false
+							strays = 0
+							getHeaders(from)
+							continue
+						}
+						return errEmptyHeaderSet
+					}
+					p.log.Debug("Empty skeleton header set, discarding as stray", "requested", skeletonOrigin(from))
+					getHeaders(from)
+					continue
+				}
 				skeleton = false
+				strays = 0 // the full header phase gets its own stray budget
+				headerReqTimer.Update(elapsed)
 				getHeaders(from)
 				continue
 			}
@@ -970,6 +1160,7 @@ func (d *Downloader) fetchHeaders(p *peerConnection, from uint64, pivot uint64) 
 			if packet.Items() == 0 {
 				// Don't abort header fetches while the pivot is downloading
 				if atomic.LoadInt32(&d.committed) == 0 && pivot <= from {
+					headerReqTimer.Update(elapsed)
 					p.log.Debug("No headers, waiting for pivot commit")
 					select {
 					case <-time.After(fsHeaderContCheck):
@@ -979,7 +1170,38 @@ func (d *Downloader) fetchHeaders(p *peerConnection, from uint64, pivot uint64) 
 						return errCanceled
 					}
 				}
+				// Same as the skeleton phase: below the advertised head an
+				// empty packet is a stray, and terminating on it truncates the
+				// round. Past it the peer's chain really ends here.
+				if from <= remoteHeight {
+					strays++
+					headerStrayMeter.Mark(1)
+					if strays > maxStrayHeaderPackets {
+						p.log.Warn("Empty header sets exceeded", "requested", from, "advertised", remoteHeight)
+						// Same discriminator as the skeleton phase.
+						kept, err := d.confirmAdvertisedHead(p, remoteHeight)
+						if err != nil {
+							return err
+						}
+						if !kept {
+							p.log.Warn("Peer head moved below advertisement", "advertised", remoteHeight, "cursor", from)
+							// Same fallback as the skeleton phase.
+							remoteHeight = from - 1
+							strays = 0
+							getHeaders(from)
+							continue
+						}
+						return errEmptyHeaderSet
+					}
+					p.log.Debug("Empty header set, discarding as stray", "requested", from)
+					getHeaders(from)
+					continue
+				}
 				// Pivot done (or not in fast sync) and no more headers, terminate the process
+				//
+				// Past the advertised head an empty reply means the peer's
+				// chain ends here.
+				headerReqTimer.Update(elapsed)
 				p.log.Debug("No more headers available")
 				select {
 				case d.headerProcCh <- nil:
@@ -989,6 +1211,26 @@ func (d *Downloader) fetchHeaders(p *peerConnection, from uint64, pivot uint64) 
 				}
 			}
 			headers := packet.(*headerPack).headers
+
+			// The wire protocol carries no request ids, so a stray reply to
+			// another request of this peer can land here. Discard and retry.
+			want := from
+			if skeleton {
+				want = skeletonOrigin(from)
+			}
+			if headers[0].Number.Uint64() != want {
+				strays++
+				headerStrayMeter.Mark(1)
+				if strays > maxStrayHeaderPackets {
+					p.log.Warn("Misattributed header responses exceeded", "requested", want, "received", headers[0].Number)
+					return fmt.Errorf("%w: misattributed header responses (%d != %d)", errBadPeer, headers[0].Number, want)
+				}
+				p.log.Debug("Misattributed header response", "requested", want, "received", firstHeaderLabel(headers))
+				getHeaders(from)
+				continue
+			}
+			strays = 0
+			headerReqTimer.Update(elapsed)
 
 			// If we received a skeleton batch, resolve internals concurrently
 			if skeleton {
