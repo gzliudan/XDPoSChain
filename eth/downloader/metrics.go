@@ -27,6 +27,7 @@ var (
 	headerReqTimer     = metrics.NewRegisteredTimer("eth/downloader/headers/req", nil)
 	headerDropMeter    = metrics.NewRegisteredMeter("eth/downloader/headers/drop", nil)
 	headerTimeoutMeter = metrics.NewRegisteredMeter("eth/downloader/headers/timeout", nil)
+	headerStrayMeter   = metrics.NewRegisteredMeter("eth/downloader/headers/stray", nil)
 
 	bodyInMeter      = metrics.NewRegisteredMeter("eth/downloader/bodies/in", nil)
 	bodyReqTimer     = metrics.NewRegisteredTimer("eth/downloader/bodies/req", nil)

@@ -113,8 +113,15 @@ func (p *stalledDownloaderPeer) claimedHead() *types.Header {
 }
 
 // RequestHeadersByHash answers the height probe with the claimed head header.
+// The downloader validates the reply against the hash the sync was started
+// with, so the stub serves the header only for the hash it advertises: any
+// other origin is unknown to it.
 func (p *stalledDownloaderPeer) RequestHeadersByHash(h common.Hash, amount int, skip int, reverse bool) error {
-	return p.download.DeliverHeaders(p.id, []*types.Header{p.claimedHead()})
+	head := p.claimedHead()
+	if h != head.Hash() {
+		return p.download.DeliverHeaders(p.id, nil)
+	}
+	return p.download.DeliverHeaders(p.id, []*types.Header{head})
 }
 
 // RequestHeadersByNumber answers the ancestor search (the first call) with the
@@ -387,13 +394,6 @@ func TestSyncStatusDuringSync(t *testing.T) {
 	}
 	defer pm.peers.Unregister(peer.id)
 
-	current := pm.blockchain.CurrentBlock()
-	localTD := pm.blockchain.GetTd(current.Hash(), current.Number.Uint64())
-	peer.lock.Lock()
-	peer.head = current.Hash()
-	peer.td = new(big.Int).Add(localTD, big.NewInt(100))
-	peer.lock.Unlock()
-
 	// Register a stub downloader peer under the same id. It answers the height
 	// probe and the ancestor search, then blocks the bulk download, holding the
 	// downloader in a deterministic synchronising state with a known target.
@@ -403,6 +403,16 @@ func TestSyncStatusDuringSync(t *testing.T) {
 	}
 	defer pm.downloader.UnregisterPeer(peer.id)
 	defer stub.release()
+
+	// Advertise the head the stub actually serves: the downloader validates the
+	// by-hash height probe against the hash the sync started with, so a stub
+	// answering a different header would be discarded as a stray reply.
+	current := pm.blockchain.CurrentBlock()
+	localTD := pm.blockchain.GetTd(current.Hash(), current.Number.Uint64())
+	peer.lock.Lock()
+	peer.head = stub.claimedHead().Hash()
+	peer.td = new(big.Int).Add(localTD, big.NewInt(100))
+	peer.lock.Unlock()
 
 	// Kick off a sync in the background; the stub keeps it synchronising.
 	go pm.synchronise(pm.peers.BestPeer())

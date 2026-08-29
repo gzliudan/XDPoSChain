@@ -212,13 +212,6 @@ func TestVoteQueuedDuringSync(t *testing.T) {
 	}
 	defer pm.peers.Unregister(peer.id)
 
-	current := pm.blockchain.CurrentBlock()
-	localTD := pm.blockchain.GetTd(current.Hash(), current.Number.Uint64())
-	peer.lock.Lock()
-	peer.head = current.Hash()
-	peer.td = new(big.Int).Add(localTD, big.NewInt(100))
-	peer.lock.Unlock()
-
 	// Hold the downloader in a synchronising state.
 	stub := newStalledDownloaderPeer(pm.downloader, peer.id, pm.blockchain.Genesis().Header())
 	if err := pm.downloader.RegisterPeer(peer.id, xdc100, stub); err != nil {
@@ -226,6 +219,16 @@ func TestVoteQueuedDuringSync(t *testing.T) {
 	}
 	defer pm.downloader.UnregisterPeer(peer.id)
 	defer stub.release()
+
+	// Advertise the head the stub actually serves: the downloader validates the
+	// by-hash height probe against the hash the sync started with, so a stub
+	// answering a different header would be discarded as a stray reply.
+	current := pm.blockchain.CurrentBlock()
+	localTD := pm.blockchain.GetTd(current.Hash(), current.Number.Uint64())
+	peer.lock.Lock()
+	peer.head = stub.claimedHead().Hash()
+	peer.td = new(big.Int).Add(localTD, big.NewInt(100))
+	peer.lock.Unlock()
 
 	syncDone := make(chan error, 1)
 	go func() { syncDone <- pm.synchronise(peer) }()
