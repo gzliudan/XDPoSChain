@@ -1490,6 +1490,61 @@ func (bc *BlockChain) WriteBlockWithState(block *types.Block, receipts []*types.
 	return bc.writeBlockWithState(block, receipts, state, tradingState, lendingState)
 }
 
+// isGapBlock reports whether the given height is the XDPoS gap block whose
+// snapshot seeds the next epoch's masternode set. Epoch 0 is treated as
+// disabled to avoid a modulo-by-zero panic on malformed configs. When Gap
+// exceeds Epoch the right-hand side wraps around and the predicate is never
+// true, preserving the semantics of the inline expression it replaced.
+func (bc *BlockChain) isGapBlock(number uint64) bool {
+	if bc.chainConfig.XDPoS == nil {
+		return false
+	}
+	xdpos := bc.chainConfig.XDPoS
+	if xdpos.Epoch == 0 {
+		return false
+	}
+	return number%xdpos.Epoch == xdpos.Epoch-xdpos.Gap
+}
+
+// writeKnownBlock makes an already stored and executed block the chain head if
+// it wins the fork choice, reorganising the chain when it does not sit on top
+// of the current head. It reports the write status, whether the adoption went
+// through reorg — which already refreshes the head and the gap-block snapshot
+// for every block of the new chain — and an error.
+func (bc *BlockChain) writeKnownBlock(block *types.Block) (WriteStatus, bool, error) {
+	current := bc.CurrentBlock()
+	externTd := bc.GetTd(block.Hash(), block.NumberU64())
+	localTd := bc.GetTd(current.Hash(), current.Number.Uint64())
+	if externTd == nil || localTd == nil {
+		return NonStatTy, false, fmt.Errorf("missing total difficulty for known block %d (%s)", block.NumberU64(), block.Hash())
+	}
+	// Mirror the fork choice of writeBlockWithState: total difficulty wins,
+	// ties break by height.
+	adopt := externTd.Cmp(localTd) > 0
+	if !adopt && externTd.Cmp(localTd) == 0 {
+		adopt = block.NumberU64() > current.Number.Uint64()
+	}
+	if !adopt {
+		return SideStatTy, false, nil
+	}
+	if block.ParentHash() != current.Hash() {
+		if err := bc.reorg(current, block.Header()); err != nil {
+			return NonStatTy, false, err
+		}
+		return CanonStatTy, true, nil
+	}
+	// WriteBlock has already been called for a known block, no need to write again
+	bc.writeHeadBlock(block, false)
+	// Mirrors writeBlockWithState: a gap block reaching the head must refresh the
+	// masternode set, otherwise its snapshot is never written.
+	if bc.isGapBlock(block.NumberU64()) {
+		if err := bc.UpdateM1(); err != nil {
+			return NonStatTy, false, fmt.Errorf("fail to update masternodes for known block %d (%s): %w", block.NumberU64(), block.Hash().Hex(), err)
+		}
+	}
+	return CanonStatTy, false, nil
+}
+
 // writeBlockWithState writes the block and all associated state to the database,
 // but is expects the chain mutex to be held.
 func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.Receipt, state *state.StateDB, tradingState *tradingstate.TradingStateDB, lendingState *lendingstate.LendingStateDB) (status WriteStatus, err error) {
@@ -1690,7 +1745,7 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 		// WriteBlock has already been called, no need to write again
 		bc.writeHeadBlock(block, false)
 		// prepare set of masternodes for the next epoch
-		if bc.chainConfig.XDPoS != nil && ((block.NumberU64() % bc.chainConfig.XDPoS.Epoch) == (bc.chainConfig.XDPoS.Epoch - bc.chainConfig.XDPoS.Gap)) {
+		if bc.isGapBlock(block.NumberU64()) {
 			if err := bc.UpdateM1(); err != nil {
 				log.Crit("Fail to update masternodes during writeBlockWithState", "number", block.Number, "hash", block.Hash().Hex(), "err", err)
 			}
@@ -1845,16 +1900,44 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, []
 	}
 
 	// No validation errors for the first block (or chain prefix skipped)
-	for ; block != nil && err == nil; block, err = it.next() {
+	for ; block != nil && (err == nil || errors.Is(err, ErrKnownBlock)); block, err = it.next() {
 		// If the chain is terminating, stop processing blocks
 		if bc.insertStopped() {
 			log.Debug("Premature abort during blocks processing")
+			// Interruption is propagated through the downloader's cancel path,
+			// not reported as an import failure.
+			err = nil
 			break
 		}
 		// If the header is a banned one, straight out abort
 		if BadHashes[block.Hash()] {
 			bc.reportBlock(block, nil, ErrDenylistedHash)
 			return it.index, events, coalescedLogs, ErrDenylistedHash
+		}
+		// The block and its state are already stored, so re-executing it would only
+		// reproduce what is on disk; it still has to win the fork choice to
+		// become the head.
+		if errors.Is(err, ErrKnownBlock) {
+			log.Debug("Writing previously known block", "number", block.Number(), "hash", block.Hash())
+			status, reorged, werr := bc.writeKnownBlock(block)
+			if werr != nil {
+				return it.index, events, coalescedLogs, werr
+			}
+			// Known blocks carry no execution work, so they never count as processed.
+			stats.ignored++
+			if status != CanonStatTy {
+				continue
+			}
+			logs := bc.collectLogs(block, false)
+			if !reorged {
+				// reorg already delivered the rebirth logs of the whole new chain.
+				coalescedLogs = append(coalescedLogs, logs...)
+			}
+			events = append(events, ChainEvent{block, block.Hash(), logs})
+			lastCanon = block
+			bc.UpdateBlocksHashCache(block)
+			bc.notifyEpochSwitch(block)
+			continue
 		}
 		// Retrieve the parent block and it's state to execute on top
 		start := time.Now()
@@ -1920,17 +2003,7 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, []
 
 		dirty, _ := bc.triedb.Size()
 		stats.report(chain, it.index, dirty)
-		if bc.chainConfig.XDPoS != nil {
-			engine, _ := bc.Engine().(*XDPoS.XDPoS)
-			isEpochSwithBlock, _, err := engine.IsEpochSwitch(block.Header()) // epoch block
-			if err != nil {
-				log.Error("[insertChain] Error while checking and notifying channel CheckpointCh if the incoming block is epoch switch block", "Hash", block.Hash(), "Number", block.Number())
-				bc.reportBlock(block, nil, err)
-			}
-			if isEpochSwithBlock {
-				CheckpointCh <- 1
-			}
-		}
+		bc.notifyEpochSwitch(block)
 	}
 
 	// Any blocks remaining here? The only ones we care about are the future ones
@@ -1949,12 +2022,39 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, []
 	}
 	stats.ignored += it.remaining()
 
+	// Record the reject like the first-block failure path; future, known and
+	// pruned-ancestor errors are legitimate states, not invalid blocks.
+	if err != nil && block != nil && !errors.Is(err, ErrKnownBlock) &&
+		!errors.Is(err, consensus.ErrFutureBlock) && !errors.Is(err, consensus.ErrPrunedAncestor) {
+		bc.reportBlock(block, nil, err)
+	}
+
 	// Append a single chain head event if we've progressed the chain
 	if lastCanon != nil && bc.CurrentBlock().Hash() == lastCanon.Hash() {
 		log.Debug("New ChainHeadEvent ", "number", lastCanon.NumberU64(), "hash", lastCanon.Hash())
 		events = append(events, ChainHeadEvent{lastCanon})
 	}
-	return it.index, events, coalescedLogs, nil
+	return it.index, events, coalescedLogs, err
+}
+
+// notifyEpochSwitch signals the checkpoint channel when the block switches
+// the XDPoS epoch, so consensus parameters get refreshed for the new epoch.
+func (bc *BlockChain) notifyEpochSwitch(block *types.Block) {
+	if bc.chainConfig.XDPoS == nil {
+		return
+	}
+	engine, ok := bc.Engine().(*XDPoS.XDPoS)
+	if !ok {
+		return
+	}
+	isEpochSwithBlock, _, err := engine.IsEpochSwitch(block.Header()) // epoch block
+	if err != nil {
+		log.Error("[insertChain] Error while checking and notifying channel CheckpointCh if the incoming block is epoch switch block", "Hash", block.Hash(), "Number", block.Number())
+		bc.reportBlock(block, nil, err)
+	}
+	if isEpochSwithBlock {
+		CheckpointCh <- 1
+	}
 }
 
 // blockProcessingResult is a summary of block processing
@@ -2595,7 +2695,7 @@ func (bc *BlockChain) reorg(oldHead, newHead *types.Header) error {
 		// Update the head block
 		bc.writeHeadBlock(block, true)
 		// prepare set of masternodes for the next epoch
-		if bc.chainConfig.XDPoS != nil && ((block.NumberU64() % bc.chainConfig.XDPoS.Epoch) == (bc.chainConfig.XDPoS.Epoch - bc.chainConfig.XDPoS.Gap)) {
+		if bc.isGapBlock(block.NumberU64()) {
 			if err := bc.UpdateM1(); err != nil {
 				log.Crit("Fail to update masternodes during reorg", "number", block.Number, "hash", block.Hash().Hex(), "err", err)
 			}

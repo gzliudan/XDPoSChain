@@ -518,6 +518,617 @@ func TestInsertChainWithoutTRC21Issuer(t *testing.T) {
 	}
 }
 
+// failVerifyEngine fails header verification for a single block number, so a batch
+// can be made to fail in the middle instead of at its first block.
+type failVerifyEngine struct {
+	consensus.Engine
+	failNumber uint64
+	failErr    error
+}
+
+func (e *failVerifyEngine) VerifyHeaders(chain consensus.ChainReader, headers []*types.Header, seals []bool) (chan<- struct{}, <-chan error) {
+	abort := make(chan struct{})
+	results := make(chan error, len(headers))
+	go func() {
+		for _, header := range headers {
+			var err error
+			if header.Number.Uint64() == e.failNumber {
+				err = e.failErr
+			}
+			select {
+			case <-abort:
+				return
+			case results <- err:
+			}
+		}
+	}()
+	return abort, results
+}
+
+// TestInsertChainReportsMidBatchFailure guards against reporting a partially
+// imported batch as a success, which lets the downloader advance past blocks the
+// node never imported.
+func TestInsertChainReportsMidBatchFailure(t *testing.T) {
+	var (
+		key, _  = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
+		address = crypto.PubkeyToAddress(key.PublicKey)
+		funds   = big.NewInt(1000000000000000)
+		gspec   = &Genesis{
+			Alloc:   types.GenesisAlloc{address: {Balance: funds}},
+			BaseFee: big.NewInt(params.InitialBaseFee),
+			Config:  params.TestChainConfig,
+		}
+	)
+	_, blocks, _ := GenerateChainWithGenesis(gspec, ethash.NewFaker(), 5, nil)
+
+	failErr := errors.New("simulated mid-batch verification failure")
+	engine := &failVerifyEngine{Engine: ethash.NewFaker(), failNumber: 3, failErr: failErr}
+
+	db := rawdb.NewMemoryDatabase()
+	chain, err := NewBlockChain(db, nil, gspec, engine, vm.Config{})
+	if err != nil {
+		t.Fatalf("failed to create tester chain: %v", err)
+	}
+	defer chain.Stop()
+
+	n, err := chain.InsertChain(blocks)
+	if err == nil {
+		t.Fatal("InsertChain reported success for a partially imported batch")
+	}
+	if !errors.Is(err, failErr) {
+		t.Fatalf("unexpected error: have %v want %v", err, failErr)
+	}
+	if want := uint64(2); chain.CurrentBlock().Number.Uint64() != want {
+		t.Fatalf("unexpected head number: have %d want %d", chain.CurrentBlock().Number.Uint64(), want)
+	}
+	if want := 2; n != want {
+		t.Fatalf("unexpected failing index: have %d want %d", n, want)
+	}
+	// The reject must be persisted for debugging via debug_getBadBlocks.
+	bad := rawdb.ReadBadBlock(db, blocks[2].Hash())
+	if bad == nil {
+		t.Fatalf("failing block %d not recorded as bad block", blocks[2].NumberU64())
+	}
+	if bad.Hash() != blocks[2].Hash() {
+		t.Fatalf("unexpected bad block: have %s want %s", bad.Hash(), blocks[2].Hash())
+	}
+}
+
+// TestInsertChainSucceedsForFullBatch is the counterpart of the mid-batch failure
+// guard: a batch that verifies end to end must still report success. It runs the
+// same verifier wrapper as the failure test, with the failure pointed at a height
+// the batch does not contain, so the injected error is the only difference
+// between the two tests.
+func TestInsertChainSucceedsForFullBatch(t *testing.T) {
+	var (
+		key, _  = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
+		address = crypto.PubkeyToAddress(key.PublicKey)
+		funds   = big.NewInt(1000000000000000)
+		gspec   = &Genesis{
+			Alloc:   types.GenesisAlloc{address: {Balance: funds}},
+			BaseFee: big.NewInt(params.InitialBaseFee),
+			Config:  params.TestChainConfig,
+		}
+	)
+	_, blocks, _ := GenerateChainWithGenesis(gspec, ethash.NewFaker(), 5, nil)
+
+	engine := &failVerifyEngine{
+		Engine:     ethash.NewFaker(),
+		failNumber: 99, // no header in this batch carries this number
+		failErr:    errors.New("verification must not fail for a clean batch"),
+	}
+	chain, err := NewBlockChain(rawdb.NewMemoryDatabase(), nil, gspec, engine, vm.Config{})
+	if err != nil {
+		t.Fatalf("failed to create tester chain: %v", err)
+	}
+	defer chain.Stop()
+
+	if n, err := chain.InsertChain(blocks); err != nil {
+		t.Fatalf("block %d: failed to insert into chain: %v", n, err)
+	}
+	if want := uint64(5); chain.CurrentBlock().Number.Uint64() != want {
+		t.Fatalf("unexpected head number: have %d want %d", chain.CurrentBlock().Number.Uint64(), want)
+	}
+}
+
+// TestInsertChainSkipsKnownBlocksBelowHead verifies that re-submitting a batch
+// whose blocks are all already stored and no higher than the current head
+// succeeds as a no-op. The downloader wraps any non-nil InsertChain error into
+// errInvalidChain and drops the peer, so duplicate deliveries must return nil.
+func TestInsertChainSkipsKnownBlocksBelowHead(t *testing.T) {
+	var (
+		key, _  = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
+		address = crypto.PubkeyToAddress(key.PublicKey)
+		funds   = big.NewInt(1000000000000000)
+		gspec   = &Genesis{
+			Alloc:   types.GenesisAlloc{address: {Balance: funds}},
+			BaseFee: big.NewInt(params.InitialBaseFee),
+			Config:  params.TestChainConfig,
+		}
+	)
+	chain, err := NewBlockChain(rawdb.NewMemoryDatabase(), nil, gspec, ethash.NewFaker(), vm.Config{})
+	if err != nil {
+		t.Fatalf("failed to create tester chain: %v", err)
+	}
+	defer chain.Stop()
+
+	_, blocks, _ := GenerateChainWithGenesis(gspec, ethash.NewFaker(), 10, nil)
+	if n, err := chain.InsertChain(blocks); err != nil {
+		t.Fatalf("failed to insert block %d: %v", n, err)
+	}
+	headNumber := chain.CurrentBlock().Number.Uint64()
+	headHash := chain.CurrentBlock().Hash()
+
+	// Re-delivering a known prefix must be a no-op, not an invalid-chain error.
+	n, err := chain.InsertChain(blocks[:5])
+	if err != nil {
+		t.Fatalf("failed to re-insert known blocks: %v", err)
+	}
+	if n != len(blocks[:5]) {
+		t.Fatalf("unexpected processed count: have %d want %d", n, len(blocks[:5]))
+	}
+	if have := chain.CurrentBlock().Number.Uint64(); have != headNumber {
+		t.Fatalf("head number changed: have %d want %d", have, headNumber)
+	}
+	if have := chain.CurrentBlock().Hash(); have != headHash {
+		t.Fatalf("head hash changed: have %s want %s", have, headHash)
+	}
+}
+
+// TestInsertChainAdvancesHeadOverKnownBlocks covers blocks that are already
+// stored with their state but sit above the head, which happens after a rollback
+// or when a side chain segment was executed without being adopted. They carry no
+// work to redo, but they still have to move the head instead of halting the
+// import or being reported as a successful no-op.
+func TestInsertChainAdvancesHeadOverKnownBlocks(t *testing.T) {
+	var (
+		key, _  = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
+		address = crypto.PubkeyToAddress(key.PublicKey)
+		funds   = big.NewInt(1000000000000000)
+		gspec   = &Genesis{
+			Alloc:   types.GenesisAlloc{address: {Balance: funds}},
+			BaseFee: big.NewInt(params.InitialBaseFee),
+			Config:  params.TestChainConfig,
+		}
+	)
+	db := rawdb.NewMemoryDatabase()
+	chain, err := NewBlockChain(db, nil, gspec, ethash.NewFaker(), vm.Config{})
+	if err != nil {
+		t.Fatalf("failed to create chain: %v", err)
+	}
+	defer chain.Stop()
+
+	_, blocks, _ := GenerateChainWithGenesis(gspec, ethash.NewFaker(), 10, nil)
+	if n, err := chain.InsertChain(blocks); err != nil {
+		t.Fatalf("failed to insert block %d: %v", n, err)
+	}
+
+	// Move the head back while leaving the blocks and their state on disk.
+	rollback := blocks[4]
+	chain.writeHeadBlock(rollback, false)
+	if have, want := chain.CurrentBlock().Number.Uint64(), rollback.NumberU64(); have != want {
+		t.Fatalf("unexpected head after rollback: have %d want %d", have, want)
+	}
+
+	// The promoted known blocks must surface as regular chain events so that
+	// indexers and log filters do not miss them.
+	chainCh := make(chan ChainEvent, 16)
+	chain.SubscribeChainEvent(chainCh)
+	headCh := make(chan ChainHeadEvent, 4)
+	chain.SubscribeChainHeadEvent(headCh)
+
+	// Re-submitting the stored suffix must promote the known blocks above the
+	// head instead of stopping at the first one.
+	if _, err := chain.InsertChain(blocks[5:]); err != nil {
+		t.Fatalf("failed to re-insert known blocks: %v", err)
+	}
+	tip := blocks[len(blocks)-1]
+	if have, want := chain.CurrentBlock().Number.Uint64(), tip.NumberU64(); have != want {
+		t.Fatalf("head did not advance over known blocks: have %d want %d", have, want)
+	}
+	if have, want := chain.CurrentBlock().Hash(), tip.Hash(); have != want {
+		t.Fatalf("unexpected head hash: have %s want %s", have, want)
+	}
+	// One chain event per promoted block, in order.
+	for i, block := range blocks[5:] {
+		select {
+		case ev := <-chainCh:
+			if ev.Block.Hash() != block.Hash() {
+				t.Fatalf("chain event %d: have %s want %s", i, ev.Block.Hash(), block.Hash())
+			}
+		case <-time.After(500 * time.Millisecond):
+			t.Fatalf("timed out waiting for chain event %d", i)
+		}
+	}
+	select {
+	case ev := <-chainCh:
+		t.Fatalf("unexpected extra chain event: %s", ev.Block.Hash())
+	case <-time.After(100 * time.Millisecond):
+	}
+	select {
+	case ev := <-headCh:
+		if ev.Block.Hash() != tip.Hash() {
+			t.Fatalf("unexpected head event: %s", ev.Block.Hash())
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting for chain head event")
+	}
+	// The canonical index must point at the original blocks again.
+	for _, block := range blocks[5:] {
+		canonical := chain.GetBlockByNumber(block.NumberU64())
+		if canonical == nil || canonical.Hash() != block.Hash() {
+			t.Fatalf("canonical block %d is not the original block", block.NumberU64())
+		}
+	}
+}
+
+// TestIsGapBlock locks down the XDPoS gap-block predicate, including the
+// boundary behaviors of the legacy unsigned expression that must be preserved.
+func TestIsGapBlock(t *testing.T) {
+	tests := []struct {
+		name   string
+		xdpos  *params.XDPoSConfig
+		number uint64
+		want   bool
+	}{
+		{"disabled", nil, 450, false},
+		{"zero epoch does not panic", &params.XDPoSConfig{Epoch: 0, Gap: 0}, 5, false},
+		{"epoch 900 gap 450 gap block", &params.XDPoSConfig{Epoch: 900, Gap: 450}, 450, true},
+		{"epoch 900 gap 450 next gap block", &params.XDPoSConfig{Epoch: 900, Gap: 450}, 1350, true},
+		{"epoch 900 gap 450 epoch block", &params.XDPoSConfig{Epoch: 900, Gap: 450}, 900, false},
+		{"epoch 900 gap 450 genesis", &params.XDPoSConfig{Epoch: 900, Gap: 450}, 0, false},
+		{"epoch 900 gap 450 plain block", &params.XDPoSConfig{Epoch: 900, Gap: 450}, 451, false},
+		{"epoch 5 gap 4 gap block", &params.XDPoSConfig{Epoch: 5, Gap: 4}, 6, true},
+		{"epoch 5 gap 4 first block", &params.XDPoSConfig{Epoch: 5, Gap: 4}, 1, true},
+		{"epoch 5 gap 4 epoch block", &params.XDPoSConfig{Epoch: 5, Gap: 4}, 5, false},
+		{"epoch 5 gap 0 never matches", &params.XDPoSConfig{Epoch: 5, Gap: 0}, 0, false},
+		{"epoch 5 gap 0 epoch block", &params.XDPoSConfig{Epoch: 5, Gap: 0}, 5, false},
+		{"epoch 5 gap 5 epoch boundary", &params.XDPoSConfig{Epoch: 5, Gap: 5}, 5, true},
+		{"epoch 5 gap 5 genesis", &params.XDPoSConfig{Epoch: 5, Gap: 5}, 0, true},
+		{"epoch 5 gap 7 underflow keeps legacy semantics", &params.XDPoSConfig{Epoch: 5, Gap: 7}, 3, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bc := &BlockChain{chainConfig: &params.ChainConfig{XDPoS: tt.xdpos}}
+			if have := bc.isGapBlock(tt.number); have != tt.want {
+				t.Errorf("isGapBlock(%d) = %v, want %v", tt.number, have, tt.want)
+			}
+		})
+	}
+}
+
+// TestInsertChainDoesNotReorgToLowerTDKnownSidechain covers a fork that was
+// fully executed (state on disk) but loses the fork choice: re-submitting its
+// blocks above the head must not pull the head onto the lighter fork.
+func TestInsertChainDoesNotReorgToLowerTDKnownSidechain(t *testing.T) {
+	var (
+		key, _  = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
+		address = crypto.PubkeyToAddress(key.PublicKey)
+		funds   = big.NewInt(1000000000000000)
+		gspec   = &Genesis{
+			Alloc:      types.GenesisAlloc{address: {Balance: funds}},
+			BaseFee:    big.NewInt(params.InitialBaseFee),
+			Config:     params.TestChainConfig,
+			Difficulty: big.NewInt(1 << 40),
+		}
+	)
+	db, blocks, _ := GenerateChainWithGenesis(gspec, ethash.NewFaker(), 20, nil)
+	chain, err := NewBlockChain(db, nil, gspec, ethash.NewFaker(), vm.Config{})
+	if err != nil {
+		t.Fatalf("failed to create chain: %v", err)
+	}
+	defer chain.Stop()
+
+	if _, err := chain.InsertChain(blocks); err != nil {
+		t.Fatalf("failed to insert canonical chain: %v", err)
+	}
+	head := chain.CurrentBlock()
+
+	// Build a longer but lighter fork off the canonical chain. The large time
+	// offset keeps every fork block lighter than its parent, so the fork tip
+	// stays below the canonical total difficulty despite being higher.
+	fork, _ := GenerateChain(gspec.Config, blocks[3], ethash.NewFaker(), db, 19, func(i int, gen *BlockGen) {
+		gen.OffsetTime(990)
+	})
+	if _, err := chain.InsertChain(fork); err != nil {
+		t.Fatalf("failed to insert fork: %v", err)
+	}
+	// Sanity checks that make the test meaningful: the fork suffix above the
+	// head is known with full state and below the canonical total difficulty.
+	tip := fork[len(fork)-1]
+	if !chain.HasBlockAndFullState(tip.Hash(), tip.NumberU64()) {
+		t.Fatalf("fork tip %d (%s) should be stored with full state", tip.NumberU64(), tip.Hash())
+	}
+	forkTd := chain.GetTd(tip.Hash(), tip.NumberU64())
+	headTd := chain.GetTd(head.Hash(), head.Number.Uint64())
+	if forkTd.Cmp(headTd) >= 0 {
+		t.Fatalf("fork TD %s must be below canonical TD %s for the test to be meaningful", forkTd, headTd)
+	}
+	if tip.NumberU64() <= head.Number.Uint64() {
+		t.Fatalf("fork tip height %d must be above head %d", tip.NumberU64(), head.Number.Uint64())
+	}
+	// Re-submitting the known fork suffix above the head must leave the head
+	// and the canonical index untouched.
+	if _, err := chain.InsertChain(fork[17:]); err != nil {
+		t.Fatalf("failed to re-insert known fork blocks: %v", err)
+	}
+	if have := chain.CurrentBlock(); have.Number.Uint64() != head.Number.Uint64() || have.Hash() != head.Hash() {
+		t.Fatalf("head moved onto lighter fork: have %d (%s), want %d (%s)", have.Number.Uint64(), have.Hash(), head.Number.Uint64(), head.Hash())
+	}
+	if canon := rawdb.ReadCanonicalHash(chain.db, tip.NumberU64()); canon != (common.Hash{}) {
+		t.Fatalf("canonical hash at %d should not point at the lighter fork: %s", tip.NumberU64(), canon)
+	}
+}
+
+// interruptingValidator interrupts the insertion exactly when the target block
+// has been validated, giving the test a deterministic happens-before the next
+// loop iteration notices the interruption.
+type interruptingValidator struct {
+	Validator
+	chain  *BlockChain
+	target common.Hash
+}
+
+func (v *interruptingValidator) ValidateBody(block *types.Block) error {
+	err := v.Validator.ValidateBody(block)
+	if block.Hash() == v.target {
+		v.chain.InterruptInsert(true)
+	}
+	return err
+}
+
+// TestInsertChainInterruptStopsBeforeKnownBlock verifies that an interruption
+// between known blocks stops the import without moving the head further and
+// without reporting an import failure: cancellation is propagated through the
+// downloader's cancel channel, matching upstream geth semantics.
+func TestInsertChainInterruptStopsBeforeKnownBlock(t *testing.T) {
+	var (
+		key, _  = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
+		address = crypto.PubkeyToAddress(key.PublicKey)
+		funds   = big.NewInt(1000000000000000)
+		gspec   = &Genesis{
+			Alloc:   types.GenesisAlloc{address: {Balance: funds}},
+			BaseFee: big.NewInt(params.InitialBaseFee),
+			Config:  params.TestChainConfig,
+		}
+	)
+	_, blocks, _ := GenerateChainWithGenesis(gspec, ethash.NewFaker(), 10, nil)
+	chain, err := NewBlockChain(rawdb.NewMemoryDatabase(), nil, gspec, ethash.NewFaker(), vm.Config{})
+	if err != nil {
+		t.Fatalf("failed to create chain: %v", err)
+	}
+	defer chain.Stop()
+
+	if _, err := chain.InsertChain(blocks); err != nil {
+		t.Fatalf("failed to insert chain: %v", err)
+	}
+	// Move the head back while leaving the blocks and their state on disk.
+	chain.writeHeadBlock(blocks[4], false)
+
+	chain.validator = &interruptingValidator{Validator: chain.validator, chain: chain, target: blocks[7].Hash()}
+	defer chain.InterruptInsert(false)
+
+	chainCh := make(chan ChainEvent, 16)
+	chain.SubscribeChainEvent(chainCh)
+	headCh := make(chan ChainHeadEvent, 4)
+	chain.SubscribeChainHeadEvent(headCh)
+
+	n, err := chain.InsertChain(blocks[5:])
+	if err != nil {
+		t.Fatalf("interruption must not surface as an import error: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("unexpected index: have %d want 2", n)
+	}
+	// The block whose validation triggered the interruption must not have been
+	// promoted; the head stops on its parent.
+	if have, want := chain.CurrentBlock().Number.Uint64(), blocks[6].NumberU64(); have != want {
+		t.Fatalf("unexpected head after interruption: have %d want %d", have, want)
+	}
+	if have, want := chain.CurrentBlock().Hash(), blocks[6].Hash(); have != want {
+		t.Fatalf("unexpected head hash: have %s want %s", have, want)
+	}
+	// blocks[5] and blocks[6] were promoted, nothing beyond them.
+	for i, block := range blocks[5:7] {
+		select {
+		case ev := <-chainCh:
+			if ev.Block.Hash() != block.Hash() {
+				t.Fatalf("chain event %d: have %s want %s", i, ev.Block.Hash(), block.Hash())
+			}
+		case <-time.After(500 * time.Millisecond):
+			t.Fatalf("timed out waiting for chain event %d", i)
+		}
+	}
+	select {
+	case ev := <-chainCh:
+		t.Fatalf("unexpected chain event beyond interruption: %s", ev.Block.Hash())
+	case <-time.After(100 * time.Millisecond):
+	}
+	select {
+	case ev := <-headCh:
+		if ev.Block.Hash() != blocks[6].Hash() {
+			t.Fatalf("unexpected head event: %s", ev.Block.Hash())
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting for chain head event")
+	}
+}
+
+// TestInsertChainKnownLinearBlocksEmitLogsOnce verifies that a linearly
+// promoted known block delivers its logs exactly once, through the coalesced
+// logs of the import, and carries them in its chain event.
+func TestInsertChainKnownLinearBlocksEmitLogsOnce(t *testing.T) {
+	var (
+		key1, _ = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
+		addr1   = crypto.PubkeyToAddress(key1.PublicKey)
+
+		// this code generates a log
+		code  = common.Hex2Bytes("60606040525b7f24ec1d3ff24c2f6ff210738839dbc339cd45a5294d85c79361016243157aae7b60405180905060405180910390a15b600a8060416000396000f360606040526008565b00")
+		gspec = &Genesis{
+			Alloc:  types.GenesisAlloc{addr1: {Balance: big.NewInt(100000000000000000)}},
+			Config: params.TestChainConfig,
+		}
+		signer = types.LatestSigner(gspec.Config)
+	)
+	chain, err := NewBlockChain(rawdb.NewMemoryDatabase(), nil, gspec, ethash.NewFaker(), vm.Config{})
+	if err != nil {
+		t.Fatalf("failed to create chain: %v", err)
+	}
+	defer chain.Stop()
+
+	_, blocks, _ := GenerateChainWithGenesis(gspec, ethash.NewFaker(), 10, func(i int, gen *BlockGen) {
+		if i == 6 {
+			tx, err := types.SignTx(types.NewContractCreation(gen.TxNonce(addr1), new(big.Int), 1000000, gen.header.BaseFee, code), signer, key1)
+			if err != nil {
+				t.Fatalf("failed to create tx: %v", err)
+			}
+			gen.AddTx(tx)
+		}
+	})
+	if _, err := chain.InsertChain(blocks); err != nil {
+		t.Fatalf("failed to insert chain: %v", err)
+	}
+	// Move the head back while leaving the blocks and their state on disk.
+	chain.writeHeadBlock(blocks[3], false)
+
+	logsCh := make(chan []*types.Log, 8)
+	chain.SubscribeLogsEvent(logsCh)
+	chainCh := make(chan ChainEvent, 16)
+	chain.SubscribeChainEvent(chainCh)
+
+	if _, err := chain.InsertChain(blocks[4:]); err != nil {
+		t.Fatalf("failed to re-insert known blocks: %v", err)
+	}
+	// Exactly one logs event carrying the contract log of blocks[6].
+	var gotLogs []*types.Log
+	select {
+	case gotLogs = <-logsCh:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting for logs event")
+	}
+	if len(gotLogs) != 1 || gotLogs[0].BlockHash != blocks[6].Hash() {
+		t.Fatalf("unexpected logs event: %d logs, first block %s", len(gotLogs), gotLogs[0].BlockHash)
+	}
+	select {
+	case ev := <-logsCh:
+		t.Fatalf("duplicate logs event: %d logs", len(ev))
+	case <-time.After(200 * time.Millisecond):
+	}
+	// One chain event per promoted block; the log block carries its log.
+	var logBlockEvent *ChainEvent
+	for i, block := range blocks[4:] {
+		select {
+		case ev := <-chainCh:
+			if ev.Block.Hash() != block.Hash() {
+				t.Fatalf("chain event %d: have %s want %s", i, ev.Block.Hash(), block.Hash())
+			}
+			if block.Hash() == blocks[6].Hash() {
+				logBlockEvent = &ev
+			}
+		case <-time.After(500 * time.Millisecond):
+			t.Fatalf("timed out waiting for chain event %d", i)
+		}
+	}
+	if logBlockEvent == nil {
+		t.Fatal("no chain event for the log block")
+	}
+	if len(logBlockEvent.Logs) != 1 {
+		t.Fatalf("chain event of log block carries %d logs, want 1", len(logBlockEvent.Logs))
+	}
+}
+
+// TestInsertChainKnownReorgDoesNotDuplicateLogs verifies that promoting a
+// known fork via reorg delivers the rebirth logs exactly once, through the
+// reorganise itself, and does not repeat them through the import's coalesced
+// logs.
+func TestInsertChainKnownReorgDoesNotDuplicateLogs(t *testing.T) {
+	var (
+		key1, _ = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
+		addr1   = crypto.PubkeyToAddress(key1.PublicKey)
+
+		// this code generates a log
+		code  = common.Hex2Bytes("60606040525b7f24ec1d3ff24c2f6ff210738839dbc339cd45a5294d85c79361016243157aae7b60405180905060405180910390a15b600a8060416000396000f360606040526008565b00")
+		gspec = &Genesis{
+			Alloc:  types.GenesisAlloc{addr1: {Balance: big.NewInt(100000000000000000)}},
+			Config: params.TestChainConfig,
+		}
+		signer = types.LatestSigner(gspec.Config)
+	)
+	chain, err := NewBlockChain(rawdb.NewMemoryDatabase(), nil, gspec, ethash.NewFaker(), vm.Config{})
+	if err != nil {
+		t.Fatalf("failed to create chain: %v", err)
+	}
+	defer chain.Stop()
+
+	// Canonical chain without logs.
+	genDb, blocks, _ := GenerateChainWithGenesis(gspec, ethash.NewFaker(), 10, nil)
+	if _, err := chain.InsertChain(blocks); err != nil {
+		t.Fatalf("failed to insert chain: %v", err)
+	}
+	// Heavier fork with a log-emitting contract at height 11.
+	fork, _ := GenerateChain(gspec.Config, blocks[4], ethash.NewFaker(), genDb, 7, func(i int, gen *BlockGen) {
+		gen.OffsetTime(-9)
+		if i == 5 {
+			tx, err := types.SignTx(types.NewContractCreation(gen.TxNonce(addr1), new(big.Int), 1000000, gen.header.BaseFee, code), signer, key1)
+			if err != nil {
+				t.Fatalf("failed to create tx: %v", err)
+			}
+			gen.AddTx(tx)
+		}
+	})
+	if _, err := chain.InsertChain(fork); err != nil {
+		t.Fatalf("failed to insert fork: %v", err)
+	}
+	if have, want := chain.CurrentBlock().Hash(), fork[len(fork)-1].Hash(); have != want {
+		t.Fatalf("unexpected head after fork import: have %s want %s", have, want)
+	}
+	// Move the head back to the canonical chain while keeping the fork blocks
+	// and their state on disk.
+	chain.writeHeadBlock(blocks[9], false)
+
+	logsCh := make(chan []*types.Log, 8)
+	chain.SubscribeLogsEvent(logsCh)
+	chainCh := make(chan ChainEvent, 16)
+	chain.SubscribeChainEvent(chainCh)
+
+	if _, err := chain.InsertChain(fork[5:]); err != nil {
+		t.Fatalf("failed to re-insert known fork blocks: %v", err)
+	}
+	if have, want := chain.CurrentBlock().Hash(), fork[len(fork)-1].Hash(); have != want {
+		t.Fatalf("unexpected head after re-insert: have %s want %s", have, want)
+	}
+	// The rebirth logs are delivered exactly once, by the reorganise.
+	var gotLogs []*types.Log
+	select {
+	case gotLogs = <-logsCh:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting for logs event")
+	}
+	if len(gotLogs) != 1 || gotLogs[0].BlockHash != fork[5].Hash() {
+		t.Fatalf("unexpected logs event: %d logs, first block %s", len(gotLogs), gotLogs[0].BlockHash)
+	}
+	select {
+	case ev := <-logsCh:
+		t.Fatalf("duplicate logs event: %d logs", len(ev))
+	case <-time.After(200 * time.Millisecond):
+	}
+	// One chain event per re-inserted fork block; the log block carries its
+	// log without a second feed delivery.
+	for i, block := range fork[5:] {
+		select {
+		case ev := <-chainCh:
+			if ev.Block.Hash() != block.Hash() {
+				t.Fatalf("chain event %d: have %s want %s", i, ev.Block.Hash(), block.Hash())
+			}
+			if block.Hash() == fork[5].Hash() && len(ev.Logs) != 1 {
+				t.Fatalf("chain event of log block carries %d logs, want 1", len(ev.Logs))
+			}
+		case <-time.After(500 * time.Millisecond):
+			t.Fatalf("timed out waiting for chain event %d", i)
+		}
+	}
+}
+
 // TestNewBlockChainRepairsMissingHeadStateConsistently tests new block chain repairs missing head state consistently.
 func TestNewBlockChainRepairsMissingHeadStateConsistently(t *testing.T) {
 	var (
