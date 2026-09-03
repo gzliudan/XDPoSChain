@@ -22,6 +22,7 @@ import (
 	"math/rand"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -518,11 +519,14 @@ func TestInsertChainWithoutTRC21Issuer(t *testing.T) {
 	}
 }
 
-// failVerifyEngine fails header verification for a single block number, so a batch
-// can be made to fail in the middle instead of at its first block.
+// failVerifyEngine fails header verification for a single block number, or for
+// every block from failFrom on (0 disables the range), so a batch can be made
+// to fail in the middle instead of at its first block. failFrom is atomic
+// because the chain's future-block loop calls VerifyHeaders concurrently.
 type failVerifyEngine struct {
 	consensus.Engine
 	failNumber uint64
+	failFrom   atomic.Uint64
 	failErr    error
 }
 
@@ -532,7 +536,8 @@ func (e *failVerifyEngine) VerifyHeaders(chain consensus.ChainReader, headers []
 	go func() {
 		for _, header := range headers {
 			var err error
-			if header.Number.Uint64() == e.failNumber {
+			number := header.Number.Uint64()
+			if number == e.failNumber || (e.failFrom.Load() != 0 && number >= e.failFrom.Load()) {
 				err = e.failErr
 			}
 			select {
@@ -626,6 +631,131 @@ func TestInsertChainSucceedsForFullBatch(t *testing.T) {
 	if n, err := chain.InsertChain(blocks); err != nil {
 		t.Fatalf("block %d: failed to insert into chain: %v", n, err)
 	}
+	if want := uint64(5); chain.CurrentBlock().Number.Uint64() != want {
+		t.Fatalf("unexpected head number: have %d want %d", chain.CurrentBlock().Number.Uint64(), want)
+	}
+}
+
+// TestInsertChainQueuesMidBatchFutureBlocks verifies that a batch rejected as
+// future mid-way has its whole tail queued instead of failing the import:
+// children of a future block fail the timestamp check before the parent lookup
+// so they surface as ErrFutureBlock too, and returning that error would make
+// the downloader drop the peer on a valid delivery.
+func TestInsertChainQueuesMidBatchFutureBlocks(t *testing.T) {
+	var (
+		key, _  = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
+		address = crypto.PubkeyToAddress(key.PublicKey)
+		funds   = big.NewInt(1000000000000000)
+		gspec   = &Genesis{
+			Alloc:   types.GenesisAlloc{address: {Balance: funds}},
+			BaseFee: big.NewInt(params.InitialBaseFee),
+			Config:  params.TestChainConfig,
+		}
+	)
+	_, blocks, _ := GenerateChainWithGenesis(gspec, ethash.NewFaker(), 5, nil)
+
+	engine := &failVerifyEngine{Engine: ethash.NewFaker(), failErr: consensus.ErrFutureBlock}
+	engine.failFrom.Store(3)
+
+	db := rawdb.NewMemoryDatabase()
+	chain, err := NewBlockChain(db, nil, gspec, engine, vm.Config{})
+	if err != nil {
+		t.Fatalf("failed to create tester chain: %v", err)
+	}
+	defer chain.Stop()
+
+	if n, err := chain.InsertChain(blocks); err != nil || n != len(blocks) {
+		t.Fatalf("failed to insert into chain: index %d err %v", n, err)
+	}
+	if want := uint64(2); chain.CurrentBlock().Number.Uint64() != want {
+		t.Fatalf("unexpected head number: have %d want %d", chain.CurrentBlock().Number.Uint64(), want)
+	}
+	for _, block := range blocks[2:] {
+		if !chain.futureBlocks.Contains(block.Hash()) {
+			t.Fatalf("block %d not queued as future block", block.NumberU64())
+		}
+		if bad := rawdb.ReadBadBlock(db, block.Hash()); bad != nil {
+			t.Fatalf("future block %d recorded as bad block", block.NumberU64())
+		}
+	}
+}
+
+// TestInsertChainQueuesFutureBatchFromFirstBlock verifies that a batch whose
+// first block is already in the future is queued in full instead of failing at
+// its second block, which made the downloader drop the delivering peer.
+func TestInsertChainQueuesFutureBatchFromFirstBlock(t *testing.T) {
+	var (
+		key, _  = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
+		address = crypto.PubkeyToAddress(key.PublicKey)
+		funds   = big.NewInt(1000000000000000)
+		gspec   = &Genesis{
+			Alloc:   types.GenesisAlloc{address: {Balance: funds}},
+			BaseFee: big.NewInt(params.InitialBaseFee),
+			Config:  params.TestChainConfig,
+		}
+	)
+	_, blocks, _ := GenerateChainWithGenesis(gspec, ethash.NewFaker(), 5, nil)
+
+	engine := &failVerifyEngine{Engine: ethash.NewFaker(), failErr: consensus.ErrFutureBlock}
+	engine.failFrom.Store(1)
+
+	db := rawdb.NewMemoryDatabase()
+	chain, err := NewBlockChain(db, nil, gspec, engine, vm.Config{})
+	if err != nil {
+		t.Fatalf("failed to create tester chain: %v", err)
+	}
+	defer chain.Stop()
+
+	if n, err := chain.InsertChain(blocks); err != nil || n != len(blocks) {
+		t.Fatalf("failed to insert into chain: index %d err %v", n, err)
+	}
+	if want := uint64(0); chain.CurrentBlock().Number.Uint64() != want {
+		t.Fatalf("unexpected head number: have %d want %d", chain.CurrentBlock().Number.Uint64(), want)
+	}
+	for _, block := range blocks {
+		if !chain.futureBlocks.Contains(block.Hash()) {
+			t.Fatalf("block %d not queued as future block", block.NumberU64())
+		}
+	}
+}
+
+// TestInsertChainProcFutureBlocksResumesImport proves the queued tail is not
+// dropped: once headers verify again, the queued blocks import and the head
+// advances to the batch tip.
+func TestInsertChainProcFutureBlocksResumesImport(t *testing.T) {
+	var (
+		key, _  = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
+		address = crypto.PubkeyToAddress(key.PublicKey)
+		funds   = big.NewInt(1000000000000000)
+		gspec   = &Genesis{
+			Alloc:   types.GenesisAlloc{address: {Balance: funds}},
+			BaseFee: big.NewInt(params.InitialBaseFee),
+			Config:  params.TestChainConfig,
+		}
+	)
+	_, blocks, _ := GenerateChainWithGenesis(gspec, ethash.NewFaker(), 5, nil)
+
+	engine := &failVerifyEngine{Engine: ethash.NewFaker(), failErr: consensus.ErrFutureBlock}
+	engine.failFrom.Store(3)
+
+	chain, err := NewBlockChain(rawdb.NewMemoryDatabase(), nil, gspec, engine, vm.Config{})
+	if err != nil {
+		t.Fatalf("failed to create tester chain: %v", err)
+	}
+	defer chain.Stop()
+
+	if _, err := chain.InsertChain(blocks); err != nil {
+		t.Fatalf("failed to insert into chain: %v", err)
+	}
+	if want := uint64(2); chain.CurrentBlock().Number.Uint64() != want {
+		t.Fatalf("unexpected head number: have %d want %d", chain.CurrentBlock().Number.Uint64(), want)
+	}
+
+	// The background future-block loop may drain the queue first; the explicit
+	// call is then a no-op and the head assertion still holds.
+	engine.failFrom.Store(0)
+	chain.procFutureBlocks()
+
 	if want := uint64(5); chain.CurrentBlock().Number.Uint64() != want {
 		t.Fatalf("unexpected head number: have %d want %d", chain.CurrentBlock().Number.Uint64(), want)
 	}

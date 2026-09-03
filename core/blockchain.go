@@ -1866,7 +1866,8 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, []
 
 	// First block is future, shove it (and all children) to the future queue (unknown ancestor)
 	case err == consensus.ErrFutureBlock || (err == consensus.ErrUnknownAncestor && bc.futureBlocks.Contains(it.first().ParentHash())):
-		for block != nil && (it.index == 0 || err == consensus.ErrUnknownAncestor) {
+		// The timestamp check precedes the parent lookup, so children of a future block also surface as ErrFutureBlock.
+		for block != nil && (it.index == 0 || err == consensus.ErrUnknownAncestor || err == consensus.ErrFutureBlock) {
 			if err := bc.addFutureBlock(block); err != nil {
 				return it.index, events, coalescedLogs, err
 			}
@@ -2013,7 +2014,8 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, []
 		}
 		block, err = it.next()
 
-		for ; block != nil && err == consensus.ErrUnknownAncestor; block, err = it.next() {
+		// Children of the queued block fail the future check before the parent lookup, same as the first-block path.
+		for ; block != nil && (err == consensus.ErrUnknownAncestor || err == consensus.ErrFutureBlock); block, err = it.next() {
 			if err := bc.addFutureBlock(block); err != nil {
 				return it.index, events, coalescedLogs, err
 			}
