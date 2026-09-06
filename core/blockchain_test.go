@@ -23,6 +23,7 @@ import (
 	"math/rand"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -3036,5 +3037,144 @@ func TestHasBlockAndExecutedState(t *testing.T) {
 	}
 	if !blockchain.HasBlockAndFullState(head.Hash(), head.Number.Uint64()) {
 		t.Fatal("executed head block must also have full state")
+	}
+}
+
+// failVerifyEngine fails header verification for a single block number, or for
+// every block from failFrom on (0 disables the range), so a batch can be made
+// to fail in the middle instead of at its first block. failFrom is atomic
+// because the chain's future-block loop calls VerifyHeaders concurrently.
+type failVerifyEngine struct {
+	consensus.Engine
+	failNumber uint64
+	failFrom   atomic.Uint64
+	failErr    error
+
+	// failErrAt overrides the failing error for individual block numbers.
+	// Set up before the chain starts and read-only afterwards.
+	failErrAt map[uint64]error
+}
+
+func (e *failVerifyEngine) VerifyHeaders(chain consensus.ChainReader, headers []*types.Header, seals []bool) (chan<- struct{}, <-chan error) {
+	abort := make(chan struct{})
+	results := make(chan error, len(headers))
+	go func() {
+		for _, header := range headers {
+			var err error
+			number := header.Number.Uint64()
+			failFrom := e.failFrom.Load()
+			if custom, ok := e.failErrAt[number]; ok {
+				err = custom
+			} else if number == e.failNumber || (failFrom != 0 && number >= failFrom) {
+				err = e.failErr
+			}
+			select {
+			case <-abort:
+				return
+			case results <- err:
+			}
+		}
+	}()
+	return abort, results
+}
+
+// errNonQueueableTest is a verification error that is neither queueable nor
+// one of the legitimate skip states (future, known, pruned ancestor).
+var errNonQueueableTest = errors.New("non-queueable verification failure")
+
+// TestInsertChainReportsNonQueueableBlockAfterFuturePrefix verifies that a
+// batch stopping at a non-queueable verification error after a future prefix
+// records the reject like the tail path, instead of returning the error
+// without a bad-block record.
+func TestInsertChainReportsNonQueueableBlockAfterFuturePrefix(t *testing.T) {
+	var (
+		key, _  = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
+		address = crypto.PubkeyToAddress(key.PublicKey)
+		funds   = big.NewInt(1000000000000000)
+		gspec   = &Genesis{
+			Alloc:   types.GenesisAlloc{address: {Balance: funds}},
+			BaseFee: big.NewInt(params.InitialBaseFee),
+			Config:  params.TestChainConfig,
+		}
+		now = uint64(time.Now().Unix())
+	)
+	// Block 1 is future and parks, block 2 fails with a non-queueable error.
+	_, blocks, _ := GenerateChainWithGenesis(gspec, ethash.NewFaker(), 2, func(i int, gen *BlockGen) {
+		gen.header.Time = now + 10
+	})
+
+	engine := &failVerifyEngine{Engine: ethash.NewFaker(), failErr: consensus.ErrFutureBlock}
+	engine.failFrom.Store(1)
+	engine.failErrAt = map[uint64]error{2: errNonQueueableTest}
+
+	db := rawdb.NewMemoryDatabase()
+	chain, err := NewBlockChain(db, nil, gspec, engine, vm.Config{})
+	if err != nil {
+		t.Fatalf("failed to create tester chain: %v", err)
+	}
+	defer chain.Stop()
+
+	n, err := chain.InsertChain(blocks)
+	if n != 1 {
+		t.Fatalf("unexpected failing index: have %d want 1", n)
+	}
+	if !errors.Is(err, errNonQueueableTest) {
+		t.Fatalf("unexpected error for block %d: %v", n, err)
+	}
+	if bad := rawdb.ReadBadBlock(db, blocks[0].Hash()); bad != nil {
+		t.Fatalf("future block %d recorded as bad block", blocks[0].NumberU64())
+	}
+	if bad := rawdb.ReadBadBlock(db, blocks[1].Hash()); bad == nil {
+		t.Fatalf("non-queueable block %d not recorded as bad block", blocks[1].NumberU64())
+	}
+}
+
+// TestInsertChainReportsNonQueueableBlockAfterFutureTail verifies that a
+// batch whose tail parks a future block and then stops at a non-queueable
+// verification error records the reject and propagates the error instead of
+// silently swallowing it.
+func TestInsertChainReportsNonQueueableBlockAfterFutureTail(t *testing.T) {
+	var (
+		key, _  = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
+		address = crypto.PubkeyToAddress(key.PublicKey)
+		funds   = big.NewInt(1000000000000000)
+		gspec   = &Genesis{
+			Alloc:   types.GenesisAlloc{address: {Balance: funds}},
+			BaseFee: big.NewInt(params.InitialBaseFee),
+			Config:  params.TestChainConfig,
+		}
+		now = uint64(time.Now().Unix())
+	)
+	// Block 1 imports, block 2 is future and parks, block 3 fails with a
+	// non-queueable error.
+	_, blocks, _ := GenerateChainWithGenesis(gspec, ethash.NewFaker(), 3, func(i int, gen *BlockGen) {
+		gen.header.Time = now + 10
+	})
+
+	engine := &failVerifyEngine{Engine: ethash.NewFaker()}
+	engine.failErrAt = map[uint64]error{2: consensus.ErrFutureBlock, 3: errNonQueueableTest}
+
+	db := rawdb.NewMemoryDatabase()
+	chain, err := NewBlockChain(db, nil, gspec, engine, vm.Config{})
+	if err != nil {
+		t.Fatalf("failed to create tester chain: %v", err)
+	}
+	defer chain.Stop()
+
+	n, err := chain.InsertChain(blocks)
+	if n != 2 {
+		t.Fatalf("unexpected failing index: have %d want 2", n)
+	}
+	if !errors.Is(err, errNonQueueableTest) {
+		t.Fatalf("unexpected error for block %d: %v", n, err)
+	}
+	if bad := rawdb.ReadBadBlock(db, blocks[1].Hash()); bad != nil {
+		t.Fatalf("future block %d recorded as bad block", blocks[1].NumberU64())
+	}
+	if bad := rawdb.ReadBadBlock(db, blocks[2].Hash()); bad == nil {
+		t.Fatalf("non-queueable block %d not recorded as bad block", blocks[2].NumberU64())
+	}
+	if !chain.futureBlocks.Contains(blocks[1].Hash()) {
+		t.Fatalf("future block %d not parked", blocks[1].NumberU64())
 	}
 }
