@@ -93,6 +93,7 @@ var (
 	errChainStopped         = errors.New("blockchain is stopped")
 	errInvalidOldChain      = errors.New("invalid old chain")
 	errInvalidNewChain      = errors.New("invalid new chain")
+	errTooManyFutureBlocks  = errors.New("future blocks queue is full")
 
 	CheckpointCh = make(chan int)
 )
@@ -1306,6 +1307,14 @@ func (bc *BlockChain) insertStopped() bool {
 	return bc.procInterrupt.Load()
 }
 
+// proposedBlockHandler is the consensus hook invoked when the future-block
+// queue imports a block that advances the canonical head, letting the engine
+// process the new head (QC handling, voting). XDPoS implements it; the small
+// interface keeps procFutureBlocks testable with a stub engine.
+type proposedBlockHandler interface {
+	HandleProposedBlock(chain consensus.ChainReader, header *types.Header) error
+}
+
 func (bc *BlockChain) procFutureBlocks() {
 	capacity := bc.futureBlocks.Len()
 	if capacity == 0 {
@@ -1321,17 +1330,44 @@ func (bc *BlockChain) procFutureBlocks() {
 		types.BlockBy(types.Number).Sort(blocks)
 
 		// Insert one by one as chain insertion needs contiguous ancestry between blocks
+		var lastCanon *types.Block
 		for i := range blocks {
-			_, err := bc.InsertChain(blocks[i : i+1])
-			// let consensus engine handle the last block (e.g. for voting)
-			if i == len(blocks)-1 && err == nil {
-				engine, ok := bc.Engine().(*XDPoS.XDPoS)
-				if ok {
-					header := blocks[i].Header()
-					err = engine.HandleProposedBlock(bc, header)
-					if err != nil {
-						log.Info("[procFutureBlocks] handle proposed block has error", "err", err, "block hash", header.Hash(), "number", header.Number)
-					}
+			if _, err := bc.InsertChain(blocks[i : i+1]); err != nil {
+				// Retryable failures keep the block parked: it is still in the future
+				// (ErrFutureBlock), or its parent is itself parked in the queue
+				// (ErrUnknownAncestor) and may import on a later pass. Everything
+				// else — most notably an ErrUnknownAncestor whose parent is neither
+				// in the chain nor in the queue — can never succeed on a retry, so
+				// the block is evicted instead of being re-verified and re-reported
+				// as a bad block on every futureBlocksLoop tick. Blocks are sorted
+				// by number, so evicting a failed parent makes the Contains check
+				// of its queued children fail within the same pass and the whole
+				// orphaned chain drains.
+				if errors.Is(err, consensus.ErrFutureBlock) ||
+					(errors.Is(err, consensus.ErrUnknownAncestor) && bc.futureBlocks.Contains(blocks[i].ParentHash())) {
+					continue
+				}
+				bc.futureBlocks.Remove(blocks[i].Hash())
+				continue
+			}
+			// Only a write that advanced the canonical head qualifies for the
+			// engine hook below: known blocks that are skipped return a nil
+			// error without importing, and side-chain writes must not be
+			// treated as the head. Comparing hashes also keeps a same-height
+			// fork from being mistaken for the canonical head.
+			if bc.CurrentBlock().Hash() == blocks[i].Hash() {
+				lastCanon = blocks[i]
+			}
+		}
+		// Let the consensus engine handle the highest imported canonical block
+		// (e.g. for voting). The sorted queue tail cannot be the target: it may
+		// have failed to import while lower blocks advanced the head, or sit on
+		// a side branch.
+		if lastCanon != nil {
+			if engine, ok := bc.Engine().(proposedBlockHandler); ok {
+				header := lastCanon.Header()
+				if err := engine.HandleProposedBlock(bc, header); err != nil {
+					log.Info("[procFutureBlocks] handle proposed block has error", "err", err, "block hash", header.Hash(), "number", header.Number)
 				}
 			}
 		}
@@ -1800,22 +1836,78 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 	return status, nil
 }
 
+// isQueueableImportErr reports whether a batch tail block should be parked in the
+// future queue instead of failing the import.
+func isQueueableImportErr(err error) bool {
+	return errors.Is(err, consensus.ErrUnknownAncestor) || errors.Is(err, consensus.ErrFutureBlock)
+}
+
 // addFutureBlock checks if the block is within the max allowed window to get
 // accepted for future processing, and returns an error if the block is too far
 // ahead and was not added.
 func (bc *BlockChain) addFutureBlock(block *types.Block) error {
 	max := uint64(time.Now().Unix()) + maxTimeFutureBlocks
 	if block.Time() > max {
+		// Evict any stale queue entry for the block (possible after a wall-clock
+		// step back between an earlier park and this retry): a block that fails
+		// the enqueue window must not linger in the future queue, where it would
+		// otherwise be retried by procFutureBlocks forever.
+		bc.futureBlocks.Remove(block.Hash())
 		return fmt.Errorf("future block timestamp %v > allowed %v", block.Time(), max)
 	}
 	bc.futureBlocks.Add(block.Hash(), block)
 	return nil
 }
 
+// queueFutureTail parks the batch tail in the future queue, starting at the
+// given block whose verification error err is queueable, and stops at the
+// first block that fails verification with a non-queueable error or at the end
+// of the batch. XDPoS v1/v2 (under full verification) check the timestamp
+// before the parent lookup (engine_v1/engine.go, engine_v2/verifyHeader.go),
+// so children of a future block surface as ErrFutureBlock. Engines that
+// resolve the parent first (e.g. ethash VerifyHeader), or XDPoS without
+// fullVerify, answer ErrUnknownAncestor instead; the loop accepts both.
+//
+// Park at most maxFutureBlocks blocks total, counting the blocks already in
+// the queue: a single delivery may fill the remaining capacity but must never
+// displace blocks parked by earlier deliveries (a full LRU would silently
+// evict its oldest entries). Blocks already parked re-enter this loop on
+// every future-block retry; re-adding them does not grow the queue, so the
+// capacity check exempts them — rejecting one would make procFutureBlocks
+// treat it as a non-retryable failure and evict a perfectly valid block.
+// Once the queue is full the import fails so the delivering peer is dropped
+// instead of being able to repeat the flood for free; blocks enqueued up to
+// that point stay parked.
+//
+// Note the asymmetry this implies: a queue left nearly full by earlier
+// deliveries makes an honest large batch fail after enqueueing only a few
+// blocks. That is the cost of keeping the eviction boundary honest; the
+// queue drains on the next procFutureBlocks passes and capacity frees up.
+//
+// It returns the block and error that stopped the queueing — the caller
+// decides whether to report them as bad or ignore them — and a non-nil abort
+// error when queueing must fail the whole import: the queue capacity was hit
+// (errTooManyFutureBlocks) or addFutureBlock rejected the enqueue.
+func (bc *BlockChain) queueFutureTail(it *insertIterator, block *types.Block, err error) (*types.Block, error, error) {
+	for ; block != nil && isQueueableImportErr(err); block, err = it.next() {
+		if bc.futureBlocks.Len() >= maxFutureBlocks && !bc.futureBlocks.Contains(block.Hash()) {
+			return block, err, errTooManyFutureBlocks
+		}
+		if aerr := bc.addFutureBlock(block); aerr != nil {
+			return block, err, aerr
+		}
+	}
+	return block, err, nil
+}
+
 // InsertChain attempts to insert the given batch of blocks in to the canonical
 // chain or, otherwise, create a fork. If an error is returned it will return
 // the index number of the failing block as well an error describing what went
 // wrong.
+//
+// A nil error does not imply every block was written: a tail failing with
+// ErrFutureBlock/ErrUnknownAncestor is parked in the future queue and
+// processed later.
 //
 // After insertion is done, all accumulated events will be fired.
 func (bc *BlockChain) InsertChain(chain types.Blocks) (int, error) {
@@ -1904,11 +1996,17 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, []
 
 	// First block is future, shove it (and all children) to the future queue (unknown ancestor)
 	case errors.Is(err, consensus.ErrFutureBlock) || (errors.Is(err, consensus.ErrUnknownAncestor) && bc.futureBlocks.Contains(it.first().ParentHash())):
-		for block != nil && (it.index == 0 || errors.Is(err, consensus.ErrUnknownAncestor)) {
-			if err := bc.addFutureBlock(block); err != nil {
-				return it.index, events, coalescedLogs, err
-			}
-			block, err = it.next()
+		stopped, err, abortErr := bc.queueFutureTail(it, block, err)
+		if abortErr != nil {
+			return it.index, events, coalescedLogs, abortErr
+		}
+		// The queueing stopped at a block that failed verification with a
+		// non-queueable error. Record the reject like the tail path below;
+		// future, known and pruned-ancestor errors are legitimate states,
+		// not invalid blocks.
+		if err != nil && stopped != nil && !errors.Is(err, ErrKnownBlock) &&
+			!errors.Is(err, consensus.ErrFutureBlock) && !errors.Is(err, consensus.ErrPrunedAncestor) {
+			bc.reportBlock(stopped, nil, err)
 		}
 		return it.index, events, coalescedLogs, err
 
@@ -2041,15 +2139,10 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, []
 
 	// Any blocks remaining here? The only ones we care about are the future ones
 	if block != nil && errors.Is(err, consensus.ErrFutureBlock) {
-		if err := bc.addFutureBlock(block); err != nil {
-			return it.index, events, coalescedLogs, err
-		}
-		block, err = it.next()
-
-		for ; block != nil && errors.Is(err, consensus.ErrUnknownAncestor); block, err = it.next() {
-			if err := bc.addFutureBlock(block); err != nil {
-				return it.index, events, coalescedLogs, err
-			}
+		var abortErr error
+		block, err, abortErr = bc.queueFutureTail(it, block, err)
+		if abortErr != nil {
+			return it.index, events, coalescedLogs, abortErr
 		}
 	}
 
