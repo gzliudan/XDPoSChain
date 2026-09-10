@@ -1807,12 +1807,12 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, []
 	block, err := it.next()
 	switch {
 	// First block is pruned, insert as sidechain and reorg only if TD grows enough
-	case err == consensus.ErrPrunedAncestor:
+	case errors.Is(err, consensus.ErrPrunedAncestor):
 		return bc.insertSidechain(block, it)
 
 	// First block is future, shove it (and all children) to the future queue (unknown ancestor)
-	case err == consensus.ErrFutureBlock || (err == consensus.ErrUnknownAncestor && bc.futureBlocks.Contains(it.first().ParentHash())):
-		for block != nil && (it.index == 0 || err == consensus.ErrUnknownAncestor) {
+	case errors.Is(err, consensus.ErrFutureBlock) || (errors.Is(err, consensus.ErrUnknownAncestor) && bc.futureBlocks.Contains(it.first().ParentHash())):
+		for block != nil && (it.index == 0 || errors.Is(err, consensus.ErrUnknownAncestor)) {
 			if err := bc.addFutureBlock(block); err != nil {
 				return it.index, events, coalescedLogs, err
 			}
@@ -1824,11 +1824,11 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, []
 	//   1. We did a roll-back, and should now do a re-import
 	//   2. The block is stored as a sidechain, and is lying about it's stateroot, and passes a stateroot
 	// 	    from the canonical chain, which has not been verified.
-	case err == ErrKnownBlock:
+	case errors.Is(err, ErrKnownBlock):
 		// Skip all known blocks that behind us
 		current := bc.CurrentBlock().Number.Uint64()
 
-		for block != nil && err == ErrKnownBlock && current >= block.NumberU64() {
+		for block != nil && errors.Is(err, ErrKnownBlock) && current >= block.NumberU64() {
 			stats.ignored++
 			block, err = it.next()
 		}
@@ -1930,13 +1930,13 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, []
 	}
 
 	// Any blocks remaining here? The only ones we care about are the future ones
-	if block != nil && err == consensus.ErrFutureBlock {
+	if block != nil && errors.Is(err, consensus.ErrFutureBlock) {
 		if err := bc.addFutureBlock(block); err != nil {
 			return it.index, events, coalescedLogs, err
 		}
 		block, err = it.next()
 
-		for ; block != nil && err == consensus.ErrUnknownAncestor; block, err = it.next() {
+		for ; block != nil && errors.Is(err, consensus.ErrUnknownAncestor); block, err = it.next() {
 			if err := bc.addFutureBlock(block); err != nil {
 				return it.index, events, coalescedLogs, err
 			}
@@ -2058,7 +2058,7 @@ func (bc *BlockChain) insertSidechain(block *types.Block, it *insertIterator) (i
 	// ones. Any other errors means that the block is invalid, and should not be written
 	// to disk.
 	err := consensus.ErrPrunedAncestor
-	for ; block != nil && (err == consensus.ErrPrunedAncestor); block, err = it.next() {
+	for ; block != nil && (errors.Is(err, consensus.ErrPrunedAncestor)); block, err = it.next() {
 		// Check the canonical state root for that number
 		if number := block.NumberU64(); current >= number {
 			if canonical := bc.GetBlockByNumber(number); canonical != nil && canonical.Root() == block.Root() {
@@ -2219,13 +2219,13 @@ func (bc *BlockChain) getResultBlock(block *types.Block, verifiedM2 bool) (*Resu
 	bstart := time.Now()
 	err := bc.validator.ValidateBody(block)
 	switch {
-	case err == ErrKnownBlock:
+	case errors.Is(err, ErrKnownBlock):
 		// Block and state both already known. However if the current block is below
 		// this number we did a rollback and we should reimport it nonetheless.
 		if bc.CurrentBlock().Number.Uint64() >= block.NumberU64() {
 			return nil, ErrKnownBlock
 		}
-	case err == consensus.ErrPrunedAncestor:
+	case errors.Is(err, consensus.ErrPrunedAncestor):
 		// Block competing with the canonical chain, store in the db, but don't process
 		// until the competitor TD goes above the canonical TD
 		currentBlock := bc.CurrentBlock()
@@ -2280,7 +2280,7 @@ func (bc *BlockChain) getResultBlock(block *types.Block, verifiedM2 bool) (*Resu
 	receipts, logs, usedGas, err := bc.processor.ProcessBlockNoValidator(calculatedBlock, statedb, tradingState, bc.vmConfig, feeCapacity)
 	process := time.Since(bstart)
 	if err != nil {
-		if err != ErrStopPreparingBlock {
+		if !errors.Is(err, ErrStopPreparingBlock) {
 			bc.reportBlock(block, receipts, err)
 		}
 		return nil, err
