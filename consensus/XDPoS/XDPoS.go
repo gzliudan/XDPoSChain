@@ -436,6 +436,15 @@ func (x *XDPoS) UpdateMasternodes(chain consensus.ChainReader, header *types.Hea
 	}
 }
 
+// IsGapBlock reports whether the block at number is the gap block of its epoch,
+// as defined by the consensus schedule this engine was built with. The chain's
+// next-epoch refresh trigger consults this predicate instead of bc.chainConfig
+// so that the trigger and UpdateMasternodes cannot disagree on which block is a
+// gap block, even if the chain config is replaced after the engine was built.
+func (x *XDPoS) IsGapBlock(number uint64) bool {
+	return x.config.IsGapBlock(number)
+}
+
 func (x *XDPoS) RecoverSigner(header *types.Header) (common.Address, error) {
 	switch x.config.BlockConsensusVersion(header.Number) {
 	case params.ConsensusEngineVersion2:

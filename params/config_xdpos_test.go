@@ -322,3 +322,38 @@ func TestV2UnmarshalSwitchEpochVariants(t *testing.T) {
 	assert.Equal(t, uint64(111), v2.SwitchEpoch)
 	assert.Equal(t, big.NewInt(456), v2.SwitchBlock)
 }
+
+// TestXDPoSConfigIsGapBlock pins the gap-block predicate against invalid
+// schedules. The modulo divides by zero on Epoch == 0 and underflows Epoch-Gap
+// when Gap >= Epoch, so both must be rejected the same way repairGapCandidates
+// rejects them. A valid schedule must still resolve exactly the Epoch-Gap block
+// of every epoch.
+func TestXDPoSConfigIsGapBlock(t *testing.T) {
+	const (
+		epoch = uint64(900)
+		gap   = uint64(450)
+	)
+	valid := &XDPoSConfig{Epoch: epoch, Gap: gap}
+
+	tests := []struct {
+		name   string
+		config *XDPoSConfig
+		number uint64
+		want   bool
+	}{
+		{"nil config is never a gap block", nil, epoch - gap, false},
+		{"zero epoch is rejected instead of dividing by zero", &XDPoSConfig{Epoch: 0, Gap: gap}, 0, false},
+		{"zero gap is rejected", &XDPoSConfig{Epoch: epoch, Gap: 0}, 0, false},
+		{"gap equal to epoch is rejected", &XDPoSConfig{Epoch: epoch, Gap: epoch}, 0, false},
+		{"gap above epoch is rejected", &XDPoSConfig{Epoch: epoch, Gap: epoch + 1}, epoch, false},
+		{"valid schedule matches the first gap block", valid, epoch - gap, true},
+		{"valid schedule matches the next epoch gap block", valid, 2*epoch - gap, true},
+		{"valid schedule rejects the epoch boundary", valid, epoch, false},
+		{"valid schedule rejects a mid-epoch block", valid, epoch - gap - 1, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.config.IsGapBlock(tt.number))
+		})
+	}
+}

@@ -55,6 +55,23 @@ type XDPoSConfig struct {
 	json jsonFieldPresence `json:"-"`
 }
 
+// IsGapBlock reports whether number is the gap block of its epoch, i.e. the
+// block at Epoch-Gap whose committed state the masternode set of the next epoch
+// is derived from. The chain's refresh trigger, the v2 engine's snapshot writer
+// and the tests building chains all have to agree on this predicate, so they
+// share this one definition instead of each spelling out the modulo.
+//
+// A nil config and Epoch == 0 both mean "never a gap block", which lets callers
+// use this as a guard without dividing by zero. A zero or out-of-range offset
+// (Gap == 0 or Gap >= Epoch) is rejected as well, instead of underflowing
+// Epoch-Gap, matching repairGapCandidates' validation of the same schedule.
+func (c *XDPoSConfig) IsGapBlock(number uint64) bool {
+	if c == nil || c.Epoch == 0 || c.Gap == 0 || c.Gap >= c.Epoch {
+		return false
+	}
+	return number%c.Epoch == c.Epoch-c.Gap
+}
+
 // UnmarshalJSON supports both the current and legacy typo-ed JSON key for
 // foundation wallet address to keep old on-disk chain configs compatible.
 func (c *XDPoSConfig) UnmarshalJSON(data []byte) error {

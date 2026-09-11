@@ -35,11 +35,10 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/common/lru"
 	"github.com/XinFinOrg/XDPoSChain/common/mclock"
 	"github.com/XinFinOrg/XDPoSChain/common/prque"
-	xdc_sort "github.com/XinFinOrg/XDPoSChain/common/sort"
 	"github.com/XinFinOrg/XDPoSChain/consensus"
 	"github.com/XinFinOrg/XDPoSChain/consensus/XDPoS"
+	"github.com/XinFinOrg/XDPoSChain/consensus/XDPoS/engines/engine_v2"
 	"github.com/XinFinOrg/XDPoSChain/consensus/XDPoS/utils"
-	contractValidator "github.com/XinFinOrg/XDPoSChain/contracts/validator/contract"
 	"github.com/XinFinOrg/XDPoSChain/core/rawdb"
 	"github.com/XinFinOrg/XDPoSChain/core/state"
 	"github.com/XinFinOrg/XDPoSChain/core/tracing"
@@ -129,6 +128,11 @@ const (
 
 	// Maximum length of chain to cache by block's number
 	blocksHashCacheLimit = 900
+
+	// Maximum number of known blocks remembered as having failed a re-drive.
+	// The memory is scoped to the head the failure happened on, so it never
+	// grows beyond the blocks that failed against the current head.
+	maxRedriveFailures = 128
 )
 
 // CacheConfig contains the configuration values for the trie database
@@ -200,6 +204,12 @@ type BlockChain struct {
 	resultProcess    *lru.Cache[common.Hash, *ResultProcessBlock] // Cache for processed blocks
 	calculatingBlock *lru.Cache[common.Hash, *CalculatedBlock]    // Cache for processing blocks
 	downloadingBlock *lru.Cache[common.Hash, struct{}]            // Cache for downloading blocks (avoid duplication from fetcher)
+
+	// redriveFailures remembers a known block whose re-drive failed, together
+	// with the head hash the failure happened on. A redelivery while the head
+	// is unchanged cannot succeed, so it must not re-execute the block; as soon
+	// as the head moves the entry stops matching and the block is retried.
+	redriveFailures *lru.Cache[common.Hash, common.Hash] // block hash -> head hash at the failed re-drive
 
 	// future blocks are blocks added for later processing
 	futureBlocks *lru.Cache[common.Hash, *types.Block]
@@ -442,6 +452,7 @@ func newBlockChain(db ethdb.Database, cacheConfig *CacheConfig, engine consensus
 		resultProcess:       lru.NewCache[common.Hash, *ResultProcessBlock](blockCacheLimit),
 		calculatingBlock:    lru.NewCache[common.Hash, *CalculatedBlock](blockCacheLimit),
 		downloadingBlock:    lru.NewCache[common.Hash, struct{}](blockCacheLimit),
+		redriveFailures:     lru.NewCache[common.Hash, common.Hash](maxRedriveFailures),
 		engine:              engine,
 		vmConfig:            vmConfig,
 		logger:              vmConfig.Tracer,
@@ -855,6 +866,7 @@ func (bc *BlockChain) setHeadBeyondRoot(head uint64) error {
 	bc.receiptsCache.Purge()
 	bc.blockCache.Purge()
 	bc.futureBlocks.Purge()
+	bc.redriveFailures.Purge()
 	bc.blocksHashCache.Purge()
 
 	return bc.loadLastState()
@@ -1668,18 +1680,19 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 	// If the total difficulty is higher than our known, add it to the canonical chain
 	// Second clause in the if statement reduces the vulnerability to selfish mining.
 	// Please refer to http://www.cs.cornell.edu/~ie53/publications/btcProcFC.pdf
-	reorg := externTd.Cmp(localTd) > 0
 	currentBlock = bc.CurrentBlock()
-	if !reorg && externTd.Cmp(localTd) == 0 {
-		// Split same-difficulty blocks by number
-		reorg = block.NumberU64() > currentBlock.Number.Uint64()
-	}
+	reorg := externTdBeatsHead(block, currentBlock, externTd, localTd)
+	refreshedByReorg := false
 	if reorg {
 		// Reorganise the chain if the parent is not the head block
 		if block.ParentHash() != currentBlock.Hash() {
 			if err := bc.reorg(currentBlock, block.Header()); err != nil {
 				return NonStatTy, err
 			}
+			// bc.reorg refreshes the next-epoch masternode set of every gap
+			// block of the new chain, this one included, so the extension path
+			// below must not derive it a second time.
+			refreshedByReorg = true
 		}
 		status = CanonStatTy
 	} else {
@@ -1688,14 +1701,51 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 
 	// Set new head.
 	if status == CanonStatTy {
-		// WriteBlock has already been called, no need to write again
-		bc.writeHeadBlock(block, false)
-		// prepare set of masternodes for the next epoch
-		if bc.chainConfig.XDPoS != nil && ((block.NumberU64() % bc.chainConfig.XDPoS.Epoch) == (bc.chainConfig.XDPoS.Epoch - bc.chainConfig.XDPoS.Gap)) {
-			if err := bc.UpdateM1(); err != nil {
-				log.Crit("Fail to update masternodes during writeBlockWithState", "number", block.Number, "hash", block.Hash().Hex(), "err", err)
+		// Prepare the masternode set for the next epoch *before* the head is
+		// advanced: the refresh is anchored at this block, so if it fails the
+		// head stays where it was and no ChainHeadEvent is emitted for a gap
+		// block whose snapshot is missing.
+		//
+		// The failure is reported, not fatal. A node that cannot derive the set
+		// for this block must not accept it, but it must stay alive: the insertion
+		// path reports the error and stops re-driving the block while the head is
+		// unchanged, so a redelivery cannot turn into a death loop.
+		//
+		// Only the extension path refreshes here. When this block reached the
+		// chain through bc.reorg, that call already refreshed it and already
+		// advanced the head, so refreshedByReorg is set and the work must not be
+		// repeated.
+		//
+		// A snapshot already stored for this block is the set the refresh would
+		// derive, so the refresh is skipped: the block can be a redelivery whose
+		// write was interrupted after the snapshot was persisted, and re-deriving
+		// it would need a state that may not be readable any more.
+		//
+		// The state is re-opened from the block root because the StateDB passed
+		// in was already committed above and cannot serve further reads.
+		//
+		// Snapshot readers resolve the gap block by its canonical number
+		// (gapBlockNum = number - number%Epoch - Gap), so they only consult this
+		// snapshot a full Gap offset later, once this block has long been
+		// canonical. During the short window before writeHeadBlock they see a
+		// missing header instead of a missing snapshot, which is equally
+		// transient.
+		if !refreshedByReorg && bc.needsNextEpochMasternodeRefresh(block.NumberU64()) {
+			stored, probeErr := bc.gapSnapshotStored(block.Header())
+			if probeErr != nil {
+				// The probe could not tell whether a snapshot is stored, so the
+				// refresh runs as before rather than assuming the best case.
+				log.Debug("Cannot probe the stored next-epoch snapshot", "number", block.Number, "hash", block.Hash().Hex(), "err", probeErr)
+			}
+			if stored {
+				log.Debug("Next-epoch snapshot already stored, skipping the refresh", "number", block.Number, "hash", block.Hash().Hex())
+			} else if err := bc.UpdateM1At(block.Header()); err != nil {
+				return NonStatTy, fmt.Errorf("failed to update masternodes during writeBlockWithState, number %d, hash %s: %w",
+					block.NumberU64(), block.Hash().Hex(), err)
 			}
 		}
+		// WriteBlock has already been called, no need to write again
+		bc.writeHeadBlock(block, false)
 	}
 	// save cache BlockSigners
 	if bc.chainConfig.XDPoS != nil && bc.chainConfig.IsTIPSigning(block.Number()) {
@@ -1840,8 +1890,10 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, []
 		return it.index, events, coalescedLogs, err
 	}
 
-	// No validation errors for the first block (or chain prefix skipped)
-	for ; block != nil && err == nil; block, err = it.next() {
+	// No validation errors for the first block (or chain prefix skipped).
+	// ErrKnownBlock is admitted here as well: a stored block may still owe the
+	// chain work, see knownBlockAwaitsReorg.
+	for ; block != nil && (err == nil || errors.Is(err, ErrKnownBlock)); block, err = it.next() {
 		// If the chain is terminating, stop processing blocks
 		if bc.insertStopped() {
 			log.Debug("Premature abort during blocks processing")
@@ -1852,6 +1904,25 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, []
 			bc.reportBlock(block, nil, ErrDenylistedHash)
 			return it.index, events, coalescedLogs, ErrDenylistedHash
 		}
+		// A known block that owes nothing is skipped exactly as before; the
+		// loop condition above only lets it in so that a block left behind by
+		// an aborted write can be re-processed. The iterator is advanced by the
+		// post statement only: advancing here as well would consume the block
+		// after the skipped one without ever looking at it.
+		if errors.Is(err, ErrKnownBlock) && !bc.knownBlockAwaitsReorg(block) {
+			stats.ignored++
+			continue
+		}
+		// A re-drive that already failed against this head is not attempted
+		// again: the outcome cannot change while the head is the same, so the
+		// block must not be re-executed on every redelivery.
+		if errors.Is(err, ErrKnownBlock) && bc.redriveBlocked(block) {
+			stats.ignored++
+			continue
+		}
+		// Whether this block is being re-driven because an aborted write left it
+		// behind, rather than imported for the first time.
+		knownRedrive := errors.Is(err, ErrKnownBlock)
 		// Retrieve the parent block and it's state to execute on top
 		start := time.Now()
 		parent := it.previous()
@@ -1889,7 +1960,13 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, []
 		res, err := bc.processBlock(block, parent, statedb)
 		followupInterrupt.Store(true)
 		if err != nil {
+			if knownRedrive {
+				bc.noteRedriveFailure(block)
+			}
 			return it.index, events, coalescedLogs, err
+		}
+		if knownRedrive {
+			bc.clearRedriveFailure(block)
 		}
 		// Report the import stats before returning the various results
 		stats.processed++
@@ -2333,6 +2410,17 @@ func (bc *BlockChain) insertBlock(block *types.Block) ([]interface{}, []*types.L
 		log.Debug("Stop fetcher a block because downloading", "number", block.NumberU64(), "hash", block.Hash())
 		return events, coalescedLogs, nil
 	}
+	// A redelivery of a known block whose re-drive already failed against this
+	// head is answered without re-executing it. The outcome cannot change while
+	// the head is the same, and re-processing the block on every redelivery
+	// would burn CPU and I/O for no progress. The check runs before
+	// getResultBlock so the block is not even executed again.
+	if bc.HasBlockAndFullState(block.Hash(), block.NumberU64()) &&
+		bc.knownBlockAwaitsReorg(block) && bc.redriveBlocked(block) {
+		log.Debug("Skipping the re-drive of a known block that already failed",
+			"number", block.NumberU64(), "hash", block.Hash())
+		return events, coalescedLogs, nil
+	}
 	result, err := bc.getResultBlock(block, true)
 	if err != nil {
 		return events, coalescedLogs, err
@@ -2345,13 +2433,33 @@ func (bc *BlockChain) insertBlock(block *types.Block) ([]interface{}, []*types.L
 		return nil, nil, errChainStopped
 	}
 	defer bc.chainmu.Unlock()
+	// Whether this block is being re-driven because an aborted write left it
+	// behind, rather than imported for the first time.
+	knownRedrive := false
 	if bc.HasBlockAndFullState(block.Hash(), block.NumberU64()) {
-		return events, coalescedLogs, nil
+		// A stored block is not necessarily a finished one: writeBlockWithState
+		// persists the block, its receipts and its state before it reorganises,
+		// so an aborted reorg leaves it in the database while the head stays on
+		// the old branch. Answering such a redelivery with nil would strand the
+		// chain there for good, so re-drive the block through the write path
+		// below and let it either recover or report the failure.
+		if !bc.knownBlockAwaitsReorg(block) {
+			return events, coalescedLogs, nil
+		}
+		log.Debug("Re-processing a known block the head is behind",
+			"number", block.NumberU64(), "hash", block.Hash())
+		knownRedrive = true
 	}
 	status, err := bc.writeBlockWithState(block, result.receipts, result.state, result.tradingState, result.lendingState)
 
 	if err != nil {
+		if knownRedrive {
+			bc.noteRedriveFailure(block)
+		}
 		return events, coalescedLogs, err
+	}
+	if knownRedrive {
+		bc.clearRedriveFailure(block)
 	}
 	switch status {
 	case CanonStatTy:
@@ -2415,7 +2523,7 @@ func (bc *BlockChain) collectLogs(b *types.Block, removed bool) []*types.Log {
 // reorg takes two blocks, an old chain and a new chain and will reconstruct the
 // blocks and inserts them to be part of the new canonical chain and accumulates
 // potential missing transactions and post an event about them.
-func (bc *BlockChain) reorg(oldHead, newHead *types.Header) error {
+func (bc *BlockChain) reorg(oldHead, newHead *types.Header) (err error) {
 	log.Warn("Reorg", "OldHash", oldHead.Hash().Hex(), "OldNum", oldHead.Number, "NewHash", newHead.Hash().Hex(), "NewNum", newHead.Number)
 
 	var (
@@ -2487,6 +2595,60 @@ func (bc *BlockChain) reorg(oldHead, newHead *types.Header) error {
 					log.Error("Impossible reorg, please file an issue", "OldNum", commonBlock.Number.Uint64(), "OldHash", commonBlock.Hash().Hex(), "LatestCommittedHash", latestCommittedBlock.Hash.Hex())
 				}
 			}
+		}
+	}
+
+	// Prepare the next-epoch masternode sets for every gap block of the new
+	// chain before any side effect, the reorg log lines and their metrics
+	// included: the head is not advanced and no event is emitted yet, so a
+	// failed refresh leaves the chain exactly where it was and the cleanup
+	// below (tx-lookup and canonical markers) is never skipped. UpdateM1At
+	// derives from each block's own committed state and never reads the head,
+	// so refreshing in this order is safe; writeBlockWithState skips its own
+	// refresh for a block the apply loop has already advanced the head to.
+	//
+	// A gap block whose snapshot is already stored is skipped: that snapshot is
+	// the set this refresh would derive from the same state, and re-deriving it
+	// after the state was pruned would fail the whole reorg on a branch whose
+	// next-epoch set is in fact already known.
+	//
+	// The snapshots written here belong to a branch that may never become
+	// canonical, and SetHead's cleanup only walks the canonical chain, so the
+	// ones an attempt that later fails has written are rolled back below.
+	var writtenSnapshots []common.Hash
+	defer func() {
+		if err == nil {
+			return
+		}
+		for _, hash := range writtenSnapshots {
+			rawdb.DeleteXdposSnapshot(bc.db, hash)
+		}
+	}()
+	for i := len(newChain) - 1; i >= 0; i-- {
+		if !bc.needsNextEpochMasternodeRefresh(newChain[i].Number.Uint64()) {
+			continue
+		}
+		stored, probeErr := bc.gapSnapshotStored(newChain[i])
+		if probeErr != nil {
+			log.Debug("Cannot probe the stored next-epoch snapshot", "number", newChain[i].Number, "hash", newChain[i].Hash().Hex(), "err", probeErr)
+		}
+		if stored {
+			log.Debug("Next-epoch snapshot already stored, skipping the refresh", "number", newChain[i].Number, "hash", newChain[i].Hash().Hex())
+			continue
+		}
+		// newChain[i] is the header this refresh is anchored at, so it is passed
+		// through directly: UpdateM1At only reads Number, Hash and Root, and the
+		// block body is not needed to write the snapshot.
+		if err := bc.UpdateM1At(newChain[i]); err != nil {
+			return fmt.Errorf("failed to update masternodes during reorg, number %d, hash %s: %w",
+				newChain[i].Number.Uint64(), newChain[i].Hash().Hex(), err)
+		}
+		// Roll back only snapshots this attempt created: a probe that could not
+		// tell whether one was stored leaves the cleanup alone, and so does the
+		// v1 era, whose refresh does not write the v2 snapshot this probe checks.
+		if probeErr == nil && bc.chainConfig.XDPoS != nil &&
+			bc.chainConfig.XDPoS.BlockConsensusVersion(newChain[i].Number) == params.ConsensusEngineVersion2 {
+			writtenSnapshots = append(writtenSnapshots, newChain[i].Hash())
 		}
 	}
 
@@ -2589,14 +2751,12 @@ func (bc *BlockChain) reorg(oldHead, newHead *types.Header) error {
 			bc.logsFeed.Send(rebirthLogs)
 			rebirthLogs = nil
 		}
-		// Update the head block
+		// The next-epoch masternode sets of this chain were already refreshed
+		// before any side effect, so advancing the head here is safe: on a
+		// refresh failure the head (and the event stream) stays untouched.
+		// writeBlockWithState skips its own refresh because refreshedByReorg is
+		// set for this block.
 		bc.writeHeadBlock(block, true)
-		// prepare set of masternodes for the next epoch
-		if bc.chainConfig.XDPoS != nil && ((block.NumberU64() % bc.chainConfig.XDPoS.Epoch) == (bc.chainConfig.XDPoS.Epoch - bc.chainConfig.XDPoS.Gap)) {
-			if err := bc.UpdateM1(); err != nil {
-				log.Crit("Fail to update masternodes during reorg", "number", block.Number, "hash", block.Hash().Hex(), "err", err)
-			}
-		}
 	}
 	if len(rebirthLogs) > 0 {
 		bc.logsFeed.Send(rebirthLogs)
@@ -2758,66 +2918,155 @@ func (bc *BlockChain) GetClient() (bind.ContractBackend, error) {
 	return bc.Client, nil
 }
 
-func (bc *BlockChain) UpdateM1() error {
+// UpdateM1At refreshes the masternode set of the next epoch from the state
+// committed at the given header. It never reads the chain head, so callers can
+// invoke it before the block becomes the head: if the refresh fails the head is
+// left untouched, and no ChainHeadEvent is emitted for a gap block whose
+// snapshot was never written.
+//
+// The state is always opened from header.Root, and there is no second source
+// anchored at this block: an unreadable state fails the refresh instead of
+// falling back to data belonging to another block. Both shapes of failure land
+// here: a root that is not available fails in StateAt below, and a state whose
+// voting contract storage cannot be read fails in the derivation, which reports
+// it through StateDB.Error(). A StateDB that already went through Commit must not
+// be reused here either: reading an account the block did not touch would hit
+// its already committed trie and fail the refresh the same way.
+func (bc *BlockChain) UpdateM1At(header *types.Header) error {
 	engine, ok := bc.Engine().(*XDPoS.XDPoS)
 	if bc.Config().XDPoS == nil || !ok {
 		return ErrNotXDPoS
 	}
-	log.Info("It's time to update new set of masternodes for the next epoch...")
-	// get masternodes information from smart contract
-	client, err := bc.GetClient()
-	if err != nil {
-		return fmt.Errorf("failed to get client: %w", err)
+	if header == nil {
+		return errors.New("nil header in UpdateM1At")
 	}
-	addr := common.MasternodeVotingSMCBinary
-	validator, err := contractValidator.NewXDCValidator(addr, client)
-	if err != nil {
-		return fmt.Errorf("failed to create validator contract: %w", err)
-	}
-	opts := new(bind.CallOpts)
+	log.Info("It's time to update new set of masternodes for the next epoch...", "number", header.Number, "hash", header.Hash().Hex())
 
-	var candidates []common.Address
-	// get candidates from slot of stateDB
-	// if can't get anything, request from contracts
-	stateDB, err := bc.State()
+	statedb, err := bc.StateAt(header.Root)
 	if err != nil {
-		candidates, err = validator.GetCandidates(opts)
-		if err != nil {
-			return err
-		}
-	} else if stateDB == nil {
-		return errors.New("nil stateDB in UpdateM1")
-	} else {
-		candidates = stateDB.GetCandidates()
+		// The state committed at this header cannot be opened (its trie nodes may
+		// have been pruned already). Fail instead of deriving the set elsewhere:
+		// the head still points at the parent block here, so any other source
+		// would yield masternodes that do not belong to the block whose snapshot
+		// is being written.
+		return fmt.Errorf("failed to open state of block %d (%s) for the masternode update: %w",
+			header.Number.Uint64(), header.Hash().Hex(), err)
 	}
-
-	var ms []utils.Masternode
-	for _, candidate := range candidates {
-		v, err := validator.GetCandidateCap(opts, candidate)
-		if err != nil {
-			return err
+	// The derivation lives in the v2 engine so that a local refresh, fast sync
+	// and the startup repair can never disagree on the set derived from the same
+	// state.
+	ms, err := engine_v2.DeriveNextEpochMasternodes(statedb)
+	if err != nil {
+		if errors.Is(err, engine_v2.ErrNoCandidates) {
+			log.Error("No masternode found", "number", header.Number, "hash", header.Hash().Hex())
 		}
-		// TODO: smart contract shouldn't return "0x0000000000000000000000000000000000000000"
-		if !candidate.IsZero() {
-			ms = append(ms, utils.Masternode{Address: candidate, Stake: v})
-		}
+		return fmt.Errorf("failed to derive the next-epoch masternodes of block %d (%s): %w",
+			header.Number.Uint64(), header.Hash().Hex(), err)
 	}
-	if len(ms) == 0 {
-		log.Error("No masternode found. Stopping node")
-		return errors.New("no masternode found")
-	} else {
-		xdc_sort.Slice(ms, func(i, j int) bool {
-			return ms[i].Stake.Cmp(ms[j].Stake) >= 0
-		})
-		log.Info("Updating new set of masternodes")
-		header := bc.CurrentHeader()
-		err = engine.UpdateMasternodes(bc, header, ms)
-		if err != nil {
-			return err
-		}
-		log.Info("Masternodes are ready for the next epoch")
+	log.Info("Updating new set of masternodes", "number", header.Number, "hash", header.Hash().Hex())
+	if err := engine.UpdateMasternodes(bc, header, ms); err != nil {
+		return err
 	}
+	log.Info("Masternodes are ready for the next epoch", "number", header.Number, "hash", header.Hash().Hex())
 	return nil
+}
+
+// needsNextEpochMasternodeRefresh reports whether the block at the given number
+// sits at the gap offset of its epoch, where the masternode set of the next
+// epoch is derived. Callers must refresh through UpdateM1At before advancing the
+// head to that block, so a failed refresh leaves the head (and the event stream)
+// untouched.
+//
+// The predicate is asked of the engine rather than of bc.chainConfig, so this
+// trigger and UpdateMasternodes read the same XDPoSConfig the engine was built
+// with and cannot disagree on which block is a gap block. An engine that is not
+// XDPoS never refreshes.
+func (bc *BlockChain) needsNextEpochMasternodeRefresh(number uint64) bool {
+	engine, ok := bc.Engine().(*XDPoS.XDPoS)
+	if !ok {
+		return false
+	}
+	return engine.IsGapBlock(number)
+}
+
+// knownBlockAwaitsReorg reports whether a block that is already stored together
+// with its full state still owes the insertion path a reorganisation.
+//
+// writeBlockWithState persists the block, its receipts and its state before it
+// reorganises, so an aborted reorg leaves the block in the database while the
+// head stays on the old branch. The insertion paths must re-drive such a block
+// instead of reading "stored" as "done", otherwise the chain can never leave
+// that branch again.
+//
+// The predicate mirrors the total-difficulty rule writeBlockWithState uses to
+// decide whether the block belongs on the canonical chain: a known block at or
+// below the head, or one whose total difficulty does not reach the head, is
+// finished as far as the insertion path is concerned and keeps the previous
+// fast path.
+func (bc *BlockChain) knownBlockAwaitsReorg(block *types.Block) bool {
+	current := bc.CurrentBlock()
+	if block.NumberU64() <= current.Number.Uint64() {
+		return false
+	}
+	ptd := bc.GetTd(block.ParentHash(), block.NumberU64()-1)
+	localTd := bc.GetTd(current.Hash(), current.Number.Uint64())
+	if ptd == nil || localTd == nil {
+		return false
+	}
+	return externTdBeatsHead(block, current, new(big.Int).Add(block.Difficulty(), ptd), localTd)
+}
+
+// externTdBeatsHead reports whether a block whose total difficulty is externTd
+// belongs on the canonical chain built on the given head, mirroring the rule
+// writeBlockWithState applies before it reorganises: a strictly higher total
+// difficulty wins, and an equal one is split by block number. The two callers
+// must never disagree on the answer, so the rule lives here once.
+func externTdBeatsHead(block *types.Block, current *types.Header, externTd, localTd *big.Int) bool {
+	if externTd.Cmp(localTd) > 0 {
+		return true
+	}
+	return externTd.Cmp(localTd) == 0 && block.NumberU64() > current.Number.Uint64()
+}
+
+// gapSnapshotStored reports whether the next-epoch snapshot of the given gap
+// header is already in the database, in which case the refresh that would derive
+// it can be skipped. The snapshot is stored under the block hash and is a pure
+// function of that block's own committed state, so a stored one is always the
+// set this refresh would produce.
+//
+// Only v2-era blocks are probed. The live schedule is v2, while in the v1 era
+// UpdateMasternodes derives and stores its snapshot through the v1 engine, whose
+// content is not the v2 candidate set this refresh computes.
+func (bc *BlockChain) gapSnapshotStored(header *types.Header) (bool, error) {
+	if bc.chainConfig.XDPoS == nil {
+		return false, nil
+	}
+	if bc.chainConfig.XDPoS.BlockConsensusVersion(header.Number) != params.ConsensusEngineVersion2 {
+		return false, nil
+	}
+	return rawdb.HasXdposV2Snapshot(bc.db, header.Hash())
+}
+
+// redriveBlocked reports whether re-driving a known block already failed against
+// the current head. The failure is only remembered while the head is unchanged:
+// the reorg decision depends on the head and its total difficulty, which are
+// fixed for a given head, so a retry would repeat the same work and the same
+// failure.
+func (bc *BlockChain) redriveBlocked(block *types.Block) bool {
+	head, ok := bc.redriveFailures.Get(block.Hash())
+	return ok && head == bc.CurrentBlock().Hash()
+}
+
+// noteRedriveFailure remembers that re-driving the given known block failed
+// against the current head.
+func (bc *BlockChain) noteRedriveFailure(block *types.Block) {
+	bc.redriveFailures.Add(block.Hash(), bc.CurrentBlock().Hash())
+}
+
+// clearRedriveFailure drops the recorded failure of a block that was re-driven
+// successfully, so a later legitimate re-drive is not suppressed.
+func (bc *BlockChain) clearRedriveFailure(block *types.Block) {
+	bc.redriveFailures.Remove(block.Hash())
 }
 
 func (bc *BlockChain) AddMatchingResult(txHash common.Hash, matchingResults map[common.Hash]tradingstate.MatchingResult) {

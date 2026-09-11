@@ -125,18 +125,23 @@ type GapStateReader interface {
 	StateAt(root common.Hash) (*state.StateDB, error)
 }
 
-// ErrNoCandidates is returned by BuildSnapshotFromState when the gap block
-// state yields no masternode candidates.
+// ErrNoCandidates is returned when the gap block state yields no masternode
+// candidates.
 var ErrNoCandidates = errors.New("no masternode candidates in state")
 
-// BuildSnapshotFromState derives a gap block snapshot from the state committed
-// at that block. The ordering must stay identical to core.BlockChain.UpdateM1:
-// a different equal-stake order yields a different masternode set. Callers such
-// as Downloader.generateSnapshot must delegate here instead of reimplementing
-// the derivation.
-func BuildSnapshotFromState(statedb *state.StateDB, number uint64, hash common.Hash) (*SnapshotV2, error) {
+// DeriveNextEpochMasternodes reads the candidate set and its stakes from the
+// state committed at a gap block and returns them ordered the way both the
+// snapshot and core.BlockChain.UpdateM1At need them. This is the single
+// implementation of the v2 next-epoch derivation: a second copy, even one that
+// orders identically today, would drift and let a local refresh and fast sync
+// disagree on the next-epoch set derived from the same state.
+//
+// The v1 signer list is a different set, derived elsewhere (see
+// eth/hooks.HookGetSignersFromContract) and deliberately not routed through here.
+func DeriveNextEpochMasternodes(statedb *state.StateDB) ([]utils.Masternode, error) {
 	var ms []utils.Masternode
 	for _, candidate := range statedb.GetCandidates() {
+		// TODO: smart contract shouldn't return "0x0000000000000000000000000000000000000000"
 		if candidate.IsZero() {
 			continue
 		}
@@ -154,10 +159,27 @@ func BuildSnapshotFromState(statedb *state.StateDB, number uint64, hash common.H
 		// An empty snapshot loads back fine and would permanently mask the hole.
 		return nil, ErrNoCandidates
 	}
+	// Deliberately >= 0: for equal stakes this is not a strict weak ordering, so
+	// the resulting order is whatever xdc_sort produces for the given input. That
+	// order is part of every snapshot already written to the chain, so it is
+	// pinned by TestBuildSnapshotFromStateEqualStakeOrder and
+	// TestBuildSnapshotFromStateEqualStakeOrderLarge. Changing the comparator (or
+	// the vendored common/sort) changes the derived set and would fork a rolling
+	// upgrade, so do not "fix" this to a strict comparator.
 	xdc_sort.Slice(ms, func(i, j int) bool {
 		return ms[i].Stake.Cmp(ms[j].Stake) >= 0
 	})
+	return ms, nil
+}
 
+// BuildSnapshotFromState derives a gap block snapshot from the state committed
+// at that block. Callers such as Downloader.generateSnapshot must delegate here
+// instead of reimplementing the derivation.
+func BuildSnapshotFromState(statedb *state.StateDB, number uint64, hash common.Hash) (*SnapshotV2, error) {
+	ms, err := DeriveNextEpochMasternodes(statedb)
+	if err != nil {
+		return nil, err
+	}
 	candidates := make([]common.Address, len(ms))
 	for i, m := range ms {
 		candidates[i] = m.Address
@@ -184,8 +206,11 @@ func (x *XDPoS_v2) repairGapCandidates(head uint64) []uint64 {
 	return []uint64{latest - epoch, latest}
 }
 
-// RepairGapSnapshots restores gap block snapshots missing from the database,
-// which happens when the process exits between writeHeadBlock and UpdateM1.
+// RepairGapSnapshots restores gap block snapshots missing from the database.
+// The refresh now runs before the head is advanced, so a process exit can no
+// longer leave a canonical gap block without its snapshot (one written while the
+// head stayed behind is harmless and gets overwritten on replay); this repair
+// only covers gaps left by older nodes or by pre-existing data.
 // Meant to run once at startup. Failures are only logged: a node that is still
 // syncing legitimately has no state to rebuild from.
 func (x *XDPoS_v2) RepairGapSnapshots(chain GapStateReader) {

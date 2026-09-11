@@ -187,8 +187,7 @@ func voteTX(gasLimit uint64, nonce uint64, addr string) (*types.Transaction, err
 }
 
 func UpdateSigner(bc *core.BlockChain) error {
-	err := bc.UpdateM1()
-	return err
+	return bc.UpdateM1At(bc.CurrentHeader())
 }
 
 func GetSnapshotSigner(bc *core.BlockChain, header *types.Header) (signersList, error) {
