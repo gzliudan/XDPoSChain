@@ -911,6 +911,91 @@ func TestInsertReceiptChainReportsInterruption(t *testing.T) {
 	}
 }
 
+// knownBlockSegmentValidator answers ValidateBody with a canned error per block number
+// and leaves the rest to the validator it embeds: scanning a sidechain segment only runs
+// body validation, so that is the only method the scan reaches. It lets a test place a
+// known block in the middle of a pruned segment without having to prune state.
+type knownBlockSegmentValidator struct {
+	*BlockValidator
+	bodyErrors map[uint64]error
+}
+
+func (v *knownBlockSegmentValidator) ValidateBody(block *types.Block) error {
+	return v.bodyErrors[block.NumberU64()]
+}
+
+// TestInsertSideChainReportsSegmentStoppedByKnownBlock covers the scan of a pruned
+// sidechain segment that stops on a block which is already on disk with its state: the
+// reimport below only rebuilds the prefix, so nothing after the known block would ever
+// be imported and reporting the prefix as a success would report a partial import as a
+// complete one.
+func TestInsertSideChainReportsSegmentStoppedByKnownBlock(t *testing.T) {
+	chain, blocks := newInsertChainTester(t, nil, 5, 3) // head at #3, #4 and #5 are unknown
+
+	// #4 is a pruned sidechain block: its parent is known but the state to execute it is
+	// gone, so the scan writes #4 out and then stops on #5, which is already known.
+	batch := blocks[3:5] // #4 and #5
+	validator := &knownBlockSegmentValidator{
+		BlockValidator: chain.validator.(*BlockValidator),
+		bodyErrors:     map[uint64]error{batch[1].NumberU64(): ErrKnownBlock},
+	}
+	results := make(chan error, len(batch))
+	results <- consensus.ErrPrunedAncestor
+	for i := 1; i < len(batch); i++ {
+		results <- nil
+	}
+	it := newInsertIterator(batch, results, validator)
+
+	n, _, _, err := chain.insertSideChain(batch[0], it)
+	if !errors.Is(err, ErrInsertionInterrupted) {
+		t.Fatalf("unexpected error: have %v want %v", err, ErrInsertionInterrupted)
+	}
+	if want := 1; n != want {
+		t.Fatalf("unexpected failing index: have %d want %d", n, want)
+	}
+	if want := uint64(3); chain.CurrentBlock().Number.Uint64() != want {
+		t.Fatalf("unexpected head number: have %d want %d", chain.CurrentBlock().Number.Uint64(), want)
+	}
+}
+
+// TestInsertSideChainAdoptsSegmentStoppedByKnownBlock is the other half: the same scan
+// stops on a known block, but the rest of the segment is on disk too, so the segment was
+// imported and only the head did not follow. Adopting it is what keeps the following
+// syncs from asking for the same range again.
+func TestInsertSideChainAdoptsSegmentStoppedByKnownBlock(t *testing.T) {
+	chain, blocks := newInsertChainTester(t, nil, 5, 5)
+	rewindHeadMarkers(chain, blocks[1]) // head stops at #2, #3..#5 stay on disk
+
+	batch := blocks[2:5] // #3, #4 and #5, all of them on disk with their state
+	validator := &knownBlockSegmentValidator{
+		BlockValidator: chain.validator.(*BlockValidator),
+		bodyErrors:     map[uint64]error{batch[1].NumberU64(): ErrKnownBlock},
+	}
+	results := make(chan error, len(batch))
+	results <- consensus.ErrPrunedAncestor
+	for i := 1; i < len(batch); i++ {
+		results <- nil
+	}
+	it := newInsertIterator(batch, results, validator)
+
+	n, events, _, err := chain.insertSideChain(batch[0], it)
+	if err != nil {
+		t.Fatalf("block %d: segment that is on disk reported as failure: %v", n, err)
+	}
+	if want := uint64(5); chain.CurrentBlock().Number.Uint64() != want {
+		t.Fatalf("unexpected head number: have %d want %d", chain.CurrentBlock().Number.Uint64(), want)
+	}
+	var head *types.Block
+	for _, event := range events {
+		if ev, ok := event.(ChainHeadEvent); ok {
+			head = ev.Block
+		}
+	}
+	if head == nil || head.Hash() != blocks[4].Hash() {
+		t.Fatal("adopting the segment did not announce the new head")
+	}
+}
+
 // interruptInsertEngine interrupts chain insertion while the body of the block at
 // interruptAt is validated. Body validation runs on the import goroutine itself,
 // so the interruption is visible deterministically at the loop head of that block,

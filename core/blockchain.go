@@ -1585,6 +1585,33 @@ func (bc *BlockChain) adoptKnownBlock(block *types.Block, head *types.Header) (b
 	return true, nil
 }
 
+// adoptKnownBatch makes the tip of chain the canonical head when it beats the current
+// one. Every block of chain is assumed to be on disk together with its state, so this
+// only moves the markers: the batch was imported, it is simply not the head yet.
+//
+// It returns the events the adoption raises, which the caller folds into the events of
+// the import it is finishing. A batch that loses fork choice is not a failure - it was
+// imported on a branch that is not the canonical one - and neither is one the head is
+// already at or above, so both return no events and no error.
+func (bc *BlockChain) adoptKnownBatch(chain types.Blocks) []interface{} {
+	current := bc.CurrentBlock()
+	last := chain[len(chain)-1]
+	if current.Number.Uint64() >= last.NumberU64() {
+		return nil
+	}
+	adopted, err := bc.adoptKnownBlock(last, current)
+	switch {
+	case err != nil:
+		log.Error("Cannot adopt an already imported batch", "head", current.Number, "block", last.NumberU64(), "err", err)
+	case !adopted:
+		log.Warn("Batch is already imported but does not beat the head", "head", current.Number, "batch", last.NumberU64())
+	default:
+		log.Debug("Adopted an already imported batch", "number", last.NumberU64(), "hash", last.Hash())
+		return []interface{}{ChainHeadEvent{last}}
+	}
+	return nil
+}
+
 // notifyEpochSwitchBlock sends a checkpoint notification when block switches the
 // epoch, so that the consensus parameters and the masternode set are refreshed.
 // It is a no-op for non-XDPoS chains and for engines that are not XDPoS.
@@ -2100,19 +2127,7 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, []
 			}
 		}
 		if onDisk {
-			if current := bc.CurrentBlock(); current.Number.Uint64() < chain[len(chain)-1].NumberU64() {
-				last := chain[len(chain)-1]
-				adopted, aerr := bc.adoptKnownBlock(last, current)
-				switch {
-				case aerr != nil:
-					log.Error("Cannot adopt an already imported batch", "head", current.Number, "block", last.NumberU64(), "err", aerr)
-				case !adopted:
-					log.Warn("Batch is already imported but does not beat the head", "head", current.Number, "batch", last.NumberU64())
-				default:
-					log.Debug("Adopted an already imported batch", "number", last.NumberU64(), "hash", last.Hash())
-					events = append(events, ChainHeadEvent{last})
-				}
-			}
+			events = append(events, bc.adoptKnownBatch(chain)...)
 			err = nil
 		}
 	}
@@ -2274,11 +2289,28 @@ func (bc *BlockChain) insertSideChain(block *types.Block, it *insertIterator) (i
 	// A block that failed verification or body validation is not one of those: report it
 	// right away, because rebuilding the prefix below and returning that result would
 	// report a partial import as a success - nothing after the failing block was even
-	// looked at. ErrUnknownAncestor and ErrKnownBlock are how a pruned segment ends
-	// normally (the next block cannot be linked yet, or it is already on disk with its
-	// state), so they are not failures and fall through to the reimport below.
+	// looked at. ErrUnknownAncestor is how a pruned segment ends normally (the next
+	// block cannot be linked yet), so it is not a failure and falls through to the
+	// reimport below.
 	if err != nil && !errors.Is(err, consensus.ErrUnknownAncestor) && !errors.Is(err, ErrKnownBlock) {
 		return it.index, nil, nil, err
+	}
+	// The scan stopped on a block that is already on disk with its state. Nothing after
+	// it was ever looked at, so the reimport below would report a partial import as a
+	// success just the same: it only rebuilds it.previous() and its ancestors, never the
+	// known block or the blocks that follow it.
+	//
+	// Adopt the rest of the batch when it is on disk too - it was imported, only the head
+	// did not follow - and report a local interruption when it is not. Missing blocks are
+	// this node's problem rather than the peer's, so this must not become an error the
+	// downloader turns into an errInvalidChain that drops the peer.
+	if errors.Is(err, ErrKnownBlock) {
+		for _, remaining := range it.chain[it.index:] {
+			if !bc.HasBlockAndFullState(remaining.Hash(), remaining.NumberU64()) {
+				return it.index, nil, nil, errInsertionInterrupted
+			}
+		}
+		return it.index, bc.adoptKnownBatch(it.chain), nil, nil
 	}
 	// If the externTd was larger than our local TD, we now need to reimport the previous
 	// blocks to regenerate the required state
