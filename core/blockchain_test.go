@@ -787,8 +787,15 @@ func TestInsertChainSucceedsWhenKnownBlocksAreOnDisk(t *testing.T) {
 	if n, err := chain.InsertChain(blocks[2:5]); err != nil {
 		t.Fatalf("block %d: batch that is fully on disk reported as failure: %v", n, err)
 	}
-	if want := uint64(2); chain.CurrentBlock().Number.Uint64() != want {
+	// The batch is on disk with its state and wins fork choice, so it is adopted instead
+	// of leaving the head behind: nothing else would move it.
+	if want := uint64(5); chain.CurrentBlock().Number.Uint64() != want {
 		t.Fatalf("unexpected head number: have %d want %d", chain.CurrentBlock().Number.Uint64(), want)
+	}
+	for i := 2; i < 5; i++ {
+		if block := chain.GetBlockByNumber(blocks[i].NumberU64()); block == nil || block.Hash() != blocks[i].Hash() {
+			t.Fatalf("block #%d is not canonical after the batch was adopted", blocks[i].NumberU64())
+		}
 	}
 	// The truncated batch must not leave the chain stuck: importing the following
 	// batch on top of the blocks that are already on disk has to work.
@@ -797,6 +804,32 @@ func TestInsertChainSucceedsWhenKnownBlocksAreOnDisk(t *testing.T) {
 	}
 	if want := uint64(7); chain.CurrentBlock().Number.Uint64() != want {
 		t.Fatalf("unexpected head number: have %d want %d", chain.CurrentBlock().Number.Uint64(), want)
+	}
+}
+
+// TestInsertChainAdoptsKnownBatchAheadOfHead covers the case the ErrKnownBlock
+// normalisation used to leave behind: every block of the batch is on disk with its state,
+// but the head sits below it, because the batch was imported and then rolled back. The
+// head is adopted here - the downloader cannot anchor its ancestor search above the local
+// head, so a head that stays behind makes every following sync fetch the same range again.
+func TestInsertChainAdoptsKnownBatchAheadOfHead(t *testing.T) {
+	chain, blocks := newInsertChainTester(t, nil, 5, 5)
+	rewindHeadMarkers(chain, blocks[2]) // head stops at #3, blocks #4..#5 stay on disk
+
+	n, err := chain.InsertChain(blocks[3:]) // #4 and #5 are known and ahead of the head
+	if err != nil {
+		t.Fatalf("block %d: batch that is fully on disk reported as failure: %v", n, err)
+	}
+	if want := uint64(5); chain.CurrentBlock().Number.Uint64() != want {
+		t.Fatalf("unexpected head number: have %d want %d", chain.CurrentBlock().Number.Uint64(), want)
+	}
+	if block := chain.GetBlockByNumber(5); block == nil || block.Hash() != blocks[4].Hash() {
+		t.Fatalf("block #5 is not canonical after the batch was adopted")
+	}
+	// Adopting must not touch the blocks themselves: they were executed when they were
+	// first imported, so their receipts and state are still the ones written back then.
+	if !chain.HasBlockAndFullState(blocks[4].Hash(), 5) {
+		t.Fatal("block #5 lost its state while being adopted")
 	}
 }
 

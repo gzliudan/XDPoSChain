@@ -1546,6 +1546,38 @@ func (bc *BlockChain) blockBeatsHead(block *types.Block, head *types.Header) boo
 	return block.NumberU64() > head.Number.Uint64()
 }
 
+// adoptKnownBlock makes block the canonical head without executing it again. It is meant
+// for batches the import loop stopped on because they were already known: those blocks are
+// on disk together with their state, so adopting one is a marker update, not a re-import.
+//
+// The decision goes through blockBeatsHead, the rule writeBlockWithState applies to
+// executed blocks, so a known block can never be adopted under a rule an executed one
+// would have lost. reorg leaves the new head to its caller, so the head write and the gap
+// block side effect are done here, exactly as writeBlockWithState does them.
+//
+// It reports false, nil when the block loses fork choice: that is not a failure, the batch
+// was simply imported on a branch that is not the canonical one.
+func (bc *BlockChain) adoptKnownBlock(block *types.Block, head *types.Header) (bool, error) {
+	if !bc.blockBeatsHead(block, head) {
+		return false, nil
+	}
+	if block.ParentHash() != head.Hash() {
+		if err := bc.reorg(head, block.Header()); err != nil {
+			return false, err
+		}
+	}
+	bc.writeHeadBlock(block, false)
+	if bc.isGapBlock(block) {
+		// Unlike the import paths, this is a recovery step: report the failure instead of
+		// crashing the node, the caller decides what to do with a half-adopted head.
+		if err := bc.UpdateM1(); err != nil {
+			return true, fmt.Errorf("failed to update masternodes for #%d [%x..]: %w",
+				block.NumberU64(), block.Hash().Bytes()[:4], err)
+		}
+	}
+	return true, nil
+}
+
 // notifyEpochSwitchBlock sends a checkpoint notification when block switches the
 // epoch, so that the consensus parameters and the masternode set are refreshed.
 // It is a no-op for non-XDPoS chains and for engines that are not XDPoS.
@@ -2048,9 +2080,10 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, []
 	//
 	// Note what this does *not* claim: the head may still sit below the batch. The
 	// normalisation only means "there is nothing left of this batch to import", not
-	// "the chain head was advanced to the end of the batch" - a later batch is what
-	// moves the head forward. Warn when the head is still behind, so that this
-	// otherwise silent state stays visible in the logs.
+	// "the chain head was advanced to the end of the batch". A head left below the batch
+	// is therefore adopted here when it wins fork choice: nothing else would move it, and
+	// the downloader cannot anchor its ancestor search above the local head, so leaving it
+	// behind makes every following sync fetch the same range again.
 	if errors.Is(err, ErrKnownBlock) {
 		onDisk := true
 		for _, remaining := range chain[it.index:] {
@@ -2060,8 +2093,18 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, []
 			}
 		}
 		if onDisk {
-			if head, last := bc.CurrentBlock().Number.Uint64(), chain[len(chain)-1].NumberU64(); head < last {
-				log.Warn("Batch is already imported but the chain head is still behind it", "head", head, "batch", last)
+			if current := bc.CurrentBlock(); current.Number.Uint64() < chain[len(chain)-1].NumberU64() {
+				last := chain[len(chain)-1]
+				adopted, aerr := bc.adoptKnownBlock(last, current)
+				switch {
+				case aerr != nil:
+					log.Error("Cannot adopt an already imported batch", "head", current.Number, "block", last.NumberU64(), "err", aerr)
+				case !adopted:
+					log.Warn("Batch is already imported but does not beat the head", "head", current.Number, "batch", last.NumberU64())
+				default:
+					log.Debug("Adopted an already imported batch", "number", last.NumberU64(), "hash", last.Hash())
+					events = append(events, ChainHeadEvent{last})
+				}
 			}
 			err = nil
 		}
