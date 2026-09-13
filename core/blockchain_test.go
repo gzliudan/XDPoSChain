@@ -890,6 +890,27 @@ func TestInsertChainReportsKnownBlockAheadOfHead(t *testing.T) {
 	}
 }
 
+// TestInsertReceiptChainReportsInterruption covers the interruption check of a receipt
+// batch. The blocks before the one that stopped the batch may already have been flushed
+// to disk, so reporting a nil error would claim the whole batch had been written - the
+// very thing an interrupted insertion must not claim. The sentinel is local, so the
+// downloader cancels the content processing instead of dropping the peer.
+func TestInsertReceiptChainReportsInterruption(t *testing.T) {
+	chain, blocks := newInsertChainTester(t, nil, 5, 5)
+	receipts := make([]types.Receipts, len(blocks))
+
+	chain.InterruptInsert(true)
+	defer chain.InterruptInsert(false)
+
+	n, err := chain.InsertReceiptChain(blocks, receipts)
+	if !errors.Is(err, ErrInsertionInterrupted) {
+		t.Fatalf("unexpected error: have %v want %v", err, ErrInsertionInterrupted)
+	}
+	if want := 0; n != want {
+		t.Fatalf("unexpected failing index: have %d want %d", n, want)
+	}
+}
+
 // interruptInsertEngine interrupts chain insertion while the body of the block at
 // interruptAt is validated. Body validation runs on the import goroutine itself,
 // so the interruption is visible deterministically at the loop head of that block,
