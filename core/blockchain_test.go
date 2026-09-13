@@ -518,6 +518,48 @@ func TestInsertChainWithoutTRC21Issuer(t *testing.T) {
 	}
 }
 
+// TestInsertChainAdvancesHeadOverKnownBlocks covers blocks that are already stored
+// with their state but sit above the head, which happens after a rollback or when
+// a side chain segment was executed without being adopted. They carry no work to
+// redo, but they still have to move the head instead of halting the import.
+func TestInsertChainAdvancesHeadOverKnownBlocks(t *testing.T) {
+	var (
+		key, _  = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
+		address = crypto.PubkeyToAddress(key.PublicKey)
+		funds   = big.NewInt(1000000000000000)
+		gspec   = &Genesis{
+			Alloc:   types.GenesisAlloc{address: {Balance: funds}},
+			BaseFee: big.NewInt(params.InitialBaseFee),
+			Config:  params.TestChainConfig,
+		}
+	)
+	db := rawdb.NewMemoryDatabase()
+	chain, err := NewBlockChain(db, nil, gspec, ethash.NewFaker(), vm.Config{})
+	if err != nil {
+		t.Fatalf("failed to create chain: %v", err)
+	}
+	defer chain.Stop()
+
+	_, blocks, _ := GenerateChainWithGenesis(gspec, ethash.NewFaker(), 10, nil)
+	if n, err := chain.InsertChain(blocks); err != nil {
+		t.Fatalf("failed to insert block %d: %v", n, err)
+	}
+
+	// Move the head back while leaving the blocks and their state on disk.
+	rollback := blocks[4]
+	chain.writeHeadBlock(rollback, false)
+	if have, want := chain.CurrentBlock().Number.Uint64(), rollback.NumberU64(); have != want {
+		t.Fatalf("unexpected head after rollback: have %d want %d", have, want)
+	}
+
+	if _, err := chain.InsertChain(blocks[5:]); err != nil {
+		t.Fatalf("failed to re-insert known blocks: %v", err)
+	}
+	if have, want := chain.CurrentBlock().Number.Uint64(), blocks[len(blocks)-1].NumberU64(); have != want {
+		t.Fatalf("head did not advance over known blocks: have %d want %d", have, want)
+	}
+}
+
 // TestBlockBeatsHead pins the fork-choice rule shared by writeBlockWithState and
 // the known-block paths: a block is adopted on a strictly higher total difficulty,
 // or on an equal one with a higher number. A taller chain carrying a lower total
@@ -614,6 +656,42 @@ func TestIsGapBlock(t *testing.T) {
 	// Chains without XDPoS have no gap blocks at all.
 	if (&BlockChain{chainConfig: &params.ChainConfig{}}).isGapBlock(block(450)) {
 		t.Fatalf("a chain without XDPoS must not have gap blocks")
+	}
+}
+
+// TestWriteKnownBlockReorgsToKnownFork covers the reorg branch of writeKnownBlock:
+// a known block that sits above the head but not on it must reorganise the chain
+// instead of being silently ignored.
+func TestWriteKnownBlockReorgsToKnownFork(t *testing.T) {
+	genDb, _, blockchain, err := newCanonical(ethash.NewFaker(), 0, true)
+	if err != nil {
+		t.Fatalf("failed to create pristine chain: %v", err)
+	}
+	defer blockchain.Stop()
+
+	canonical := makeBlockChain(blockchain.chainConfig, blockchain.Genesis(), 10, ethash.NewFaker(), genDb, 10)
+	if _, err := blockchain.InsertChain(canonical); err != nil {
+		t.Fatalf("failed to insert canonical chain: %v", err)
+	}
+	// The fork shares genesis, so it is stored as a side chain together with its
+	// state and its blocks stay known from here on.
+	fork := makeBlockChain(blockchain.chainConfig, blockchain.Genesis(), 10, ethash.NewFaker(), genDb, 20)
+	if _, err := blockchain.InsertChain(fork); err != nil {
+		t.Fatalf("failed to insert the fork: %v", err)
+	}
+	if head := blockchain.CurrentBlock(); head.Hash() != canonical[len(canonical)-1].Hash() {
+		t.Fatalf("head moved onto the fork, want it kept as a side chain: have %x, want %x", head.Hash(), canonical[len(canonical)-1].Hash())
+	}
+	// Roll the head below the fork point so the first re-imported known block does
+	// not sit on the head and writeKnownBlock has to reorganise.
+	blockchain.writeHeadBlock(canonical[2], false)
+	if _, err := blockchain.InsertChain(fork[3:]); err != nil {
+		t.Fatalf("failed to re-insert known fork blocks: %v", err)
+	}
+	head, want := blockchain.CurrentBlock(), fork[len(fork)-1]
+	if head.Hash() != want.Hash() {
+		t.Fatalf("head did not reorg onto the known fork: have %d (%x), want %d (%x)",
+			head.Number.Uint64(), head.Hash(), want.NumberU64(), want.Hash())
 	}
 }
 
@@ -1555,6 +1633,344 @@ func TestReorgLeavesNewHeadToCaller(t *testing.T) {
 	// the old chain is cleared, and the head is not written here.
 	if have := rawdb.ReadCanonicalHash(blockchain.db, newHead.NumberU64()); have != (common.Hash{}) {
 		t.Fatalf("reorg left a canonical marker at %d (%x), the caller must write it", newHead.NumberU64(), have)
+	}
+}
+
+// TestWriteKnownBlockLogDelivery covers the logs of known blocks that are adopted
+// without re-execution. A block that was not canonical yet has never had its logs
+// delivered, so promoting it must send them; a rollback re-import is the opposite
+// and must not deliver them a second time.
+func TestWriteKnownBlockLogDelivery(t *testing.T) {
+	var (
+		key, _  = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
+		address = crypto.PubkeyToAddress(key.PublicKey)
+		// emitter is a genesis contract whose runtime code emits one anonymous log:
+		// PUSH1 0x00, PUSH1 0x00, LOG0, STOP.
+		emitter = common.HexToAddress("0x0000000000000000000000000000000000000010")
+		gspec   = &Genesis{
+			Config: &params.ChainConfig{
+				ChainID:        big.NewInt(1338),
+				HomesteadBlock: new(big.Int),
+				Ethash:         new(params.EthashConfig),
+			},
+			Alloc: types.GenesisAlloc{
+				address: {Balance: big.NewInt(params.Ether)},
+				emitter: {Code: []byte{0x60, 0x00, 0x60, 0x00, 0xa0, 0x00}},
+			},
+			Difficulty: big.NewInt(1),
+		}
+	)
+	engine := ethash.NewFaker()
+	genDb := rawdb.NewMemoryDatabase()
+	if _, err := gspec.Commit(genDb); err != nil {
+		t.Fatalf("failed to commit genesis: %v", err)
+	}
+	blockchain, err := NewBlockChain(rawdb.NewMemoryDatabase(), nil, gspec, engine, vm.Config{})
+	if err != nil {
+		t.Fatalf("failed to create chain: %v", err)
+	}
+	defer blockchain.Stop()
+
+	// The canonical chain carries no transactions at all, so any log delivered below
+	// can only come from the fork.
+	canonical := makeBlockChain(blockchain.chainConfig, blockchain.Genesis(), 10, engine, genDb, 0x01)
+	fork, _ := GenerateChain(blockchain.chainConfig, blockchain.Genesis(), engine, genDb, 10, func(i int, b *BlockGen) {
+		b.SetCoinbase(common.Address{0: 0x02, 19: byte(i)})
+		if i == 9 {
+			tx, err := types.SignTx(types.NewTransaction(0, emitter, big.NewInt(0), 100000, big.NewInt(1), nil), types.HomesteadSigner{}, key)
+			if err != nil {
+				t.Fatalf("failed to sign log transaction: %v", err)
+			}
+			b.AddTx(tx)
+		}
+	})
+
+	logsCh := make(chan []*types.Log, 64)
+	sub := blockchain.SubscribeLogsEvent(logsCh)
+	defer sub.Unsubscribe()
+	drain := func() []*types.Log {
+		var got []*types.Log
+		for {
+			select {
+			case batch := <-logsCh:
+				got = append(got, batch...)
+			default:
+				return got
+			}
+		}
+	}
+
+	if _, err := blockchain.InsertChain(canonical); err != nil {
+		t.Fatalf("failed to insert canonical chain: %v", err)
+	}
+	if _, err := blockchain.InsertChain(fork); err != nil {
+		t.Fatalf("failed to insert the fork: %v", err)
+	}
+	if head := blockchain.CurrentBlock(); head.Hash() != canonical[len(canonical)-1].Hash() {
+		t.Fatalf("head moved onto the fork, want it kept as a side chain: have %x, want %x", head.Hash(), canonical[len(canonical)-1].Hash())
+	}
+	// A side chain block is executed but not adopted, so its logs stay unsent.
+	if got := drain(); len(got) != 0 {
+		t.Fatalf("side chain delivered %d log(s), want none", len(got))
+	}
+
+	// Roll the head below the fork point so the fork is adopted through the
+	// known-block path, where its logs have to be delivered.
+	blockchain.writeHeadBlock(canonical[2], false)
+	if _, err := blockchain.InsertChain(fork[3:]); err != nil {
+		t.Fatalf("failed to re-insert known fork blocks: %v", err)
+	}
+	if head, want := blockchain.CurrentBlock(), fork[len(fork)-1]; head.Hash() != want.Hash() {
+		t.Fatalf("head did not adopt the known fork: have %d (%x), want %d (%x)",
+			head.Number.Uint64(), head.Hash(), want.NumberU64(), want.Hash())
+	}
+	logs := drain()
+	if len(logs) != 1 {
+		t.Fatalf("promoted known block delivered %d log(s), want 1", len(logs))
+	}
+	if logs[0].BlockNumber != fork[len(fork)-1].NumberU64() || logs[0].Removed {
+		t.Fatalf("unexpected log %+v, want a live log of block %d", logs[0], fork[len(fork)-1].NumberU64())
+	}
+
+	// Re-importing blocks that were canonical already must not repeat their logs:
+	// those were delivered when the blocks were first imported.
+	blockchain.writeHeadBlock(fork[4], false)
+	if _, err := blockchain.InsertChain(fork[5:]); err != nil {
+		t.Fatalf("failed to re-import rolled back blocks: %v", err)
+	}
+	if got := drain(); len(got) != 0 {
+		t.Fatalf("rollback re-import re-delivered %d log(s), want none", len(got))
+	}
+}
+
+// TestWriteKnownBlockReorgSkipsRebirthLogs covers the non-adjacent rollback: the
+// head is rewound several blocks below a known block, so adopting it reorgs the
+// retained rollback blocks back in. Rollback keeps their canonical mappings and
+// emits no removed logs, so their logs were delivered and must not be sent again;
+// only blocks promoted to the canonical chain for the first time may emit here.
+func TestWriteKnownBlockReorgSkipsRebirthLogs(t *testing.T) {
+	var (
+		key, _  = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
+		address = crypto.PubkeyToAddress(key.PublicKey)
+		// emitter is a genesis contract whose runtime code emits one anonymous log:
+		// PUSH1 0x00, PUSH1 0x00, LOG0, STOP.
+		emitter = common.HexToAddress("0x0000000000000000000000000000000000000010")
+		gspec   = &Genesis{
+			Config: &params.ChainConfig{
+				ChainID:        big.NewInt(1338),
+				HomesteadBlock: new(big.Int),
+				Ethash:         new(params.EthashConfig),
+			},
+			Alloc: types.GenesisAlloc{
+				address: {Balance: big.NewInt(params.Ether)},
+				emitter: {Code: []byte{0x60, 0x00, 0x60, 0x00, 0xa0, 0x00}},
+			},
+			Difficulty: big.NewInt(1),
+		}
+	)
+	engine := ethash.NewFaker()
+	genDb := rawdb.NewMemoryDatabase()
+	if _, err := gspec.Commit(genDb); err != nil {
+		t.Fatalf("failed to commit genesis: %v", err)
+	}
+	blockchain, err := NewBlockChain(rawdb.NewMemoryDatabase(), nil, gspec, engine, vm.Config{})
+	if err != nil {
+		t.Fatalf("failed to create chain: %v", err)
+	}
+	defer blockchain.Stop()
+
+	// The canonical chain carries no transactions, and the fork emits its only
+	// log from a block strictly between the rollback point and the re-imported
+	// one, so a duplicated delivery can only come from that block being reorged
+	// back in as a retained intermediate.
+	canonical := makeBlockChain(blockchain.chainConfig, blockchain.Genesis(), 10, engine, genDb, 0x01)
+	fork, _ := GenerateChain(blockchain.chainConfig, blockchain.Genesis(), engine, genDb, 10, func(i int, b *BlockGen) {
+		b.SetCoinbase(common.Address{0: 0x02, 19: byte(i)})
+		if i == 5 {
+			tx, err := types.SignTx(types.NewTransaction(0, emitter, big.NewInt(0), 100000, big.NewInt(1), nil), types.HomesteadSigner{}, key)
+			if err != nil {
+				t.Fatalf("failed to sign log transaction: %v", err)
+			}
+			b.AddTx(tx)
+		}
+	})
+
+	logsCh := make(chan []*types.Log, 64)
+	sub := blockchain.SubscribeLogsEvent(logsCh)
+	defer sub.Unsubscribe()
+	drain := func() []*types.Log {
+		var got []*types.Log
+		for {
+			select {
+			case batch := <-logsCh:
+				got = append(got, batch...)
+			default:
+				return got
+			}
+		}
+	}
+
+	if _, err := blockchain.InsertChain(canonical); err != nil {
+		t.Fatalf("failed to insert canonical chain: %v", err)
+	}
+	if _, err := blockchain.InsertChain(fork); err != nil {
+		t.Fatalf("failed to insert the fork: %v", err)
+	}
+	// Adopt the fork over the known-block path; the log block is promoted and
+	// its log goes out exactly once.
+	blockchain.writeHeadBlock(canonical[2], false)
+	if _, err := blockchain.InsertChain(fork[3:]); err != nil {
+		t.Fatalf("failed to adopt the fork over the known-block path: %v", err)
+	}
+	if head, want := blockchain.CurrentBlock(), fork[len(fork)-1]; head.Hash() != want.Hash() {
+		t.Fatalf("head did not adopt the known fork: have %d (%x), want %d (%x)",
+			head.Number.Uint64(), head.Hash(), want.NumberU64(), want.Hash())
+	}
+	logs := drain()
+	if len(logs) != 1 || logs[0].BlockNumber != fork[5].NumberU64() {
+		t.Fatalf("promoted fork delivered %+v, want the single log of block %d", logs, fork[5].NumberU64())
+	}
+
+	// Rewind the head below the log block. The canonical mappings of the
+	// blocks above stay in place, exactly like Rollback leaves them.
+	blockchain.writeHeadBlock(fork[4], false)
+	// Re-import a known block several numbers above the head. The reorg this
+	// triggers walks the retained blocks back in and must not repeat their
+	// logs.
+	if _, err := blockchain.InsertChain(fork[9:]); err != nil {
+		t.Fatalf("failed to re-import the known block above the rollback point: %v", err)
+	}
+	if head, want := blockchain.CurrentBlock(), fork[len(fork)-1]; head.Hash() != want.Hash() {
+		t.Fatalf("head did not advance to the known block: have %d (%x), want %d (%x)",
+			head.Number.Uint64(), head.Hash(), want.NumberU64(), want.Hash())
+	}
+	got := drain()
+	if len(got) != 0 {
+		t.Fatalf("reorg over retained rollback blocks re-delivered %d log(s), want none", len(got))
+	}
+}
+
+// TestWriteKnownBlockChainEvents pins that adopting a known block reaches the
+// chain feed. Such a block moves the head, and the subscribers that follow the
+// head, eth_subscribe("newHeads") among them, learn about it through ChainEvent
+// alone, so skipping the event left them stuck until an executed block arrived.
+// The event carries the logs of a block promoted for the first time and none for
+// a rollback re-import, whose logs were already delivered.
+func TestWriteKnownBlockChainEvents(t *testing.T) {
+	var (
+		key, _  = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
+		address = crypto.PubkeyToAddress(key.PublicKey)
+		// emitter is a genesis contract whose runtime code emits one anonymous log:
+		// PUSH1 0x00, PUSH1 0x00, LOG0, STOP.
+		emitter = common.HexToAddress("0x0000000000000000000000000000000000000010")
+		gspec   = &Genesis{
+			Config: &params.ChainConfig{
+				ChainID:        big.NewInt(1338),
+				HomesteadBlock: new(big.Int),
+				Ethash:         new(params.EthashConfig),
+			},
+			Alloc: types.GenesisAlloc{
+				address: {Balance: big.NewInt(params.Ether)},
+				emitter: {Code: []byte{0x60, 0x00, 0x60, 0x00, 0xa0, 0x00}},
+			},
+			Difficulty: big.NewInt(1),
+		}
+	)
+	engine := ethash.NewFaker()
+	genDb := rawdb.NewMemoryDatabase()
+	if _, err := gspec.Commit(genDb); err != nil {
+		t.Fatalf("failed to commit genesis: %v", err)
+	}
+	blockchain, err := NewBlockChain(rawdb.NewMemoryDatabase(), nil, gspec, engine, vm.Config{})
+	if err != nil {
+		t.Fatalf("failed to create chain: %v", err)
+	}
+	defer blockchain.Stop()
+
+	// Only the tip of the fork emits a log, so the event of that block and no
+	// other can be told apart by its logs.
+	canonical := makeBlockChain(blockchain.chainConfig, blockchain.Genesis(), 10, engine, genDb, 0x01)
+	fork, _ := GenerateChain(blockchain.chainConfig, blockchain.Genesis(), engine, genDb, 10, func(i int, b *BlockGen) {
+		b.SetCoinbase(common.Address{0: 0x02, 19: byte(i)})
+		if i == 9 {
+			tx, err := types.SignTx(types.NewTransaction(0, emitter, big.NewInt(0), 100000, big.NewInt(1), nil), types.HomesteadSigner{}, key)
+			if err != nil {
+				t.Fatalf("failed to sign log transaction: %v", err)
+			}
+			b.AddTx(tx)
+		}
+	})
+
+	chainCh := make(chan ChainEvent, 64)
+	sub := blockchain.SubscribeChainEvent(chainCh)
+	defer sub.Unsubscribe()
+	drain := func() []ChainEvent {
+		var got []ChainEvent
+		for {
+			select {
+			case ev := <-chainCh:
+				got = append(got, ev)
+			default:
+				return got
+			}
+		}
+	}
+
+	if _, err := blockchain.InsertChain(canonical); err != nil {
+		t.Fatalf("failed to insert canonical chain: %v", err)
+	}
+	if _, err := blockchain.InsertChain(fork); err != nil {
+		t.Fatalf("failed to insert the fork: %v", err)
+	}
+	// Executed blocks are the baseline the known-block path has to match: one
+	// event per canonical block, and a side chain that was not adopted sends
+	// none of them.
+	if events := drain(); len(events) != len(canonical) {
+		t.Fatalf("canonical import delivered %d chain event(s), want %d", len(events), len(canonical))
+	}
+	// Roll the head below the fork point so the fork is adopted through the
+	// known-block path, which has to announce every block it moves the head over.
+	blockchain.writeHeadBlock(canonical[2], false)
+	if _, err := blockchain.InsertChain(fork[3:]); err != nil {
+		t.Fatalf("failed to re-insert known fork blocks: %v", err)
+	}
+	events := drain()
+	if len(events) != len(fork)-3 {
+		t.Fatalf("promoted known blocks delivered %d chain event(s), want %d", len(events), len(fork)-3)
+	}
+	for i, ev := range events {
+		want := fork[i+3]
+		if ev.Block.Hash() != want.Hash() || ev.Hash != want.Hash() {
+			t.Fatalf("chain event %d is for %x, want %x", i, ev.Block.Hash(), want.Hash())
+		}
+		// The tip is promoted for the first time and carries the log of its
+		// transaction; the blocks below it were executed without any.
+		wantLogs := 0
+		if i == len(events)-1 {
+			wantLogs = 1
+		}
+		if len(ev.Logs) != wantLogs {
+			t.Fatalf("chain event %d carries %d log(s), want %d", i, len(ev.Logs), wantLogs)
+		}
+	}
+
+	// Re-importing blocks that were canonical already announces them again, since
+	// the head moves over them, but must not repeat their logs.
+	blockchain.writeHeadBlock(fork[4], false)
+	if _, err := blockchain.InsertChain(fork[5:]); err != nil {
+		t.Fatalf("failed to re-import rolled back blocks: %v", err)
+	}
+	events = drain()
+	if len(events) != len(fork)-5 {
+		t.Fatalf("rollback re-import delivered %d chain event(s), want %d", len(events), len(fork)-5)
+	}
+	for i, ev := range events {
+		if want := fork[i+5]; ev.Block.Hash() != want.Hash() {
+			t.Fatalf("chain event %d is for %x, want %x", i, ev.Block.Hash(), want.Hash())
+		}
+		if len(ev.Logs) != 0 {
+			t.Fatalf("rollback re-import re-delivered %d log(s) of block %d, want none", len(ev.Logs), ev.Block.NumberU64())
+		}
 	}
 }
 

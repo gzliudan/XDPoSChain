@@ -1563,6 +1563,34 @@ func (bc *BlockChain) cacheSigningTxs(block *types.Block) {
 	engine.CacheSigningTxs(block.Header().Hash(), block.Transactions())
 }
 
+// writeKnownBlock makes an already stored and executed block the chain head,
+// reorganising the chain if it does not sit on top of the current head.
+func (bc *BlockChain) writeKnownBlock(block *types.Block) error {
+	current := bc.CurrentBlock()
+	if block.ParentHash() != current.Hash() {
+		if err := bc.reorg(current, block.Header()); err != nil {
+			return err
+		}
+	}
+	// WriteBlock has already been called for a known block, no need to write again
+	bc.writeHeadBlock(block, false)
+	// Mirror the head side effects of the canonical import path: insertChain calls
+	// UpdateBlocksHashCache and writeBlockWithState populates the signing-tx cache.
+	bc.UpdateBlocksHashCache(block)
+	bc.cacheSigningTxs(block)
+	// A gap block reaching the head must refresh the masternode set, otherwise its
+	// snapshot is never written. The head is already persisted at this point, so a
+	// failure here cannot be rolled back and must halt the node.
+	if bc.isGapBlock(block) {
+		if err := bc.UpdateM1(); err != nil {
+			log.Crit("Fail to update masternodes during writeKnownBlock", "number", block.Number, "hash", block.Hash().Hex(), "err", err)
+		}
+	}
+	bc.notifyEpochSwitchBlock(block)
+	bc.futureBlocks.Remove(block.Hash())
+	return nil
+}
+
 // writeBlockWithState writes the block and all associated state to the database,
 // but is expects the chain mutex to be held.
 func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.Receipt, state *state.StateDB, tradingState *tradingstate.TradingStateDB, lendingState *lendingstate.LendingStateDB) (status WriteStatus, err error) {
@@ -1887,10 +1915,9 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, []
 	//   2. The block is stored as a sidechain, and is lying about it's stateroot, and passes a stateroot
 	// 	    from the canonical chain, which has not been verified.
 	case errors.Is(err, ErrKnownBlock):
-		// Skip all known blocks that behind us
-		current := bc.CurrentBlock().Number.Uint64()
-
-		for block != nil && errors.Is(err, ErrKnownBlock) && current >= block.NumberU64() {
+		// Skip all known blocks that the chain would not adopt anyway, comparing
+		// each of them against the current head.
+		for block != nil && errors.Is(err, ErrKnownBlock) && !bc.blockBeatsHead(block, bc.CurrentBlock()) {
 			stats.ignored++
 			block, err = it.next()
 		}
@@ -1903,7 +1930,7 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, []
 	}
 
 	// No validation errors for the first block (or chain prefix skipped)
-	for ; block != nil && err == nil; block, err = it.next() {
+	for ; block != nil && (err == nil || errors.Is(err, ErrKnownBlock)); block, err = it.next() {
 		// If the chain is terminating, stop processing blocks
 		if bc.insertStopped() {
 			log.Debug("Premature abort during blocks processing")
@@ -1913,6 +1940,37 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, []
 		if BadHashes[block.Hash()] {
 			bc.reportBlock(block, nil, ErrDenylistedHash)
 			return it.index, events, coalescedLogs, ErrDenylistedHash
+		}
+		// The block and its state are already stored, so re-executing it would only
+		// reproduce what is on disk. It still has to become the head, but only if it
+		// wins the same fork choice an executed block would.
+		if errors.Is(err, ErrKnownBlock) {
+			if !bc.blockBeatsHead(block, bc.CurrentBlock()) {
+				stats.ignored++
+				continue
+			}
+			// A block that is not canonical yet is adopted for the first time here,
+			// so its logs were never delivered. A rollback re-import is the opposite:
+			// the block was canonical before, its logs already went out, and sending
+			// them again would duplicate them. The marker must be read before
+			// writeKnownBlock, which may rewrite it while reorganising.
+			promoted := bc.GetCanonicalHash(block.NumberU64()) != block.Hash()
+			log.Debug("Writing previously known block", "number", block.Number(), "hash", block.Hash())
+			if err := bc.writeKnownBlock(block); err != nil {
+				return it.index, events, coalescedLogs, err
+			}
+			// The head has advanced, so consumers of chain events must be notified
+			// even for an adopted known block. Its logs are only delivered on the
+			// first adoption (promoted); a rollback re-import already sent them.
+			var logs []*types.Log
+			if promoted {
+				logs = bc.collectLogs(block, false)
+				coalescedLogs = append(coalescedLogs, logs...)
+			}
+			events = append(events, ChainEvent{block, block.Hash(), logs})
+			stats.processed++
+			lastCanon = block
+			continue
 		}
 		// Retrieve the parent block and it's state to execute on top
 		start := time.Now()
@@ -2628,13 +2686,21 @@ func (bc *BlockChain) reorg(oldHead, newHead *types.Header) error {
 		for _, tx := range block.Transactions() {
 			rebirthTxs = append(rebirthTxs, tx.Hash())
 		}
-		// Collect inserted logs and emit them
-		if logs := bc.collectLogs(block, false); len(logs) > 0 {
-			rebirthLogs = append(rebirthLogs, logs...)
-		}
-		if len(rebirthLogs) > 512 {
-			bc.logsFeed.Send(rebirthLogs)
-			rebirthLogs = nil
+		// Collect inserted logs and emit them, but only for blocks that are
+		// promoted to the canonical chain for the first time. A rollback only
+		// rewinds the head markers and leaves the canonical mappings of the
+		// blocks it rewinds over in place, so re-importing a known block
+		// across them lands here with those retained blocks as intermediates.
+		// Their logs were delivered before the rollback, and sending them
+		// again would duplicate them.
+		if bc.GetCanonicalHash(block.NumberU64()) != block.Hash() {
+			if logs := bc.collectLogs(block, false); len(logs) > 0 {
+				rebirthLogs = append(rebirthLogs, logs...)
+			}
+			if len(rebirthLogs) > 512 {
+				bc.logsFeed.Send(rebirthLogs)
+				rebirthLogs = nil
+			}
 		}
 		// Update the head block
 		bc.writeHeadBlock(block, true)
