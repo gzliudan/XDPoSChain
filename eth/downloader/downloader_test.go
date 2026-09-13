@@ -76,6 +76,10 @@ type downloadTester struct {
 
 	insertHeaderChainHook func([]*types.Header) error
 
+	// insertChainHook, when non-nil, makes InsertChain fail with the returned error
+	// before touching the simulated chain.
+	insertChainHook func(types.Blocks) error
+
 	// headHeaderCap, when non-zero, caps the height reported by CurrentHeader.
 	// It models the real chain, where importing blocks moves the header head
 	// back to the block being inserted. It must be set below the length of the
@@ -305,6 +309,11 @@ func (dl *downloadTester) InsertHeaderChain(headers []*types.Header, checkFreq i
 func (dl *downloadTester) InsertChain(blocks types.Blocks) (i int, err error) {
 	dl.lock.Lock()
 	defer dl.lock.Unlock()
+	if dl.insertChainHook != nil {
+		if err := dl.insertChainHook(blocks); err != nil {
+			return 0, err
+		}
+	}
 
 	for i, block := range blocks {
 		if parent, ok := dl.ownBlocks[block.ParentHash()]; !ok {
@@ -1925,6 +1934,60 @@ func TestSyncBatchAncestorErrDropPeer(t *testing.T) {
 				t.Fatalf("peer should be dropped on invalid chain")
 			}
 		})
+	}
+}
+
+// TestImportBlockResultsKeepsPeerOnInterruption guards the local-interruption path of
+// importBlockResults: an insertion that was cut short by InterruptInsert is local, so it
+// says nothing about the peer that served the blocks, and it must not be turned into
+// errInvalidChain - which is the error class Synchronise drops the peer for.
+func TestImportBlockResultsKeepsPeerOnInterruption(t *testing.T) {
+	tester := newTester()
+	defer tester.terminate()
+
+	block := testChainBase.shorten(2).headBlock()
+	tester.insertChainHook = func(types.Blocks) error { return core.ErrInsertionInterrupted }
+
+	err := tester.downloader.importBlockResults([]*fetchResult{{
+		Header:       block.Header(),
+		Uncles:       block.Uncles(),
+		Transactions: block.Transactions(),
+	}})
+	if err == nil {
+		t.Fatal("expected the interruption to be reported")
+	}
+	if errors.Is(err, errInvalidChain) {
+		t.Fatalf("a locally interrupted insertion must not be an invalid chain: %v", err)
+	}
+	if !errors.Is(err, errCancelContentProcessing) {
+		t.Fatalf("unexpected error: have %v want %v", err, errCancelContentProcessing)
+	}
+}
+
+// TestImportBlockResultsKeepsPeerOnStoppedChain covers the other local condition
+// InsertChain can report: the chain is stopping, so the chain lock is held and the
+// batch was never even looked at. That is just as local as an interruption, so the
+// peer must be kept here too instead of being dropped through errInvalidChain.
+func TestImportBlockResultsKeepsPeerOnStoppedChain(t *testing.T) {
+	tester := newTester()
+	defer tester.terminate()
+
+	block := testChainBase.shorten(2).headBlock()
+	tester.insertChainHook = func(types.Blocks) error { return core.ErrChainStopped }
+
+	err := tester.downloader.importBlockResults([]*fetchResult{{
+		Header:       block.Header(),
+		Uncles:       block.Uncles(),
+		Transactions: block.Transactions(),
+	}})
+	if err == nil {
+		t.Fatal("expected the stopped chain to be reported")
+	}
+	if errors.Is(err, errInvalidChain) {
+		t.Fatalf("a locally stopped insertion must not be an invalid chain: %v", err)
+	}
+	if !errors.Is(err, errCancelContentProcessing) {
+		t.Fatalf("unexpected error: have %v want %v", err, errCancelContentProcessing)
 	}
 }
 

@@ -89,10 +89,29 @@ var (
 	blockPrefetchExecuteTimer   = metrics.NewRegisteredTimer("chain/prefetch/executes", nil)
 	blockPrefetchInterruptMeter = metrics.NewRegisteredMeter("chain/prefetch/interrupts", nil)
 
-	errInsertionInterrupted = errors.New("insertion is interrupted")
-	errChainStopped         = errors.New("blockchain is stopped")
-	errInvalidOldChain      = errors.New("invalid old chain")
-	errInvalidNewChain      = errors.New("invalid new chain")
+	// ErrInsertionInterrupted is returned by the chain insertion methods when the chain
+	// is terminating or an import was cut short by InterruptInsert. It carries no
+	// information about the validity of the blocks, so callers must not treat it as a
+	// consensus failure - the downloader, for instance, must not drop the peer that
+	// served them because of it.
+	ErrInsertionInterrupted = errors.New("insertion is interrupted")
+
+	// errInsertionInterrupted is the internal alias of the exported sentinel. Both names
+	// refer to the same error value, so errors.Is matches either of them.
+	errInsertionInterrupted = ErrInsertionInterrupted
+
+	// ErrChainStopped is returned by the insertion methods when the chain is stopping, or
+	// when another insertion already holds the chain lock. Like ErrInsertionInterrupted it
+	// carries no information about the blocks themselves, so callers must not treat it as a
+	// consensus failure - the downloader, for instance, must not drop the peer that served
+	// them because of it.
+	ErrChainStopped = errors.New("blockchain is stopped")
+
+	// errChainStopped is the internal alias of the exported sentinel. Both names refer to
+	// the same error value, so errors.Is matches either of them.
+	errChainStopped    = ErrChainStopped
+	errInvalidOldChain = errors.New("invalid old chain")
+	errInvalidNewChain = errors.New("invalid new chain")
 
 	CheckpointCh = make(chan int)
 )
@@ -1782,6 +1801,16 @@ func (bc *BlockChain) addFutureBlock(block *types.Block) error {
 	return nil
 }
 
+// IsLocalInsertError reports whether an insertion failed for a reason that lives in this
+// node rather than in the blocks: the chain is stopping, another insertion holds the chain
+// lock, or the insertion was cut short by InterruptInsert. Callers that penalise peers on
+// insertion failures - the downloader turns an unknown error into errInvalidChain, which
+// drops the peer that served the batch - must exempt these, since none of them says
+// anything about the validity of the blocks.
+func IsLocalInsertError(err error) bool {
+	return errors.Is(err, ErrInsertionInterrupted) || errors.Is(err, ErrChainStopped)
+}
+
 // InsertChain attempts to insert the given batch of blocks in to the canonical
 // chain or, otherwise, create a fork. If an error is returned it will return
 // the index number of the failing block as well an error describing what went
@@ -1832,7 +1861,10 @@ func (bc *BlockChain) InsertChain(chain types.Blocks) (int, error) {
 func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, []interface{}, []*types.Log, error) {
 	// If the chain is terminating, don't even bother starting up.
 	if bc.insertStopped() {
-		return 0, nil, nil, nil
+		// Report the interruption rather than a success: nothing was imported, and the
+		// caller would otherwise believe the whole batch was. The downloader recognises
+		// this sentinel and does not blame (or drop) the peer that served the blocks.
+		return 0, nil, nil, errInsertionInterrupted
 	}
 
 	// Start a parallel signature recovery (signer will fluke on fork transition, minimal perf loss)
@@ -1894,7 +1926,10 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, []
 			stats.ignored++
 			block, err = it.next()
 		}
-		// Falls through to the block import
+		// Blocks ahead of the head are not skipped, they fall through to the import
+		// loop below. That loop only runs while err == nil though, so such a block
+		// is reported back to the caller instead (see the ErrKnownBlock handling at
+		// the end of this function).
 
 	// Some other error occurred, abort
 	case err != nil:
@@ -1907,6 +1942,12 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, []
 		// If the chain is terminating, stop processing blocks
 		if bc.insertStopped() {
 			log.Debug("Premature abort during blocks processing")
+			// Report the interruption instead of leaving err nil: InterruptInsert
+			// documents that insertion methods return errInsertionInterrupted, and
+			// the caller would otherwise believe the remaining blocks were imported.
+			// This matches what writeBlockWithState and getResultBlock report when
+			// they notice the interruption while processing a block.
+			err = errInsertionInterrupted
 			break
 		}
 		// If the header is a banned one, straight out abort
@@ -2000,7 +2041,39 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, []
 		log.Debug("New ChainHeadEvent ", "number", lastCanon.NumberU64(), "hash", lastCanon.Hash())
 		events = append(events, ChainHeadEvent{lastCanon})
 	}
-	return it.index, events, coalescedLogs, nil
+	// The import loop stops as soon as it meets a block that is already on disk.
+	// Treat that as a success so the caller does not mistake an already imported batch
+	// for an invalid chain (the downloader drops the peer that served it in that case),
+	// but only if the whole rest of the batch is on disk as well.
+	//
+	// Note what this does *not* claim: the head may still sit below the batch. The
+	// normalisation only means "there is nothing left of this batch to import", not
+	// "the chain head was advanced to the end of the batch" - a later batch is what
+	// moves the head forward. Warn when the head is still behind, so that this
+	// otherwise silent state stays visible in the logs.
+	if errors.Is(err, ErrKnownBlock) {
+		onDisk := true
+		for _, remaining := range chain[it.index:] {
+			if !bc.HasBlockAndFullState(remaining.Hash(), remaining.NumberU64()) {
+				onDisk = false
+				break
+			}
+		}
+		if onDisk {
+			if head, last := bc.CurrentBlock().Number.Uint64(), chain[len(chain)-1].NumberU64(); head < last {
+				log.Warn("Batch is already imported but the chain head is still behind it", "head", head, "batch", last)
+			}
+			err = nil
+		}
+	}
+	// Surface what stopped the batch before the caller turns it into a peer drop:
+	// the downloader only logs this at debug level, which used to leave no usable
+	// trace of why a batch was not imported.
+	if err != nil && block != nil && !errors.Is(err, errInsertionInterrupted) {
+		log.Warn("Blockchain import aborted", "number", block.Number(), "hash", block.Hash(),
+			"index", it.index, "batch", len(chain), "err", err)
+	}
+	return it.index, events, coalescedLogs, err
 }
 
 // blockProcessingResult is a summary of block processing
@@ -2188,6 +2261,9 @@ func (bc *BlockChain) insertSideChain(block *types.Block, it *insertIterator) (i
 		// memory here.
 		if len(blocks) >= 2048 || memory > 64*1024*1024 {
 			log.Info("Importing heavy sidechain segment", "blocks", len(blocks), "start", blocks[0].NumberU64(), "end", block.NumberU64())
+			// insertChain also reports a block that fails verification or body
+			// validation in the middle of the segment: abort the sidechain import
+			// instead of continuing with a state that can only be rebuilt partially.
 			if _, _, _, err := bc.insertChain(blocks, false); err != nil {
 				return 0, nil, nil, err
 			}
@@ -2196,12 +2272,16 @@ func (bc *BlockChain) insertSideChain(block *types.Block, it *insertIterator) (i
 			// If the chain is terminating, stop processing blocks
 			if bc.insertStopped() {
 				log.Debug("Abort during blocks processing")
-				return 0, nil, nil, nil
+				// Report the interruption instead of a success, see the entry guard of
+				// insertChain: the rest of the segment was not imported.
+				return 0, nil, nil, errInsertionInterrupted
 			}
 		}
 	}
 	if len(blocks) > 0 {
 		log.Info("Importing sidechain segment", "start", blocks[0].NumberU64(), "end", blocks[len(blocks)-1].NumberU64())
+		// The error of a partially imported segment is propagated as well, see the
+		// comment on the heavy segment import above.
 		return bc.insertChain(blocks, false)
 	}
 	return 0, nil, nil, nil
@@ -2233,6 +2313,10 @@ func (bc *BlockChain) PrepareBlock(block *types.Block) (err error) {
 		bc.resultProcess.Add(block.Hash(), result)
 		return nil
 	case ErrKnownBlock:
+		// Benign: the block (and its state) is already on disk, so there is nothing to
+		// prepare. Note that getResultBlock also returns this sentinel when the re-import
+		// of pruned blocks stopped on an already known block, so this branch can hide a
+		// partially applied winner import; insertBlock does not swallow it.
 		return nil
 	case ErrStopPreparingBlock:
 		log.Debug("Stop prepare a block because calculating", "number", block.NumberU64(), "hash", block.Hash(), "validator", block.Header().Validator)
@@ -2307,6 +2391,14 @@ func (bc *BlockChain) getResultBlock(block *types.Block, verifiedM2 bool) (*Resu
 		log.Debug("Number block need calculated again", "number", block.NumberU64(), "hash", block.Hash().Hex(), "winners", len(winner))
 		// Import all the pruned blocks to make the state available
 		// During reorg, we use verifySeals=false
+		// insertChain reports blocks failing in the middle of the segment as well, and
+		// the block cannot be calculated on a torn state, so the error is propagated.
+		// It is returned unwrapped so that the callers see the original sentinel:
+		// insertBlock hands it to its own caller as-is, while PrepareBlock maps a bare
+		// ErrKnownBlock to the benign "already imported" case (and does the same for
+		// ErrStopPreparingBlock). An unwrapped ErrKnownBlock therefore does not fail the
+		// prepare, which is why a partially applied winner import can stay invisible
+		// there; every other error does surface as a prepare failure.
 		_, _, _, err := bc.insertChain(winner, false)
 		if err != nil {
 			return nil, err

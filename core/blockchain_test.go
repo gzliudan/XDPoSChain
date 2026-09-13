@@ -18,6 +18,7 @@ package core
 
 import (
 	"errors"
+	"fmt"
 	"math/big"
 	"math/rand"
 	"strings"
@@ -614,6 +615,314 @@ func TestIsGapBlock(t *testing.T) {
 	// Chains without XDPoS have no gap blocks at all.
 	if (&BlockChain{chainConfig: &params.ChainConfig{}}).isGapBlock(block(450)) {
 		t.Fatalf("a chain without XDPoS must not have gap blocks")
+	}
+}
+
+// failVerifyEngine fails header verification for a single block number, so a batch
+// can be made to fail in the middle instead of at its first block.
+type failVerifyEngine struct {
+	consensus.Engine
+	failNumber uint64
+	failErr    error
+}
+
+func (e *failVerifyEngine) VerifyHeaders(chain consensus.ChainReader, headers []*types.Header, seals []bool) (chan<- struct{}, <-chan error) {
+	abort := make(chan struct{})
+	results := make(chan error, len(headers))
+	go func() {
+		for _, header := range headers {
+			var err error
+			if header.Number.Uint64() == e.failNumber {
+				err = e.failErr
+			}
+			select {
+			case <-abort:
+				return
+			case results <- err:
+			}
+		}
+	}()
+	return abort, results
+}
+
+// TestInsertChainReportsMidBatchFailure guards against reporting a partially
+// imported batch as a success, which lets the downloader advance past blocks the
+// node never imported.
+func TestInsertChainReportsMidBatchFailure(t *testing.T) {
+	failErr := errors.New("simulated mid-batch verification failure")
+	engine := &failVerifyEngine{Engine: ethash.NewFaker(), failNumber: 3, failErr: failErr}
+	chain, blocks := newInsertChainTester(t, engine, 5, 0)
+
+	n, err := chain.InsertChain(blocks)
+	if err == nil {
+		t.Fatal("InsertChain reported success for a partially imported batch")
+	}
+	if !errors.Is(err, failErr) {
+		t.Fatalf("unexpected error: have %v want %v", err, failErr)
+	}
+	if want := uint64(2); chain.CurrentBlock().Number.Uint64() != want {
+		t.Fatalf("unexpected head number: have %d want %d", chain.CurrentBlock().Number.Uint64(), want)
+	}
+	if want := 2; n != want {
+		t.Fatalf("unexpected failing index: have %d want %d", n, want)
+	}
+	for i := 2; i < len(blocks); i++ {
+		if block := chain.GetBlockByNumber(blocks[i].NumberU64()); block != nil {
+			t.Fatalf("block #%d was written although the batch reported failure", blocks[i].NumberU64())
+		}
+	}
+}
+
+// failBodyValidator fails body validation for a single block number, so a batch can be
+// made to fail in the middle through the body-validation path, while the header verifier
+// of the embedded engine still accepts every header.
+type failBodyValidator struct {
+	Validator
+	failNumber uint64
+	failErr    error
+}
+
+func (v *failBodyValidator) ValidateBody(block *types.Block) error {
+	if block.NumberU64() == v.failNumber {
+		return v.failErr
+	}
+	return v.Validator.ValidateBody(block)
+}
+
+// TestInsertChainReportsMidBatchBodyFailure is the body-validation counterpart of
+// TestInsertChainReportsMidBatchFailure. Body validation errors are the other trigger
+// class named by the fix (the loop stops on them too), and they run on the import
+// goroutine, so this exercises the abort at the following loop head instead of through
+// the header verifier results channel.
+func TestInsertChainReportsMidBatchBodyFailure(t *testing.T) {
+	chain, blocks := newInsertChainTester(t, nil, 5, 0)
+	chain.validator = &failBodyValidator{
+		Validator:  chain.validator,
+		failNumber: 3,
+		failErr:    consensus.ErrPrunedAncestor,
+	}
+
+	n, err := chain.InsertChain(blocks)
+	if err == nil {
+		t.Fatal("InsertChain reported success for a batch whose body validation failed mid-batch")
+	}
+	if !errors.Is(err, consensus.ErrPrunedAncestor) {
+		t.Fatalf("unexpected error: have %v want %v", err, consensus.ErrPrunedAncestor)
+	}
+	if want := 2; n != want {
+		t.Fatalf("unexpected failing index: have %d want %d", n, want)
+	}
+	if want := uint64(2); chain.CurrentBlock().Number.Uint64() != want {
+		t.Fatalf("unexpected head number: have %d want %d", chain.CurrentBlock().Number.Uint64(), want)
+	}
+	for i := 2; i < len(blocks); i++ {
+		if block := chain.GetBlockByNumber(blocks[i].NumberU64()); block != nil {
+			t.Fatalf("block #%d was written although body validation failed mid-batch", blocks[i].NumberU64())
+		}
+	}
+}
+
+// TestInsertChainSucceedsForFullBatch is the counterpart of the mid-batch failure
+// guard: a batch that verifies end to end must still report success.
+func TestInsertChainSucceedsForFullBatch(t *testing.T) {
+	chain, blocks := newInsertChainTester(t, nil, 5, 0)
+
+	if n, err := chain.InsertChain(blocks); err != nil {
+		t.Fatalf("block %d: failed to insert into chain: %v", n, err)
+	}
+	if want := uint64(5); chain.CurrentBlock().Number.Uint64() != want {
+		t.Fatalf("unexpected head number: have %d want %d", chain.CurrentBlock().Number.Uint64(), want)
+	}
+}
+
+// rewindHeadMarkers rewinds the chain head markers onto the given block without
+// removing anything from disk, mimicking what a crash or an interrupted rollback
+// leaves behind: the block and its state are on disk, but the head stops below it.
+func rewindHeadMarkers(chain *BlockChain, block *types.Block) {
+	chain.chainmu.MustLock()
+	defer chain.chainmu.Unlock()
+	chain.writeHeadBlock(block, false)
+}
+
+// newInsertChainTester returns a memory chain over a fresh genesis together with a
+// generated batch of total blocks, of which the first imported ones are already
+// inserted. Keeping total larger than imported lets callers re-deliver blocks that
+// are on disk and extend the chain afterwards. A nil engine means the ethash faker;
+// blocks are always generated with it, so a custom engine must accept those.
+func newInsertChainTester(t *testing.T, engine consensus.Engine, total, imported int) (*BlockChain, types.Blocks) {
+	t.Helper()
+
+	if engine == nil {
+		engine = ethash.NewFaker()
+	}
+	key, _ := crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
+	address := crypto.PubkeyToAddress(key.PublicKey)
+	gspec := &Genesis{
+		Alloc:   types.GenesisAlloc{address: {Balance: big.NewInt(1000000000000000)}},
+		BaseFee: big.NewInt(params.InitialBaseFee),
+		Config:  params.TestChainConfig,
+	}
+	_, blocks, _ := GenerateChainWithGenesis(gspec, ethash.NewFaker(), total, nil)
+
+	chain, err := NewBlockChain(rawdb.NewMemoryDatabase(), nil, gspec, engine, vm.Config{})
+	if err != nil {
+		t.Fatalf("failed to create tester chain: %v", err)
+	}
+	t.Cleanup(chain.Stop)
+
+	if n, err := chain.InsertChain(blocks[:imported]); err != nil {
+		t.Fatalf("block %d: failed to insert into chain: %v", n, err)
+	}
+	return chain, blocks
+}
+
+// TestInsertChainSucceedsWhenKnownBlocksAreOnDisk covers the case where the import
+// loop stops on a block that is already on disk while the rest of the batch is on
+// disk too: the batch really is fully imported, so it must not be reported as a
+// failure and the next batch must still be able to extend the chain.
+func TestInsertChainSucceedsWhenKnownBlocksAreOnDisk(t *testing.T) {
+	chain, blocks := newInsertChainTester(t, nil, 7, 5)
+	rewindHeadMarkers(chain, blocks[1]) // head stops at #2, blocks #3..#5 stay on disk
+
+	if n, err := chain.InsertChain(blocks[2:5]); err != nil {
+		t.Fatalf("block %d: batch that is fully on disk reported as failure: %v", n, err)
+	}
+	if want := uint64(2); chain.CurrentBlock().Number.Uint64() != want {
+		t.Fatalf("unexpected head number: have %d want %d", chain.CurrentBlock().Number.Uint64(), want)
+	}
+	// The truncated batch must not leave the chain stuck: importing the following
+	// batch on top of the blocks that are already on disk has to work.
+	if n, err := chain.InsertChain(blocks[5:]); err != nil {
+		t.Fatalf("block %d: failed to insert the following batch: %v", n, err)
+	}
+	if want := uint64(7); chain.CurrentBlock().Number.Uint64() != want {
+		t.Fatalf("unexpected head number: have %d want %d", chain.CurrentBlock().Number.Uint64(), want)
+	}
+}
+
+// TestInsertChainReportsKnownBlockAheadOfHead guards the other half of the same
+// contract: when the batch stops on a known block that sits ahead of the head and
+// the blocks after it were never imported, the caller must see an error instead of
+// believing the whole batch was written.
+func TestInsertChainReportsKnownBlockAheadOfHead(t *testing.T) {
+	chain, blocks := newInsertChainTester(t, nil, 5, 3)
+	rewindHeadMarkers(chain, blocks[1]) // head stops at #2, block #3 stays on disk
+
+	n, err := chain.InsertChain(blocks[2:]) // #3 is known, #4 and #5 are not
+	if err == nil {
+		t.Fatal("InsertChain reported success for a batch that is only partially on disk")
+	}
+	if !errors.Is(err, ErrKnownBlock) {
+		t.Fatalf("unexpected error: have %v want %v", err, ErrKnownBlock)
+	}
+	if want := 0; n != want {
+		t.Fatalf("unexpected failing index: have %d want %d", n, want)
+	}
+	if want := uint64(2); chain.CurrentBlock().Number.Uint64() != want {
+		t.Fatalf("unexpected head number: have %d want %d", chain.CurrentBlock().Number.Uint64(), want)
+	}
+	for i := 3; i < len(blocks); i++ {
+		if block := chain.GetBlockByNumber(blocks[i].NumberU64()); block != nil {
+			t.Fatalf("block #%d was written although the batch reported failure", blocks[i].NumberU64())
+		}
+	}
+}
+
+// interruptInsertEngine interrupts chain insertion while the body of the block at
+// interruptAt is validated. Body validation runs on the import goroutine itself,
+// so the interruption is visible deterministically at the loop head of that block,
+// without racing against the header verifier of the embedded engine.
+type interruptInsertEngine struct {
+	consensus.Engine
+	chain       *BlockChain
+	interruptAt uint64
+}
+
+func (e *interruptInsertEngine) VerifyUncles(chain consensus.ChainReader, block *types.Block) error {
+	if block.NumberU64() == e.interruptAt {
+		e.chain.InterruptInsert(true)
+	}
+	return e.Engine.VerifyUncles(chain, block)
+}
+
+// TestInsertChainReportsInterruptedInsertion guards the documented contract of
+// BlockChain.InterruptInsert ("causing them to return errInsertionInterrupted as
+// soon as possible"): a batch that was cut short must not be reported as a success.
+func TestInsertChainReportsInterruptedInsertion(t *testing.T) {
+	engine := &interruptInsertEngine{Engine: ethash.NewFaker(), interruptAt: 2}
+	chain, blocks := newInsertChainTester(t, engine, 5, 0)
+	engine.chain = chain
+
+	n, err := chain.InsertChain(blocks)
+	if err == nil {
+		t.Fatal("InsertChain reported success although the insertion was interrupted")
+	}
+	if !errors.Is(err, errInsertionInterrupted) {
+		t.Fatalf("unexpected error: have %v want %v", err, errInsertionInterrupted)
+	}
+	if want := 1; n != want {
+		t.Fatalf("unexpected failing index: have %d want %d", n, want)
+	}
+	if want := uint64(1); chain.CurrentBlock().Number.Uint64() != want {
+		t.Fatalf("unexpected head number: have %d want %d", chain.CurrentBlock().Number.Uint64(), want)
+	}
+	for i := 1; i < len(blocks); i++ {
+		if block := chain.GetBlockByNumber(blocks[i].NumberU64()); block != nil {
+			t.Fatalf("block #%d was written although the insertion was interrupted", blocks[i].NumberU64())
+		}
+	}
+}
+
+// TestInsertChainReportsInterruptedInsertionAtEntry covers the entry guard of insertChain:
+// an interruption that lands before the first block is inspected must not be reported as a
+// (zero block) success either, otherwise the caller believes a batch it never got.
+func TestInsertChainReportsInterruptedInsertionAtEntry(t *testing.T) {
+	chain, blocks := newInsertChainTester(t, nil, 5, 0)
+	chain.InterruptInsert(true)
+
+	n, err := chain.InsertChain(blocks)
+	if err == nil {
+		t.Fatal("InsertChain reported success although the insertion was interrupted before the first block")
+	}
+	if !errors.Is(err, errInsertionInterrupted) {
+		t.Fatalf("unexpected error: have %v want %v", err, errInsertionInterrupted)
+	}
+	if !errors.Is(err, ErrInsertionInterrupted) {
+		t.Fatalf("the exported sentinel must match the internal one, got %v", err)
+	}
+	if want := 0; n != want {
+		t.Fatalf("unexpected failing index: have %d want %d", n, want)
+	}
+	if want := uint64(0); chain.CurrentBlock().Number.Uint64() != want {
+		t.Fatalf("unexpected head number: have %d want %d", chain.CurrentBlock().Number.Uint64(), want)
+	}
+	if block := chain.GetBlockByNumber(1); block != nil {
+		t.Fatalf("block #1 was written although the insertion was interrupted before the first block")
+	}
+}
+
+// TestIsLocalInsertError pins the classification the downloader relies on to keep its peer:
+// only failures that say nothing about the blocks are local, everything else must stay a
+// consensus failure so that the peer serving an invalid batch is still dropped.
+func TestIsLocalInsertError(t *testing.T) {
+	tests := []struct {
+		err  error
+		want bool
+	}{
+		{ErrInsertionInterrupted, true},
+		{errInsertionInterrupted, true},
+		{ErrChainStopped, true},
+		{errChainStopped, true},
+		{fmt.Errorf("insertion aborted: %w", errChainStopped), true},
+		{nil, false},
+		{errors.New("blockchain is stopped"), false},
+		{ErrKnownBlock, false},
+		{consensus.ErrPrunedAncestor, false},
+	}
+	for _, tt := range tests {
+		if have := IsLocalInsertError(tt.err); have != tt.want {
+			t.Errorf("IsLocalInsertError(%v): have %v want %v", tt.err, have, tt.want)
+		}
 	}
 }
 

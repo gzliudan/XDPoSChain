@@ -28,6 +28,7 @@ import (
 	"github.com/XinFinOrg/XDPoSChain"
 	"github.com/XinFinOrg/XDPoSChain/common"
 	"github.com/XinFinOrg/XDPoSChain/consensus/XDPoS/engines/engine_v2"
+	"github.com/XinFinOrg/XDPoSChain/core"
 	"github.com/XinFinOrg/XDPoSChain/core/rawdb"
 	"github.com/XinFinOrg/XDPoSChain/core/state"
 	"github.com/XinFinOrg/XDPoSChain/core/types"
@@ -1650,6 +1651,14 @@ func (d *Downloader) importBlockResults(results []*fetchResult) error {
 		blocks[i] = types.NewBlockWithHeader(result.Header).WithBody(result.body())
 	}
 	if index, err := d.blockchain.InsertChain(blocks); err != nil {
+		// An insertion cut short by a local condition (shutdown, cancel, or another
+		// insertion holding the chain lock) says nothing about the peer that served
+		// the blocks, so it must not be turned into errInvalidChain: that is the
+		// branch that drops the peer.
+		if core.IsLocalInsertError(err) {
+			log.Debug("Downloaded item processing interrupted", "number", results[0].Header.Number, "index", index, "err", err)
+			return errCancelContentProcessing
+		}
 		if index < len(results) {
 			log.Debug("Downloaded item processing failed", "number", results[index].Header.Number, "hash", results[index].Header.Hash(), "err", err)
 		} else {
