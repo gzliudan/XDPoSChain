@@ -80,6 +80,10 @@ type downloadTester struct {
 	// before touching the simulated chain.
 	insertChainHook func(types.Blocks) error
 
+	// insertReceiptChainHook, when non-nil, makes InsertReceiptChain fail with the
+	// returned error before touching the simulated chain.
+	insertReceiptChainHook func(types.Blocks, []types.Receipts) error
+
 	// headHeaderCap, when non-zero, caps the height reported by CurrentHeader.
 	// It models the real chain, where importing blocks moves the header head
 	// back to the block being inserted. It must be set below the length of the
@@ -360,6 +364,12 @@ func (dl *downloadTester) writeBlockWithoutState(block *types.Block) error {
 func (dl *downloadTester) InsertReceiptChain(blocks types.Blocks, receipts []types.Receipts) (i int, err error) {
 	dl.lock.Lock()
 	defer dl.lock.Unlock()
+
+	if dl.insertReceiptChainHook != nil {
+		if err := dl.insertReceiptChainHook(blocks, receipts); err != nil {
+			return 0, err
+		}
+	}
 
 	for i := 0; i < len(blocks) && i < len(receipts); i++ {
 		if _, ok := dl.ownHeaders[blocks[i].Hash()]; !ok {
@@ -1980,6 +1990,33 @@ func TestImportBlockResultsKeepsPeerOnStoppedChain(t *testing.T) {
 		Uncles:       block.Uncles(),
 		Transactions: block.Transactions(),
 	}})
+	if err == nil {
+		t.Fatal("expected the stopped chain to be reported")
+	}
+	if errors.Is(err, errInvalidChain) {
+		t.Fatalf("a locally stopped insertion must not be an invalid chain: %v", err)
+	}
+	if !errors.Is(err, errCancelContentProcessing) {
+		t.Fatalf("unexpected error: have %v want %v", err, errCancelContentProcessing)
+	}
+}
+
+// TestCommitFastSyncDataKeepsPeerOnStoppedChain is the fast sync counterpart of
+// TestImportBlockResultsKeepsPeerOnStoppedChain: InsertReceiptChain reports the same local
+// conditions as InsertChain, and commitFastSyncData must exempt them too instead of
+// blaming the peer that served the batch.
+func TestCommitFastSyncDataKeepsPeerOnStoppedChain(t *testing.T) {
+	tester := newTester()
+	defer tester.terminate()
+
+	block := testChainBase.shorten(2).headBlock()
+	tester.insertReceiptChainHook = func(types.Blocks, []types.Receipts) error { return core.ErrChainStopped }
+
+	err := tester.downloader.commitFastSyncData([]*fetchResult{{
+		Header:       block.Header(),
+		Uncles:       block.Uncles(),
+		Transactions: block.Transactions(),
+	}}, &stateSync{done: make(chan struct{})})
 	if err == nil {
 		t.Fatal("expected the stopped chain to be reported")
 	}

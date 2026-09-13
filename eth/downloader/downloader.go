@@ -1930,6 +1930,13 @@ func (d *Downloader) commitFastSyncData(results []*fetchResult, stateSync *state
 		receipts[i] = result.Receipts
 	}
 	if index, err := d.blockchain.InsertReceiptChain(blocks, receipts); err != nil {
+		// A local failure (shutdown, or another insertion holding the chain lock) says
+		// nothing about the peer that served the batch, so it must not be turned into
+		// errInvalidChain: that is the branch that drops the peer.
+		if core.IsLocalInsertError(err) {
+			log.Debug("Downloaded item processing interrupted", "number", results[0].Header.Number, "index", index, "err", err)
+			return errCancelContentProcessing
+		}
 		log.Debug("Downloaded item processing failed", "number", results[index].Header.Number, "hash", results[index].Header.Hash(), "err", err)
 		return fmt.Errorf("%w: %v", errInvalidChain, err)
 	}
