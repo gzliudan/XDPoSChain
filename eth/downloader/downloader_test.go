@@ -2001,6 +2001,33 @@ func TestImportBlockResultsKeepsPeerOnStoppedChain(t *testing.T) {
 	}
 }
 
+// TestImportBlockResultsKeepsPeerOnKnownBlock covers the batch that stops on a block this
+// node already stores with its state: the peer served exactly the range it was asked for,
+// so it must not be dropped through errInvalidChain - the head stays where it is, and
+// every following attempt would otherwise fail on the same range and drop another peer.
+func TestImportBlockResultsKeepsPeerOnKnownBlock(t *testing.T) {
+	tester := newTester()
+	defer tester.terminate()
+
+	block := testChainBase.shorten(2).headBlock()
+	tester.insertChainHook = func(types.Blocks) error { return core.ErrKnownBlock }
+
+	err := tester.downloader.importBlockResults([]*fetchResult{{
+		Header:       block.Header(),
+		Uncles:       block.Uncles(),
+		Transactions: block.Transactions(),
+	}})
+	if err == nil {
+		t.Fatal("expected the known block to be reported")
+	}
+	if errors.Is(err, errInvalidChain) {
+		t.Fatalf("a batch stopping on a known block must not be an invalid chain: %v", err)
+	}
+	if !errors.Is(err, errCancelContentProcessing) {
+		t.Fatalf("unexpected error: have %v want %v", err, errCancelContentProcessing)
+	}
+}
+
 // TestCommitFastSyncDataKeepsPeerOnStoppedChain is the fast sync counterpart of
 // TestImportBlockResultsKeepsPeerOnStoppedChain: InsertReceiptChain reports the same local
 // conditions as InsertChain, and commitFastSyncData must exempt them too instead of

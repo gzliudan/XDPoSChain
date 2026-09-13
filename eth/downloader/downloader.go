@@ -1659,6 +1659,15 @@ func (d *Downloader) importBlockResults(results []*fetchResult) error {
 			log.Debug("Downloaded item processing interrupted", "number", results[0].Header.Number, "index", index, "err", err)
 			return errCancelContentProcessing
 		}
+		// A batch that stopped on a block this node already stores with its state is not
+		// an invalid chain either: the peer served exactly the range it was asked for, and
+		// the head simply cannot move past that block here. Reporting it as
+		// errInvalidChain would drop the peer and, because the head stays where it is,
+		// make every following attempt fail on the same range over and over.
+		if errors.Is(err, core.ErrKnownBlock) {
+			log.Debug("Downloaded item processing stopped on a known block", "number", results[0].Header.Number, "index", index, "err", err)
+			return errCancelContentProcessing
+		}
 		if index < len(results) {
 			log.Debug("Downloaded item processing failed", "number", results[index].Header.Number, "hash", results[index].Header.Hash(), "err", err)
 		} else {
