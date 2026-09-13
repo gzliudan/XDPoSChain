@@ -1491,6 +1491,78 @@ func (bc *BlockChain) WriteBlockWithState(block *types.Block, receipts []*types.
 	return bc.writeBlockWithState(block, receipts, state, tradingState, lendingState)
 }
 
+// isGapBlock reports whether block is the gap block of its epoch, at which the
+// masternode set for the next epoch is refreshed.
+func (bc *BlockChain) isGapBlock(block *types.Block) bool {
+	if bc.chainConfig.XDPoS == nil {
+		return false
+	}
+	epoch, gap := bc.chainConfig.XDPoS.Epoch, bc.chainConfig.XDPoS.Gap
+	return epoch != 0 && block.NumberU64()%epoch == epoch-gap
+}
+
+// blockBeatsHead reports whether block would be adopted as canonical under the
+// same fork-choice rule writeBlockWithState applies: a higher total difficulty,
+// or an equal one with a higher number. It must stay in sync with the check in
+// writeBlockWithState, otherwise a known block could move the head onto a chain
+// that an executed block would never be allowed to adopt.
+//
+// An unknown parent total difficulty means the block cannot be compared, and is
+// treated as not beating the head so that the batch keeps the current chain.
+func (bc *BlockChain) blockBeatsHead(block *types.Block, head *types.Header) bool {
+	if block.NumberU64() == 0 {
+		return false
+	}
+	ptd := bc.GetTd(block.ParentHash(), block.NumberU64()-1)
+	if ptd == nil {
+		return false
+	}
+	localTd := bc.GetTd(head.Hash(), head.Number.Uint64())
+	if localTd == nil {
+		return false
+	}
+	if cmp := new(big.Int).Add(block.Difficulty(), ptd).Cmp(localTd); cmp != 0 {
+		return cmp > 0
+	}
+	return block.NumberU64() > head.Number.Uint64()
+}
+
+// notifyEpochSwitchBlock sends a checkpoint notification when block switches the
+// epoch, so that the consensus parameters and the masternode set are refreshed.
+// It is a no-op for non-XDPoS chains and for engines that are not XDPoS.
+func (bc *BlockChain) notifyEpochSwitchBlock(block *types.Block) {
+	if bc.chainConfig.XDPoS == nil {
+		return
+	}
+	engine, ok := bc.Engine().(*XDPoS.XDPoS)
+	if !ok {
+		return
+	}
+	isEpochSwitch, _, err := engine.IsEpochSwitch(block.Header())
+	if err != nil {
+		log.Error("[notifyEpochSwitchBlock] Error while checking if the incoming block is epoch switch block", "Hash", block.Hash(), "Number", block.Number())
+		bc.reportBlock(block, nil, err)
+		return
+	}
+	if isEpochSwitch {
+		CheckpointCh <- 1
+	}
+}
+
+// cacheSigningTxs caches the signing transactions of a block that is being
+// adopted, so that later epoch lookups do not have to rescan the whole block.
+// It is a no-op for non-XDPoS chains and for blocks that do not use TIP signing.
+func (bc *BlockChain) cacheSigningTxs(block *types.Block) {
+	if bc.chainConfig.XDPoS == nil || !bc.chainConfig.IsTIPSigning(block.Number()) {
+		return
+	}
+	engine, ok := bc.Engine().(*XDPoS.XDPoS)
+	if !ok {
+		return
+	}
+	engine.CacheSigningTxs(block.Header().Hash(), block.Transactions())
+}
+
 // writeBlockWithState writes the block and all associated state to the database,
 // but is expects the chain mutex to be held.
 func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.Receipt, state *state.StateDB, tradingState *tradingstate.TradingStateDB, lendingState *lendingstate.LendingStateDB) (status WriteStatus, err error) {
@@ -1504,8 +1576,6 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 		return NonStatTy, consensus.ErrUnknownAncestor
 	}
 	// Make sure no inconsistent state is leaked during insertion
-	currentBlock := bc.CurrentBlock()
-	localTd := bc.GetTd(currentBlock.Hash(), currentBlock.Number.Uint64())
 	externTd := new(big.Int).Add(block.Difficulty(), ptd)
 
 	// Irrelevant of the canonical status, write the block itself to the database.
@@ -1665,16 +1735,13 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 		}
 	}
 
-	// If the total difficulty is higher than our known, add it to the canonical chain
-	// Second clause in the if statement reduces the vulnerability to selfish mining.
+	// If the block outranks our head, add it to the canonical chain. The rule
+	// itself lives in blockBeatsHead so that the known-block path adopts a chain
+	// exactly when an executed block would, including the same-difficulty split by
+	// block number that reduces the vulnerability to selfish mining.
 	// Please refer to http://www.cs.cornell.edu/~ie53/publications/btcProcFC.pdf
-	reorg := externTd.Cmp(localTd) > 0
-	currentBlock = bc.CurrentBlock()
-	if !reorg && externTd.Cmp(localTd) == 0 {
-		// Split same-difficulty blocks by number
-		reorg = block.NumberU64() > currentBlock.Number.Uint64()
-	}
-	if reorg {
+	currentBlock := bc.CurrentBlock()
+	if beatsHead := bc.blockBeatsHead(block, currentBlock); beatsHead {
 		// Reorganise the chain if the parent is not the head block
 		if block.ParentHash() != currentBlock.Hash() {
 			if err := bc.reorg(currentBlock, block.Header()); err != nil {
@@ -1691,19 +1758,14 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 		// WriteBlock has already been called, no need to write again
 		bc.writeHeadBlock(block, false)
 		// prepare set of masternodes for the next epoch
-		if bc.chainConfig.XDPoS != nil && ((block.NumberU64() % bc.chainConfig.XDPoS.Epoch) == (bc.chainConfig.XDPoS.Epoch - bc.chainConfig.XDPoS.Gap)) {
+		if bc.isGapBlock(block) {
 			if err := bc.UpdateM1(); err != nil {
 				log.Crit("Fail to update masternodes during writeBlockWithState", "number", block.Number, "hash", block.Hash().Hex(), "err", err)
 			}
 		}
 	}
 	// save cache BlockSigners
-	if bc.chainConfig.XDPoS != nil && bc.chainConfig.IsTIPSigning(block.Number()) {
-		engine, ok := bc.Engine().(*XDPoS.XDPoS)
-		if ok {
-			engine.CacheSigningTxs(block.Header().Hash(), block.Transactions())
-		}
-	}
+	bc.cacheSigningTxs(block)
 	bc.futureBlocks.Remove(block.Hash())
 	return status, nil
 }
@@ -1808,7 +1870,7 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, []
 	switch {
 	// First block is pruned, insert as sidechain and reorg only if TD grows enough
 	case errors.Is(err, consensus.ErrPrunedAncestor):
-		return bc.insertSidechain(block, it)
+		return bc.insertSideChain(block, it)
 
 	// First block is future, shove it (and all children) to the future queue (unknown ancestor)
 	case errors.Is(err, consensus.ErrFutureBlock) || (errors.Is(err, consensus.ErrUnknownAncestor) && bc.futureBlocks.Contains(it.first().ParentHash())):
@@ -1916,17 +1978,7 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, []
 
 		dirty, _ := bc.triedb.Size()
 		stats.report(chain, it.index, dirty)
-		if bc.chainConfig.XDPoS != nil {
-			engine, _ := bc.Engine().(*XDPoS.XDPoS)
-			isEpochSwithBlock, _, err := engine.IsEpochSwitch(block.Header()) // epoch block
-			if err != nil {
-				log.Error("[insertChain] Error while checking and notifying channel CheckpointCh if the incoming block is epoch switch block", "Hash", block.Hash(), "Number", block.Number())
-				bc.reportBlock(block, nil, err)
-			}
-			if isEpochSwithBlock {
-				CheckpointCh <- 1
-			}
-		}
+		bc.notifyEpochSwitchBlock(block)
 	}
 
 	// Any blocks remaining here? The only ones we care about are the future ones
@@ -2042,13 +2094,13 @@ func (bc *BlockChain) processBlock(block *types.Block, parent *types.Header, sta
 	return &blockProcessingResult{usedGas: usedGas, procTime: proctime, status: status, logs: logs}, nil
 }
 
-// insertSidechain is called when an import batch hits upon a pruned ancestor
+// insertSideChain is called when an import batch hits upon a pruned ancestor
 // error, which happens when a sidechain with a sufficiently old fork-block is
 // found.
 //
 // The method writes all (header-and-body-valid) blocks to disk, then tries to
 // switch over to the new chain if the TD exceeded the current chain.
-func (bc *BlockChain) insertSidechain(block *types.Block, it *insertIterator) (int, []interface{}, []*types.Log, error) {
+func (bc *BlockChain) insertSideChain(block *types.Block, it *insertIterator) (int, []interface{}, []*types.Log, error) {
 	var (
 		externTd *big.Int
 		current  = bc.CurrentBlock().Number.Uint64()
@@ -2373,17 +2425,7 @@ func (bc *BlockChain) insertBlock(block *types.Block) ([]interface{}, []*types.L
 	stats.usedGas += result.usedGas
 	dirty, _ := bc.triedb.Size()
 	stats.report(types.Blocks{block}, 0, dirty)
-	if bc.chainConfig.XDPoS != nil {
-		// epoch block
-		isEpochSwithBlock, _, err := bc.Engine().(*XDPoS.XDPoS).IsEpochSwitch(block.Header())
-		if err != nil {
-			log.Error("[insertBlock] Error while checking if the incoming block is epoch switch block", "Hash", block.Hash(), "Number", block.Number())
-			bc.reportBlock(block, nil, err)
-		}
-		if isEpochSwithBlock {
-			CheckpointCh <- 1
-		}
-	}
+	bc.notifyEpochSwitchBlock(block)
 	// Append a single chain head event if we've progressed the chain
 	if status == CanonStatTy && bc.CurrentBlock().Hash() == block.Hash() {
 		events = append(events, ChainHeadEvent{block})
@@ -2415,6 +2457,9 @@ func (bc *BlockChain) collectLogs(b *types.Block, removed bool) []*types.Log {
 // reorg takes two blocks, an old chain and a new chain and will reconstruct the
 // blocks and inserts them to be part of the new canonical chain and accumulates
 // potential missing transactions and post an event about them.
+//
+// Note the new head block won't be processed here, callers need to handle it
+// externally.
 func (bc *BlockChain) reorg(oldHead, newHead *types.Header) error {
 	log.Warn("Reorg", "OldHash", oldHead.Hash().Hex(), "OldNum", oldHead.Number, "NewHash", newHead.Hash().Hex(), "NewNum", newHead.Number)
 
@@ -2571,8 +2616,10 @@ func (bc *BlockChain) reorg(oldHead, newHead *types.Header) error {
 		// }
 	}
 
-	// Apply new blocks in forward order
-	for i := len(newChain) - 1; i >= 0; i-- {
+	// Apply new blocks in forward order, except the new head (newChain[0]). The
+	// caller writes the head once the reorg is done; doing it here as well would
+	// write the same markers twice and, for a gap block, run UpdateM1 twice.
+	for i := len(newChain) - 1; i >= 1; i-- {
 		// Collect all the included transactions
 		block := bc.GetBlock(newChain[i].Hash(), newChain[i].Number.Uint64())
 		if block == nil {
@@ -2592,7 +2639,7 @@ func (bc *BlockChain) reorg(oldHead, newHead *types.Header) error {
 		// Update the head block
 		bc.writeHeadBlock(block, true)
 		// prepare set of masternodes for the next epoch
-		if bc.chainConfig.XDPoS != nil && ((block.NumberU64() % bc.chainConfig.XDPoS.Epoch) == (bc.chainConfig.XDPoS.Epoch - bc.chainConfig.XDPoS.Gap)) {
+		if bc.isGapBlock(block) {
 			if err := bc.UpdateM1(); err != nil {
 				log.Crit("Fail to update masternodes during reorg", "number", block.Number, "hash", block.Hash().Hex(), "err", err)
 			}
@@ -2609,11 +2656,11 @@ func (bc *BlockChain) reorg(oldHead, newHead *types.Header) error {
 		rawdb.DeleteTxLookupEntry(batch, tx)
 	}
 	// Delete all hash markers that are not part of the new canonical chain.
-	// Because the reorg function handles new chain head, all hash
-	// markers greater than new chain head should be deleted.
+	// Because the reorg function does not handle the new chain head, all hash
+	// markers greater than or equal to new chain head should be deleted.
 	number := commonBlock.Number
-	if len(newChain) > 0 {
-		number = newChain[0].Number
+	if len(newChain) > 1 {
+		number = newChain[1].Number
 	}
 	for i := number.Uint64() + 1; ; i++ {
 		hash := rawdb.ReadCanonicalHash(bc.db, i)
