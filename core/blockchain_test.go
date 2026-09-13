@@ -833,6 +833,35 @@ func TestInsertChainAdoptsKnownBatchAheadOfHead(t *testing.T) {
 	}
 }
 
+// TestInsertSideChainReportsInvalidBlockInSegment covers the scan of a pruned sidechain
+// segment: when it stops on a block whose body does not match its header, that error has
+// to be reported instead of being dropped in favour of the result of re-importing the
+// prefix - re-importing the prefix succeeded, so returning it reported a partial import
+// as a success while nothing after the failing block was even looked at.
+func TestInsertSideChainReportsInvalidBlockInSegment(t *testing.T) {
+	chain, blocks := newInsertChainTester(t, nil, 7, 2) // head at #2
+
+	// #3 is on disk but without its state, which is what makes #4 the first block of a
+	// pruned sidechain segment: its parent is known, but the state to execute it is gone.
+	td := new(big.Int).Add(chain.GetTd(blocks[1].Hash(), 2), blocks[2].Difficulty())
+	if err := chain.writeBlockWithoutState(blocks[2], td); err != nil {
+		t.Fatalf("failed to write the pruned block: %v", err)
+	}
+	// #6 keeps a valid header, so the scan reaches it, but its body does not match it.
+	tx := types.NewTransaction(0, common.Address{}, big.NewInt(1), params.TxGas, big.NewInt(1), nil)
+	invalid := types.NewBlockWithHeader(blocks[5].Header()).WithBody(types.Body{Transactions: types.Transactions{tx}})
+
+	n, err := chain.InsertChain(types.Blocks{blocks[3], blocks[4], invalid})
+	if err == nil {
+		t.Fatalf("block %d: sidechain segment holding an invalid block reported as success", n)
+	}
+	// Re-importing the prefix of the segment must not make it canonical behind the back
+	// of the block that stopped the import.
+	if want := uint64(2); chain.CurrentBlock().Number.Uint64() != want {
+		t.Fatalf("unexpected head number: have %d want %d", chain.CurrentBlock().Number.Uint64(), want)
+	}
+}
+
 // TestInsertChainReportsKnownBlockAheadOfHead guards the other half of the same
 // contract: when the batch stops on a known block that sits ahead of the head and
 // the blocks after it were never imported, the caller must see an error instead of

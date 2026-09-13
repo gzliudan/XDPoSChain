@@ -2262,9 +2262,17 @@ func (bc *BlockChain) insertSideChain(block *types.Block, it *insertIterator) (i
 		}
 	}
 	// At this point, we've written all sidechain blocks to database. Loop ended
-	// either on some other error or all were processed. If there was some other
-	// error, we can ignore the rest of those blocks.
+	// either on some other error or all were processed.
 	//
+	// A block that failed verification or body validation is not one of those: report it
+	// right away, because rebuilding the prefix below and returning that result would
+	// report a partial import as a success - nothing after the failing block was even
+	// looked at. ErrUnknownAncestor and ErrKnownBlock are how a pruned segment ends
+	// normally (the next block cannot be linked yet, or it is already on disk with its
+	// state), so they are not failures and fall through to the reimport below.
+	if err != nil && !errors.Is(err, consensus.ErrUnknownAncestor) && !errors.Is(err, ErrKnownBlock) {
+		return it.index, nil, nil, err
+	}
 	// If the externTd was larger than our local TD, we now need to reimport the previous
 	// blocks to regenerate the required state
 	localTd := bc.GetTd(bc.CurrentBlock().Hash(), current)
