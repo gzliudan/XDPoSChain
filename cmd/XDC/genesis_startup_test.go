@@ -97,6 +97,11 @@ func assertCommandFailsWithChainConfigErrors(t *testing.T, cmd *testXDC, wants .
 	t.Helper()
 
 	cmd.WaitExit()
+	// ExitStatus answers -1 for an exit no wait has observed, and that must not
+	// pass for "the command failed" here without the command having failed at all.
+	if !cmd.ExitObserved() {
+		t.Fatalf("command was not reaped within KillTimeout; stderr=%q", cmd.StderrText())
+	}
 	if status := cmd.ExitStatus(); status == 0 {
 		t.Fatalf("expected command to fail, got exit status 0, stderr=%q", cmd.StderrText())
 	}

@@ -57,6 +57,10 @@ func TestMain(m *testing.M) {
 func runXDC(t *testing.T, args ...string) *testXDC {
 	tt := &testXDC{}
 	tt.TestCmd = cmdtest.NewTestCmd(t, tt)
+	// A node's logs far exceed the default cap and the assertions read text the node
+	// writes early: the loggers keep the head and drop the tail, so keep enough of
+	// both streams.
+	tt.MaxLogSize = 64 << 20
 	for i, arg := range args {
 		switch arg {
 		case "--datadir":
