@@ -94,9 +94,11 @@ var (
 	blockPrefetchExecuteTimer   = metrics.NewRegisteredTimer("chain/prefetch/executes", nil)
 	blockPrefetchInterruptMeter = metrics.NewRegisteredMeter("chain/prefetch/interrupts", nil)
 
-	// Known blocks that were not adopted because they do not beat the head. The batch
-	// reports success without importing anything in that shape, so this is the only count
-	// of it - see writeKnownBlock and the prefix adoption of insertSideChain.
+	// Known blocks above the head that were not adopted because they do not beat it. The
+	// batch reports success without importing anything in that shape, so this is the only
+	// count of it - see writeKnownBlock and the prefix adoption of insertSideChain. A
+	// known block below the head is not counted: rejecting one is the routine skip of a
+	// block that is already canonical, not a range that came back without moving the head.
 	blockKnownNotAdoptedMeter = metrics.NewRegisteredMeter("chain/knownblocks/notadopted", nil)
 
 	// ErrInsertionInterrupted is returned by the chain insertion methods when the chain
@@ -906,7 +908,7 @@ func (bc *BlockChain) setHeadBeyondRoot(head uint64) error {
 			rawdb.DeleteBody(db, hash, num)
 			rawdb.DeleteReceipts(db, hash, num)
 		}
-		if bc.chainConfig.XDPoS != nil && (num+bc.chainConfig.XDPoS.Gap)%bc.chainConfig.XDPoS.Epoch == 0 {
+		if bc.isGapBlockNumber(num) {
 			rawdb.DeleteXdposSnapshot(db, hash)
 		}
 		// Todo(rjl493456442) txlookup, bloombits, etc
@@ -1197,8 +1199,9 @@ func (bc *BlockChain) HasBlockAndFullState(hash common.Hash, number uint64) bool
 // the header resolves in the trie database. writeBlockWithoutState stores a sidechain block
 // without its state and without its receipts, so a block that names a root which happens to
 // exist is taken for one that was executed - and trie.New resolves no node at all for
-// types.EmptyRootHash, so naming an empty root is enough. A caller that means "this node"
-// already did the work" has to ask this instead of HasBlockAndFullState.
+// types.EmptyRootHash, so naming an empty root is enough. The insertion paths read "known"
+// as "this node already did the work", which is why they ask this instead wherever that is
+// what they mean.
 //
 // Receipts are the marker because something else would have to write them without writing
 // the state next to them: writeBlockWithState writes both, writeBlockWithoutState writes
@@ -1686,17 +1689,23 @@ func (bc *BlockChain) WriteBlockWithState(block *types.Block, receipts []*types.
 
 // isGapBlockNumber reports whether num is the gap block of its epoch, at which the
 // masternode set for the next epoch is refreshed. It asks exactly what engine_v2 asks in
-// UpdateMasternodes (num%Epoch == Epoch-Gap), because every UpdateM1 call site turns a
-// rejection from that engine into a log.Crit: a block this predicate accepts and the engine
-// refuses halts the node.
+// UpdateMasternodes (num%Epoch == Epoch-Gap), because the three UpdateM1 call sites -
+// writeBlockWithState, writeKnownBlock and reorg - turn a rejection from that engine into a
+// log.Crit: a block this predicate accepts and the engine refuses halts the node.
 //
-// The (num+Gap)%Epoch == 0 form kept before - which engine_v1 stores and loads its snapshots
-// with, and which setHeadBeyondRoot still deletes them by - only agrees with the engine for
-// 0 < Gap <= Epoch. With Gap == 0 it holds at every epoch boundary, and with Gap > Epoch,
-// where Epoch-Gap underflows, it holds at offsets the engine cannot express, so both are
-// excluded here. Every configuration in params/config_networks.go uses 0 < Gap < Epoch.
-// With Gap == Epoch the gap block is the epoch switch block itself and engine_v2 accepts it,
-// so that boundary stays.
+// The (num+Gap)%Epoch == 0 form kept before, which engine_v1 stores and loads its snapshots
+// with, only agrees with the engine for 0 < Gap <= Epoch. With Gap == 0 it holds at every
+// epoch boundary, and with Gap > Epoch, where Epoch-Gap underflows, it holds at offsets the
+// engine cannot express, so both are excluded here. Every configuration in
+// params/config_networks.go uses 0 < Gap < Epoch. With Gap == Epoch the gap block is the
+// epoch switch block itself and engine_v2 accepts it, so that boundary stays.
+//
+// setHeadBeyondRoot used the (num+Gap)%Epoch == 0 form to pick the snapshots a rewind
+// deletes, and now asks this predicate instead, so the two excluded ranges are excluded
+// there too: on a chain with Gap == 0 or Gap > Epoch this predicate is false at every
+// height, the rewind deletes no snapshot, and the ones engine_v1 wrote stay in the database.
+// They are keyed by block hash, so a rewound block's snapshot is never loaded again; the
+// leftover entry is leaked, not wrong.
 func (bc *BlockChain) isGapBlockNumber(num uint64) bool {
 	if bc.chainConfig.XDPoS == nil {
 		return false
@@ -1714,31 +1723,75 @@ func (bc *BlockChain) isGapBlock(block *types.Block) bool {
 // same fork-choice rule writeBlockWithState applies: a higher total difficulty,
 // or an equal one with a higher number. It must stay in sync with the check in
 // writeBlockWithState, otherwise a known block could move the head onto a chain
-// that an executed block would never be allowed to adopt.
+// that an executed block would never be allowed to adopt - which is why both of
+// them ask forkChoiceBeatsHead instead of spelling the comparison out. The rule is
+// what they share, not the record: writeBlockWithState compares the total difficulty
+// it accumulates for a block it is executing, while this compares the one the block
+// already has. See blockTd.
 //
 // Upstream go-ethereum has no counterpart: its skipBlock decides whether a known block may
 // be skipped from the availability of the snapshot state, not from fork choice. Here the
 // decision is a total-difficulty comparison because XDPoS batches can be re-delivered on a
 // branch that must not become canonical.
 //
-// An unknown parent total difficulty means the block cannot be compared, and is
-// treated as not beating the head so that the batch keeps the current chain.
-func (bc *BlockChain) blockBeatsHead(block *types.Block, head *types.Header) bool {
-	if block.NumberU64() == 0 {
+// A block this node holds no total difficulty for cannot be compared, and is treated
+// as not beating the head so that the batch keeps the current chain. A head this node
+// holds no record for is not that case: the comparison cannot be made at all, so it is
+// reported through headTd as the local condition it is instead of being read as a block
+// that lost fork choice.
+func (bc *BlockChain) blockBeatsHead(block *types.Block, head *types.Header) (bool, error) {
+	headTd, err := bc.headTd(head)
+	if err != nil {
+		return false, err
+	}
+	return bc.blockBeatsHeadTd(block, head, headTd), nil
+}
+
+// blockBeatsHeadTd is blockBeatsHead with the head's total difficulty already read, for
+// callers that compare many blocks against one head that does not move in between: the
+// known-block skip loop reads it once for a whole re-delivered batch instead of once per
+// block. The record is read through headTd, so the nil of a head this node holds no record
+// for is answered by the caller before it gets here.
+func (bc *BlockChain) blockBeatsHeadTd(block *types.Block, head *types.Header, headTd *big.Int) bool {
+	return forkChoiceBeatsHead(bc.blockTd(block), headTd, block.NumberU64(), head)
+}
+
+// forkChoiceBeatsHead is the fork-choice rule, in the one place it is written: a higher total
+// difficulty than the head's, or an equal one with a higher number. That second clause is the
+// reduction of the vulnerability to selfish mining that writeBlockWithState's reference
+// describes (http://www.cs.cornell.edu/~ie53/publications/btcProcFC.pdf).
+//
+// It takes the two total difficulties rather than a block because both callers hold them
+// already: writeBlockWithState accumulates the block's to write it with the block, and going
+// through blockBeatsHead would look the parent's up a second time for that same value, while
+// the known-block skip loop reads the head's once for a whole re-delivered batch. A nil on
+// either side is an unknown total difficulty, which cannot be compared and is therefore not
+// beating the head; number 0 is the same case, genesis having no parent to accumulate onto.
+func forkChoiceBeatsHead(td, headTd *big.Int, number uint64, head *types.Header) bool {
+	if head == nil || headTd == nil || td == nil || number == 0 {
 		return false
 	}
-	ptd := bc.GetTd(block.ParentHash(), block.NumberU64()-1)
-	if ptd == nil {
-		return false
-	}
-	localTd := bc.GetTd(head.Hash(), head.Number.Uint64())
-	if localTd == nil {
-		return false
-	}
-	if cmp := new(big.Int).Add(block.Difficulty(), ptd).Cmp(localTd); cmp != 0 {
+	if cmp := td.Cmp(headTd); cmp != 0 {
 		return cmp > 0
 	}
-	return block.NumberU64() > head.Number.Uint64()
+	return number > head.Number.Uint64()
+}
+
+// blockTd returns the total difficulty this node stored for block: the one it wrote when it
+// executed that block, or nil when it holds no such record.
+//
+// Both callers pass a block this node already has on disk - writeKnownBlock asks it after
+// HasExecutedBlock, the known-block skip loop after ErrKnownBlock - so the record they want is
+// the block's own, the one writeBlockWithState writes atomically together with its body and its
+// receipts (see HasExecutedBlock). Recomputing it from the parent's record instead would read a
+// second record this node may have lost, and its nil says "cannot be compared" - which
+// forkChoiceBeatsHead cannot tell apart from a block that lost fork choice, leaving the head
+// where it is with no trace at all.
+func (bc *BlockChain) blockTd(block *types.Block) *big.Int {
+	if block.NumberU64() == 0 {
+		return nil
+	}
+	return bc.GetTd(block.Hash(), block.NumberU64())
 }
 
 // notifyEpochSwitchBlock sends a checkpoint notification when block switches the
@@ -1791,7 +1844,9 @@ func (bc *BlockChain) cacheSigningTxs(block *types.Block) {
 }
 
 // adoptHead writes block as the canonical head, reorganising the chain first when block does
-// not sit directly on top of current.
+// not sit directly on top of current. reorg deliberately leaves the new head to its caller -
+// it has already deleted that block's canonical marker - so this is the single place that
+// writes the head after a reorg, and the callers below must not write it a second time.
 //
 // The reorg error is returned unwrapped so each caller can classify it: writeBlockWithState
 // hands it back and the batch fails, writeKnownBlock wraps it in ErrLocalInsertRefused because
@@ -1837,7 +1892,9 @@ func (bc *BlockChain) adoptHead(block *types.Block, current *types.Header, critM
 // The decision goes through blockBeatsHead, the same rule writeBlockWithState applies to
 // executed blocks, so a known block can never be adopted under a rule an executed one
 // would have lost. A block that loses fork choice is not adopted and is not an error:
-// the batch was simply imported on a branch that is not the canonical one.
+// the batch was simply imported on a branch that is not the canonical one. A head this
+// node holds no record for is not that case: the comparison cannot be made at all, so it
+// is reported as the local condition headTd raises instead of leaving the head behind.
 //
 // Upstream go-ethereum has a helper of the same name but writes the head unconditionally;
 // here the block must first win fork choice, because a batch can be re-delivered on a branch
@@ -1885,7 +1942,25 @@ func (bc *BlockChain) writeKnownBlock(block *types.Block) (adopted *types.Block,
 	// The marker has to be read before the head moves: reorg rewrites it.
 	promoted = bc.GetCanonicalHash(block.NumberU64()) != block.Hash()
 	current := bc.CurrentBlock()
-	if !bc.blockBeatsHead(block, current) {
+	// The comparison below asks for the total difficulty this node stored for this very block,
+	// and writeBlockWithState wrote it in the same batch as the receipts HasExecutedBlock has
+	// just checked. Its absence is therefore a condition of this node, and it is reported the
+	// way headTd reports a head with no record: read as a block that lost fork choice it would
+	// leave the head where it is, silently - the stall this adoption path exists to end.
+	if bc.blockTd(block) == nil {
+		return nil, false, fmt.Errorf("%w: no total difficulty for stored block %d (%v)",
+			ErrLocalInsertCondition, block.NumberU64(), block.Hash())
+	}
+	beatsHead, err := bc.blockBeatsHead(block, current)
+	if err != nil {
+		// The head's record is missing from this node, so the comparison cannot be made at
+		// all: reporting it is what keeps the same missing record from leaving the head
+		// behind here, silently, the way it did on the executed path. insertSideChain
+		// adopts a stored prefix through this function, so this is also what answers for
+		// that path.
+		return nil, false, err
+	}
+	if !beatsHead {
 		return nil, false, nil
 	}
 	if err := bc.adoptHead(block, current, "Fail to update masternodes during writeKnownBlock"); err != nil {
@@ -1907,7 +1982,11 @@ func (bc *BlockChain) writeKnownBlock(block *types.Block) (adopted *types.Block,
 // announceKnownBlock returns the events and logs an adopted known block raises: a
 // ChainEvent always, because the head moved and subscribers following the head have to
 // learn about it, and the block's logs only when it is promoted to the canonical chain
-// for the first time.
+// for the first time. A rollback re-import already delivered them, so sending them again
+// would duplicate them.
+//
+// Subscribers should therefore treat the two as different: the ChainEvent may repeat (a
+// rollback re-import re-announces a head it already announced), the logs never do.
 func (bc *BlockChain) announceKnownBlock(block *types.Block, promoted bool) ([]interface{}, []*types.Log) {
 	var logs []*types.Log
 	if promoted {
@@ -1929,9 +2008,18 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 		return NonStatTy, consensus.ErrUnknownAncestor
 	}
 	// Make sure no inconsistent state is leaked during insertion
-	currentBlock := bc.CurrentBlock()
-	localTd := bc.GetTd(currentBlock.Hash(), currentBlock.Number.Uint64())
 	externTd := new(big.Int).Add(block.Difficulty(), ptd)
+
+	// The head's total difficulty is read, not assumed away: a record this node is missing
+	// is a local condition, not a comparison this block lost. It is read here, before
+	// anything is written, for the same reason the parent's total difficulty is asked for
+	// above: a missing record must fail the import before the block, its receipts and its
+	// state are on disk rather than after.
+	currentBlock := bc.CurrentBlock()
+	headTd, err := bc.headTd(currentBlock)
+	if err != nil {
+		return NonStatTy, err
+	}
 
 	// Irrelevant of the canonical status, write the block itself to the database.
 	//
@@ -2090,45 +2178,34 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 		}
 	}
 
-	// If the total difficulty is higher than our known, add it to the canonical chain
-	// Second clause in the if statement reduces the vulnerability to selfish mining.
+	// If the block outranks our head, add it to the canonical chain. The rule
+	// itself lives in forkChoiceBeatsHead so that the known-block path adopts a
+	// chain exactly when an executed block would, including the same-difficulty
+	// split by block number that reduces the vulnerability to selfish mining.
 	// Please refer to http://www.cs.cornell.edu/~ie53/publications/btcProcFC.pdf
-	reorg := externTd.Cmp(localTd) > 0
-	currentBlock = bc.CurrentBlock()
-	if !reorg && externTd.Cmp(localTd) == 0 {
-		// Split same-difficulty blocks by number
-		reorg = block.NumberU64() > currentBlock.Number.Uint64()
-	}
-	if reorg {
-		// Reorganise the chain if the parent is not the head block
-		if block.ParentHash() != currentBlock.Hash() {
-			if err := bc.reorg(currentBlock, block.Header()); err != nil {
-				return NonStatTy, err
-			}
-		}
-		status = CanonStatTy
-	} else {
+	//
+	// externTd is the block's own total difficulty, accumulated above to be written with the
+	// block, and headTd the head's, read before anything was written: asking through
+	// blockBeatsHead would look the parent's up a second time for a value this function
+	// already holds, and the head's for the one it already read.
+	//
+	// Reading the head as "does not beat the head" when its record is missing would write
+	// the block as a side chain and leave the head where it is, with no error and no log,
+	// and every following block would repeat the same silent stall. headTd reports that
+	// record being missing instead, and it does so before the write above for the same
+	// reason the parent's total difficulty is asked for before it.
+	if !forkChoiceBeatsHead(externTd, headTd, block.NumberU64(), currentBlock) {
 		status = SideStatTy
-	}
-
-	// Set new head.
-	if status == CanonStatTy {
-		// WriteBlock has already been called, no need to write again
-		bc.writeHeadBlock(block, false)
-		// prepare set of masternodes for the next epoch
-		if bc.chainConfig.XDPoS != nil && ((block.NumberU64() % bc.chainConfig.XDPoS.Epoch) == (bc.chainConfig.XDPoS.Epoch - bc.chainConfig.XDPoS.Gap)) {
-			if err := bc.UpdateM1(); err != nil {
-				log.Crit("Fail to update masternodes during writeBlockWithState", "number", block.Number, "hash", block.Hash().Hex(), "err", err)
-			}
+	} else {
+		status = CanonStatTy
+		// adoptHead reorganises the chain and writes the new head together: reorg leaves the
+		// head to its caller, so the two must not be split.
+		if err := bc.adoptHead(block, currentBlock, "Fail to update masternodes during writeBlockWithState"); err != nil {
+			return NonStatTy, err
 		}
 	}
 	// save cache BlockSigners
-	if bc.chainConfig.XDPoS != nil && bc.chainConfig.IsTIPSigning(block.Number()) {
-		engine, ok := bc.Engine().(*XDPoS.XDPoS)
-		if ok {
-			engine.CacheSigningTxs(block.Header().Hash(), block.Transactions())
-		}
-	}
+	bc.cacheSigningTxs(block)
 	bc.futureBlocks.Remove(block.Hash())
 	return status, nil
 }
@@ -2310,14 +2387,56 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, []
 	//   2. The block is stored as a sidechain, and is lying about it's stateroot, and passes a stateroot
 	// 	    from the canonical chain, which has not been verified.
 	case errors.Is(err, ErrKnownBlock):
-		// Skip all known blocks that behind us
-		current := bc.CurrentBlock().Number.Uint64()
-
-		for block != nil && errors.Is(err, ErrKnownBlock) && current >= block.NumberU64() {
+		// Skip all known blocks that the chain would not adopt anyway, comparing each of
+		// them against the current head. Nothing in the loop moves the head, so the head and
+		// its total difficulty are read once for the whole run: a batch re-delivering
+		// thousands of known blocks would otherwise pay two database lookups per block.
+		// A head this node holds no record for cannot be compared against, and reading that
+		// as "does not beat the head" would report every known block in the batch as one it
+		// would not adopt: the batch would succeed, the head would stay where it is, and the
+		// only trace would be the ignored count. The missing record is a condition of this
+		// node rather than of the blocks, so it is reported as one - the same answer headTd
+		// gives for the same read anywhere else.
+		head := bc.CurrentBlock()
+		headTd, headErr := bc.headTd(head)
+		if headErr != nil {
+			return it.index, events, coalescedLogs, headErr
+		}
+		for block != nil && errors.Is(err, ErrKnownBlock) && !bc.blockBeatsHeadTd(block, head, headTd) {
+			// blockTd answers nil for two different things: a block this node holds no
+			// record for, and the genesis block, which has no record to hold. The rule
+			// above folds both into "does not beat the head", but only the first is a
+			// condition of this node - report it the way writeKnownBlock reports the same
+			// read, and leave the genesis block to the skip the rule gives it.
+			if block.NumberU64() != 0 && bc.blockTd(block) == nil {
+				return it.index, events, coalescedLogs, fmt.Errorf("%w: no total difficulty for stored block %d (%v)",
+					ErrLocalInsertCondition, block.NumberU64(), block.Hash())
+			}
+			// A known block that loses fork choice now loses it later too - the head
+			// only moves forward here - so leaving it parked would have procFutureBlocks
+			// re-verify it on every tick without ever draining the entry. Dropping it is
+			// safe: ErrKnownBlock means the block and its state are on disk, so a batch
+			// that carries it again adopts it on this very path.
+			//
+			// Counted here as well as in the import loop below, and only above the head:
+			// a known block below it is a routine skip of a block that is already
+			// canonical, not a range that came back without moving the head. The meter
+			// is what makes a stalled sync visible, so it must not be paid for by every
+			// block of every re-delivered range.
+			bc.futureBlocks.Remove(block.Hash())
+			if block.NumberU64() > head.Number.Uint64() {
+				blockKnownNotAdoptedMeter.Mark(1)
+			}
 			stats.ignored++
 			block, err = it.next()
 		}
-		// Falls through to the block import
+		// A stop of this loop is left to the tail of the import loop below, which reports
+		// the block it ended on through the same table. Reporting it here as well would
+		// write the same bad block twice: reportBlock is not idempotent - it overwrites
+		// the entry and increments its counter again.
+		// A known block that wins fork choice is not skipped: it falls through to
+		// the import loop below, which adopts it with writeKnownBlock and then
+		// carries on with the rest of the batch instead of stopping on it.
 
 	// Some other error occurred, abort
 	case err != nil:
@@ -2330,7 +2449,7 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, []
 	}
 
 	// No validation errors for the first block (or chain prefix skipped)
-	for ; block != nil && err == nil; block, err = it.next() {
+	for ; block != nil && (err == nil || errors.Is(err, ErrKnownBlock)); block, err = it.next() {
 		// If the chain is terminating, stop processing blocks
 		if bc.insertStopped() {
 			log.Debug("Premature abort during blocks processing")
@@ -2346,6 +2465,38 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, []
 		if BadHashes[block.Hash()] {
 			bc.reportBlock(block, nil, ErrDenylistedHash)
 			return it.index, events, coalescedLogs, ErrDenylistedHash
+		}
+		// The block and its state are already stored, so re-executing it would only
+		// reproduce what is on disk. It still has to become the head, but only if it
+		// wins the same fork choice an executed block would.
+		if errors.Is(err, ErrKnownBlock) {
+			log.Debug("Writing previously known block", "number", block.Number(), "hash", block.Hash())
+			adoptedBlock, promoted, adoptErr := bc.writeKnownBlock(block)
+			if adoptErr != nil {
+				return it.index, events, coalescedLogs, adoptErr
+			}
+			if adoptedBlock == nil {
+				// The block is executed and on disk, this node simply does not adopt this
+				// branch. The batch still reports success, so the count is the only trace
+				// of a sync that keeps delivering ranges without the head moving.
+				//
+				// Drop it from the future queue for the reason the skip loop above gives:
+				// a block that loses fork choice now loses it later too, so the entry
+				// would only be re-verified on every futureBlocksLoop tick.
+				bc.futureBlocks.Remove(block.Hash())
+				blockKnownNotAdoptedMeter.Mark(1)
+				stats.ignored++
+				continue
+			}
+			// The head has advanced, so consumers of chain events must be notified
+			// even for an adopted known block - and with the stored block, not with the
+			// one the batch handed in. See writeKnownBlock.
+			blockEvents, blockLogs := bc.announceKnownBlock(adoptedBlock, promoted)
+			events = append(events, blockEvents...)
+			coalescedLogs = append(coalescedLogs, blockLogs...)
+			stats.processed++
+			lastCanon = adoptedBlock
+			continue
 		}
 		// Retrieve the parent block and it's state to execute on top
 		start := time.Now()
@@ -2989,6 +3140,18 @@ func (bc *BlockChain) collectLogs(b *types.Block, removed bool) []*types.Log {
 // reorg takes two blocks, an old chain and a new chain and will reconstruct the
 // blocks and inserts them to be part of the new canonical chain and accumulates
 // potential missing transactions and post an event about them.
+//
+// The new head block is deliberately not processed here: the caller has to write it with
+// writeHeadBlock once reorg returns successfully - and only then - and must not write it a
+// second time. adoptHead is the single caller that does so today, for both the executed
+// path (writeBlockWithState) and the already stored one (writeKnownBlock).
+//
+// A failed reorg does not leave a torn head behind for the caller to repair: every one of
+// its failure returns - the chain reduction, the committed-block guard and the GetBlock
+// lookups in the loops below - runs before the stale hash markers are dropped, so the head
+// marker still names whatever the loop wrote last and the marker of the new head was never
+// deleted. That is the same state the chain was in before this helper existed, where the
+// caller returned without writing the head as well.
 func (bc *BlockChain) reorg(oldHead, newHead *types.Header) error {
 	log.Warn("Reorg", "OldHash", oldHead.Hash().Hex(), "OldNum", oldHead.Number, "NewHash", newHead.Hash().Hex(), "NewNum", newHead.Number)
 
@@ -3150,8 +3313,25 @@ func (bc *BlockChain) reorg(oldHead, newHead *types.Header) error {
 		// }
 	}
 
-	// Apply new blocks in forward order
-	for i := len(newChain) - 1; i >= 0; i-- {
+	// The new head (newChain[0]) is not applied by this function - the caller writes it
+	// once the reorg is done - but its transactions still belong to the rebirth set: the
+	// difference below drops the transactions of the rewound blocks from the lookup table,
+	// and leaving the head's own transactions out would have this reorg delete entries the
+	// caller is about to write back. Collect them before the loop, whose bounds skip the
+	// head.
+	if len(newChain) > 0 {
+		head := bc.GetBlock(newChain[0].Hash(), newChain[0].Number.Uint64())
+		if head == nil {
+			return errInvalidNewChain // Corrupt database, mostly here to avoid weird panics
+		}
+		for _, tx := range head.Transactions() {
+			rebirthTxs = append(rebirthTxs, tx.Hash())
+		}
+	}
+	// Apply the rest of the new blocks in forward order. The loop stops at index 1, the
+	// upstream go-ethereum bound: this function does not handle the new chain head, so
+	// neither its markers nor, for a gap block, its UpdateM1 are written here.
+	for i := len(newChain) - 1; i >= 1; i-- {
 		// Collect all the included transactions
 		block := bc.GetBlock(newChain[i].Hash(), newChain[i].Number.Uint64())
 		if block == nil {
@@ -3160,18 +3340,26 @@ func (bc *BlockChain) reorg(oldHead, newHead *types.Header) error {
 		for _, tx := range block.Transactions() {
 			rebirthTxs = append(rebirthTxs, tx.Hash())
 		}
-		// Collect inserted logs and emit them
-		if logs := bc.collectLogs(block, false); len(logs) > 0 {
-			rebirthLogs = append(rebirthLogs, logs...)
-		}
-		if len(rebirthLogs) > 512 {
-			bc.logsFeed.Send(rebirthLogs)
-			rebirthLogs = nil
+		// Collect inserted logs and emit them, but only for blocks that are
+		// promoted to the canonical chain for the first time. A rollback only
+		// rewinds the head markers and leaves the canonical mappings of the
+		// blocks it rewinds over in place, so re-importing a known block
+		// across them lands here with those retained blocks as intermediates.
+		// Their logs were delivered before the rollback, and sending them
+		// again would duplicate them.
+		if bc.GetCanonicalHash(block.NumberU64()) != block.Hash() {
+			if logs := bc.collectLogs(block, false); len(logs) > 0 {
+				rebirthLogs = append(rebirthLogs, logs...)
+			}
+			if len(rebirthLogs) > 512 {
+				bc.logsFeed.Send(rebirthLogs)
+				rebirthLogs = nil
+			}
 		}
 		// Update the head block
 		bc.writeHeadBlock(block, true)
 		// prepare set of masternodes for the next epoch
-		if bc.chainConfig.XDPoS != nil && ((block.NumberU64() % bc.chainConfig.XDPoS.Epoch) == (bc.chainConfig.XDPoS.Epoch - bc.chainConfig.XDPoS.Gap)) {
+		if bc.isGapBlock(block) {
 			if err := bc.UpdateM1(); err != nil {
 				log.Crit("Fail to update masternodes during reorg", "number", block.Number, "hash", block.Hash().Hex(), "err", err)
 			}
@@ -3188,11 +3376,15 @@ func (bc *BlockChain) reorg(oldHead, newHead *types.Header) error {
 		rawdb.DeleteTxLookupEntry(batch, tx)
 	}
 	// Delete all hash markers that are not part of the new canonical chain.
-	// Because the reorg function handles new chain head, all hash
-	// markers greater than new chain head should be deleted.
+	// reorg deliberately does not write the new chain head - its callers do - so the new
+	// head's own marker is the first one that may go. This matches upstream go-ethereum
+	// (core/blockchain.go, reorg): keep the two in sync when backporting. Three shapes:
+	// len(newChain) == 0 is a pure rewind, so everything above commonBlock is stale;
+	// len(newChain) == 1 means newChain[0] sits directly above commonBlock;
+	// len(newChain) > 1 means newChain[1] is the head minus one, contiguous by construction.
 	number := commonBlock.Number
-	if len(newChain) > 0 {
-		number = newChain[0].Number
+	if len(newChain) > 1 {
+		number = newChain[1].Number
 	}
 	for i := number.Uint64() + 1; ; i++ {
 		hash := rawdb.ReadCanonicalHash(bc.db, i)
