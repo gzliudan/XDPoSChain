@@ -44,9 +44,10 @@ type insertErrClass struct {
 //	ErrChainStopped          retryable, local  the chain is shutting down
 //	ErrLocalInsertAheadOfClock retryable, local  a block dated too far ahead of this node's
 //	                                           clock to be queued; the clock catches up
-//	ErrLocalInsertCondition  local            a segment with nothing stored, or a record
-//	                                           this node no longer holds: the next tick
-//	                                           reads the same records
+//	ErrLocalInsertCondition  local            a segment with nothing stored, a refused
+//	                                           receipt write, a stored block with no total
+//	                                           difficulty record: the next tick reads the
+//	                                           same records
 //	ErrLocalInsertRefused    local            a reorg this node refuses; retrying it can only
 //	                                           be refused again, so it must not stay parked
 //	ErrKnownBlock            local            the block is on disk; the next batch adopts it
@@ -124,4 +125,35 @@ func IsLocalInsertError(err error) bool {
 // implementation it abstracts back into its dependency tree.
 func (bc *BlockChain) IsLocalInsertError(err error) bool {
 	return IsLocalInsertError(err)
+}
+
+// DescribeLocalInsertFailure names why an insertion failed for a local condition, so that the
+// callers which take their error message from the classification - the file importers - report
+// the same reason for the same sentinel instead of each keeping its own copy of the list.
+//
+// ok is false for anything that is not local: those are the failures the caller reports in its
+// own words, because they are about the blocks rather than about this node.
+//
+// The specific sentinels are asked before the local flag on purpose: ErrKnownBlock and
+// ErrPrunedAncestor are local as well, so testing IsLocalInsertError first would mask their
+// reasons and report every one of them as a plain interruption.
+func DescribeLocalInsertFailure(err error) (string, bool) {
+	switch {
+	case errors.Is(err, ErrLocalInsertRefused), errors.Is(err, ErrLocalInsertCondition),
+		errors.Is(err, ErrLocalInsertAheadOfClock):
+		// None of them is a fault of the blocks, so blaming the file would report this
+		// node's own state as a corrupt import. The message says the import cannot proceed
+		// rather than that the file is bad, and claims nothing about a retry: a refused
+		// reorg is refused again while the head does not move, a record this node is
+		// missing is missing for this file as well, and a block dated ahead of the clock is
+		// one this import cannot place even though a later retry could.
+		return "cannot be imported", true
+	case errors.Is(err, ErrKnownBlock):
+		return "already imported", true
+	case errors.Is(err, consensus.ErrPrunedAncestor):
+		return "ancestor state is pruned", true
+	case IsLocalInsertError(err):
+		return "interrupted during import", true
+	}
+	return "", false
 }

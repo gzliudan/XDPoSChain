@@ -165,3 +165,51 @@ func TestIsLocalInsertErrorIsTheLocalFlag(t *testing.T) {
 		}
 	}
 }
+
+// TestDescribeLocalInsertFailure pins the reason each local sentinel reports, and that a failure
+// the blocks are to blame for stays with the caller. The file importers take their message from
+// here, so a sentinel whose reason is missing would be reported as "invalid block <n>" - the
+// reading the classification exists to avoid.
+//
+// The reason is deliberately not a claim about a retry: ErrLocalInsertCondition and
+// ErrLocalInsertAheadOfClock differ in classifyInsertErr - a record this node is missing is
+// missing again on the next tick, while a clock that cannot place a block yet catches up - and
+// both only say that this very input cannot be imported now.
+func TestDescribeLocalInsertFailure(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"refused reorg", ErrLocalInsertRefused, "cannot be imported"},
+		{"local condition", ErrLocalInsertCondition, "cannot be imported"},
+		{"ahead of the local clock", ErrLocalInsertAheadOfClock, "cannot be imported"},
+		{"known block", ErrKnownBlock, "already imported"},
+		{"pruned ancestor", consensus.ErrPrunedAncestor, "ancestor state is pruned"},
+		{"interrupted import", ErrInsertionInterrupted, "interrupted during import"},
+		{"stopped chain", ErrChainStopped, "interrupted during import"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reason, ok := DescribeLocalInsertFailure(tt.err)
+			if !ok {
+				t.Fatalf("DescribeLocalInsertFailure(%v) must report a local failure", tt.err)
+			}
+			if reason != tt.want {
+				t.Errorf("DescribeLocalInsertFailure(%v) = %q, want %q", tt.err, reason, tt.want)
+			}
+		})
+	}
+	// A future block is retryable but not local, and an unknown ancestor is the peer's: the
+	// caller words both itself.
+	for _, err := range []error{
+		consensus.ErrFutureBlock,
+		consensus.ErrUnknownAncestor,
+		errors.New("derived state root mismatch"),
+		nil,
+	} {
+		if reason, ok := DescribeLocalInsertFailure(err); ok {
+			t.Errorf("DescribeLocalInsertFailure(%v) = %q, want it left to the caller", err, reason)
+		}
+	}
+}
