@@ -3045,9 +3045,9 @@ func dropTd(t *testing.T, chain *BlockChain, block *types.Block) {
 	}
 }
 
-// sidechainSegmentIterator hands insertSidechain a batch whose first block has already
+// sidechainSegmentIterator hands insertSideChain a batch whose first block has already
 // been pulled from the iterator, mirroring the call site in insertChain. Every block is
-// reported as pruned, the shape that routes a batch into insertSidechain.
+// reported as pruned, the shape that routes a batch into insertSideChain.
 func sidechainSegmentIterator(t *testing.T, chain *BlockChain, batch types.Blocks) (*types.Block, *insertIterator) {
 	t.Helper()
 
@@ -3076,7 +3076,7 @@ func TestInsertSidechainReportsMissingParentTd(t *testing.T) {
 	// has, so the scan has nothing to weigh it against.
 	block, it := sidechainSegmentIterator(t, chain, blocks[3:5])
 
-	n, _, _, err := chain.insertSidechain(block, it)
+	n, _, _, err := chain.insertSideChain(block, it, true)
 	if !errors.Is(err, ErrLocalInsertCondition) {
 		t.Fatalf("unexpected error: have %v want %v", err, ErrLocalInsertCondition)
 	}
@@ -3109,7 +3109,7 @@ func TestInsertSidechainReportsMissingLocalTd(t *testing.T) {
 	// and the scan runs until the batch is exhausted.
 	block, it := sidechainSegmentIterator(t, chain, blocks[4:6])
 
-	n, _, _, err := chain.insertSidechain(block, it)
+	n, _, _, err := chain.insertSideChain(block, it, true)
 	if !errors.Is(err, ErrLocalInsertCondition) {
 		t.Fatalf("unexpected error: have %v want %v", err, ErrLocalInsertCondition)
 	}
