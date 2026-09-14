@@ -76,6 +76,14 @@ type downloadTester struct {
 
 	insertHeaderChainHook func([]*types.Header) error
 
+	// insertChainHook, when non-nil, makes InsertChain fail with the returned error
+	// before touching the simulated chain.
+	insertChainHook func(types.Blocks) error
+
+	// insertReceiptChainHook, when non-nil, makes InsertReceiptChain fail with the
+	// returned error before touching the simulated chain.
+	insertReceiptChainHook func(types.Blocks, []types.Receipts) error
+
 	// headHeaderCap, when non-zero, caps the height reported by CurrentHeader.
 	// It models the real chain, where importing blocks moves the header head
 	// back to the block being inserted. It must be set below the length of the
@@ -308,6 +316,11 @@ func (dl *downloadTester) InsertHeaderChain(headers []*types.Header, checkFreq i
 func (dl *downloadTester) InsertChain(blocks types.Blocks) (i int, err error) {
 	dl.lock.Lock()
 	defer dl.lock.Unlock()
+	if dl.insertChainHook != nil {
+		if err := dl.insertChainHook(blocks); err != nil {
+			return 0, err
+		}
+	}
 
 	for i, block := range blocks {
 		if parent, ok := dl.ownBlocks[block.ParentHash()]; !ok {
@@ -354,6 +367,12 @@ func (dl *downloadTester) writeBlockWithoutState(block *types.Block) error {
 func (dl *downloadTester) InsertReceiptChain(blocks types.Blocks, receipts []types.Receipts) (i int, err error) {
 	dl.lock.Lock()
 	defer dl.lock.Unlock()
+
+	if dl.insertReceiptChainHook != nil {
+		if err := dl.insertReceiptChainHook(blocks, receipts); err != nil {
+			return 0, err
+		}
+	}
 
 	for i := 0; i < len(blocks) && i < len(receipts); i++ {
 		if _, ok := dl.ownHeaders[blocks[i].Hash()]; !ok {
@@ -409,12 +428,15 @@ func (dl *downloadTester) dropPeer(id string) {
 	dl.downloader.UnregisterPeer(id)
 }
 
-// an empty handleProposedBlock function
+// a handleProposedBlock function that records what it was handed
 func (dl *downloadTester) handleProposedBlock(header *types.Header) error {
+	dl.lock.Lock()
+	defer dl.lock.Unlock()
+	dl.proposedBlocks = append(dl.proposedBlocks, header)
 	return nil
 }
 
-// proposedHandled returns the headers the proposed-block callback was invoked with.
+// proposedHandled returns the headers handed to the proposed-block callback so far.
 func (dl *downloadTester) proposedHandled() []*types.Header {
 	dl.lock.RLock()
 	defer dl.lock.RUnlock()
@@ -1882,6 +1904,7 @@ func testBlockHeaderAttackerDropping(t *testing.T, protocol int) {
 		{errInvalidBody, false},             // A bad peer was detected, but not the sync origin
 		{errInvalidReceipt, false},          // A bad peer was detected, but not the sync origin
 		{errCancelContentProcessing, false}, // Synchronisation was canceled, origin may be innocent, don't drop
+		{errLocalInsertFailure, false},      // The node could not write the range, the peer is innocent, don't drop
 	}
 	// Run the tests and check disconnection status
 	tester := newTester()
