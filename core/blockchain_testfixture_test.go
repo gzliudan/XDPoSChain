@@ -243,26 +243,6 @@ func (e *failFromEngine) VerifyHeaders(chain consensus.ChainReader, headers []*t
 	return abort, results
 }
 
-// recordingProposedEngine records the headers the future-block queue hands to the
-// proposed-block hook.
-type recordingProposedEngine struct {
-	consensus.Engine
-	mu   sync.Mutex
-	seen []common.Hash
-}
-
-func (e *recordingProposedEngine) HandleProposedBlock(chain consensus.ChainReader, header *types.Header) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.seen = append(e.seen, header.Hash())
-	return nil
-}
-func (e *recordingProposedEngine) handled() []common.Hash {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return append([]common.Hash(nil), e.seen...)
-}
-
 // newFarFutureChain builds a short chain whose first block is past the window the future
 // queue accepts, so that refusing it says something about this node's clock rather than
 // about the block. The engine decides verification; the genesis only carries the balance

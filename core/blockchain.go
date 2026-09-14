@@ -84,6 +84,11 @@ var (
 	blockReorgAddMeter  = metrics.NewRegisteredMeter("chain/reorg/add", nil)
 	blockReorgDropMeter = metrics.NewRegisteredMeter("chain/reorg/drop", nil)
 
+	// Blocks a futureBlocksLoop pass took out of the queue for good. The queue is the only
+	// place a parked block lives before it is imported, so this counts the blocks that now
+	// have to be delivered again.
+	blockFutureEvictMeter = metrics.NewRegisteredMeter("chain/futureblocks/evictions", nil)
+
 	blockPrefetchExecuteTimer   = metrics.NewRegisteredTimer("chain/prefetch/executes", nil)
 	blockPrefetchInterruptMeter = metrics.NewRegisteredMeter("chain/prefetch/interrupts", nil)
 
@@ -1373,17 +1378,123 @@ func (bc *BlockChain) procFutureBlocks() {
 		types.BlockBy(types.Number).Sort(blocks)
 
 		// Insert one by one as chain insertion needs contiguous ancestry between blocks
+		var lastCanon *types.Block
+		// The blocks this pass has proved unimportable and dropped. Their queued children are
+		// orphans from that moment on - their parent is neither on the chain nor parked any
+		// more - so a retry could only answer ErrUnknownAncestor, which insertChain records as
+		// a bad block. They are dropped here instead, for the same reason as their parent, so
+		// that a valid block is never written into the bad block database for a state of this
+		// queue.
+		//
+		// The guard covers one pass, and deliberately so: an orphan whose parent an earlier
+		// pass dropped still reaches insertChain on its own delivery, which answers
+		// ErrUnknownAncestor and records that valid block as a bad one. Widening the guard to
+		// everything the queue has ever dropped would also evict the blocks a peer delivers
+		// ahead of their parent, so the residue is left to the next delivery rather than
+		// guessed at here.
+		dropped := make(map[common.Hash]bool)
 		for i := range blocks {
-			_, err := bc.InsertChain(blocks[i : i+1])
-			// let consensus engine handle the last block (e.g. for voting)
-			if i == len(blocks)-1 && err == nil {
-				engine, ok := bc.Engine().(*XDPoS.XDPoS)
-				if ok {
-					header := blocks[i].Header()
-					err = engine.HandleProposedBlock(bc, header)
-					if err != nil {
-						log.Info("[procFutureBlocks] handle proposed block has error", "err", err, "block hash", header.Hash(), "number", header.Number)
+			// The parent was dropped earlier in this same pass, so this block is an orphan of
+			// our own eviction and must not be handed to insertChain: the only answer left for
+			// it there is ErrUnknownAncestor, and that one is reported as a bad block.
+			if dropped[blocks[i].ParentHash()] {
+				log.Debug("[procFutureBlocks] dropping the orphaned parked block",
+					"number", blocks[i].Number(), "hash", blocks[i].Hash(), "parent", blocks[i].ParentHash())
+				blockFutureEvictMeter.Mark(1)
+				bc.futureBlocks.Remove(blocks[i].Hash())
+				dropped[blocks[i].Hash()] = true
+				continue
+			}
+			// The head this attempt starts from. InsertChain reports an error for a batch it
+			// stopped in the middle of as well, and a pruned sidechain rebuild can have moved
+			// the head by then, so the failure path below asks where the head is instead of
+			// assuming nothing moved.
+			before := bc.CurrentBlock()
+			if _, err := bc.InsertChain(blocks[i : i+1]); err != nil {
+				// A failure that moved the head is not only a failure to report: the rebuild
+				// promoted stored ancestors on the way here, and the engine hook below is what
+				// advances the consensus state with the new head. The hash comparison further
+				// down only recognises a head this loop's own block reached, so a head moved by
+				// the rebuild would be dropped there and the engine would never hear about it.
+				// The downloader's handoffProposedBlock asks the same question the same way.
+				if head := bc.CurrentBlock(); head != nil && (before == nil || head.Hash() != before.Hash()) {
+					if moved := bc.GetBlock(head.Hash(), head.Number.Uint64()); moved != nil {
+						lastCanon = moved
 					}
+				}
+				// Retryable failures keep the block parked: it is still in the future
+				// (ErrFutureBlock), its parent is itself parked in the queue
+				// (ErrUnknownAncestor), the attempt never looked at the block at all
+				// (ErrInsertionInterrupted, ErrChainStopped), or the one local condition
+				// that heals is what stopped it (ErrLocalInsertAheadOfClock - the clock
+				// catches up). A record this node is missing, on the other hand, is
+				// ErrLocalInsertCondition and is not retryable: it is read the same way
+				// on every tick, so waiting for it would re-verify the block forever.
+				// None of the retryable ones says anything about the block, and the batch
+				// that parked it already reported success, so an eviction here would drop
+				// it for good. A new retryable error has to be registered in
+				// classifyInsertErr - that flag is what selects this branch - otherwise
+				// its blocks are dropped for good.
+				// Anything else is evicted: it leaves the queue for good rather than being
+				// re-verified and re-reported as a bad block on every futureBlocksLoop tick.
+				// Blocks are sorted by number, so evicting a failed parent makes the Contains
+				// check of its queued children fail within the same pass and the whole
+				// orphaned chain drains.
+				//
+				// The parked parent is chain state rather than a property of the error, so it
+				// stays here instead of in the table the retryable flag comes from.
+				class := classifyInsertErr(err)
+				if class.retryable ||
+					(errors.Is(err, consensus.ErrUnknownAncestor) && bc.futureBlocks.Contains(blocks[i].ParentHash())) {
+					log.Debug("[procFutureBlocks] keeping the parked block for a later retry",
+						"number", blocks[i].Number(), "hash", blocks[i].Hash(), "err", err)
+					continue
+				}
+				// Nothing else is retried, so this is the only place that can explain why a
+				// parked block disappeared, and the metric below is the only count of it. Every
+				// eviction reached this way is logged at Warn, including the ones the table
+				// blames the block for: that report is not guaranteed. insertChain hands back
+				// unrecognised errors from paths that never ask the table - the state read of
+				// its main loop - and the default class still calls them the block's fault, so a
+				// Warn here is the only trace such an eviction leaves. The ones the table does
+				// not blame the block for - a refused reorg, an ancestor whose state is gone -
+				// have no report at all, and dropping one of those is exactly what has to be
+				// visible.
+				//
+				// The orphans dropped at the top of the loop are the one eviction that leaves no
+				// line here: the Warn their parent left is what explains them, and one line per
+				// orphan would only repeat the reason the whole orphaned chain is gone.
+				//
+				// Those two are local and not retryable, which is why they land here: a
+				// refused reorg is refused again while the head does not move, and an ancestor
+				// whose state is gone cannot be rebuilt from this queue. Evicting them is
+				// therefore permanent - only a re-delivery brings the block back - so a new
+				// sentinel that is local and not retryable has to be weighed here as well, not
+				// only in the table it is registered in.
+				log.Warn("[procFutureBlocks] dropping the parked block",
+					"number", blocks[i].Number(), "hash", blocks[i].Hash(), "err", err)
+				blockFutureEvictMeter.Mark(1)
+				bc.futureBlocks.Remove(blocks[i].Hash())
+				dropped[blocks[i].Hash()] = true
+				continue
+			}
+			// Only a write that advanced the canonical head qualifies for the engine
+			// hook below: known blocks that are skipped return a nil error without
+			// importing, and side-chain writes must not be treated as the head.
+			// Comparing hashes also keeps a same-height fork from being mistaken for
+			// the canonical head.
+			if head := bc.CurrentBlock(); head != nil && head.Hash() == blocks[i].Hash() {
+				lastCanon = blocks[i]
+			}
+		}
+		// Let the consensus engine handle the highest imported canonical block (e.g.
+		// for voting). The sorted queue tail cannot be the target: it may have failed
+		// to import while lower blocks advanced the head, or sit on a side branch.
+		if lastCanon != nil {
+			if engine, ok := bc.Engine().(*XDPoS.XDPoS); ok {
+				header := lastCanon.Header()
+				if err := engine.HandleProposedBlock(bc, header); err != nil {
+					log.Info("[procFutureBlocks] handle proposed block has error", "err", err, "block hash", header.Hash(), "number", header.Number)
 				}
 			}
 		}
