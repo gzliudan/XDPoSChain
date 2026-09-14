@@ -44,6 +44,12 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/crypto"
 )
 
+// deployChainV2SwitchBlock is the block at which the throwaway chain used to
+// deploy the genesis contracts would switch to the XDPoS v2 engine. Deploying
+// takes a handful of blocks, so the switch is never reached and the chain stays
+// on v1 throughout. It must be a whole number of epochs and must not be 0.
+const deployChainV2SwitchBlock = 900
+
 type GenesisInput struct {
 	Name                    string   // informational network name
 	ChainId                 uint64   // network id
@@ -94,6 +100,44 @@ func (w *wizard) loadGenesisInput() *GenesisInput {
 }
 
 // makeGenesis creates a new genesis struct based on some user input.
+// masternodeRewards are the per-epoch reward figures derived from the staking
+// threshold and the target yield, in whole coins.
+type masternodeRewards struct {
+	TotalPerEpoch    uint64  // rewards paid out to the whole masternode set each epoch
+	MasternodeReward float64 // reward of a single masternode (core validator)
+	ProtectorReward  float64 // reward of a single protector, 80% of a masternode
+	ObserverReward   float64 // reward of a single observer, 40% of a masternode
+}
+
+// calcMasternodeRewards derives the per-epoch rewards from the block period,
+// the epoch length, the per-masternode staking threshold and the target reward
+// yield in APY%. The per-node rewards are grossed up by the foundation cut, so
+// that a masternode still earns the requested yield after the foundation has
+// taken its percentage. It reports false when the period and epoch length do
+// not add up to at least one epoch per year, in which case there is nothing to
+// pay out and the caller should leave the reward config untouched.
+func calcMasternodeRewards(period, epoch, threshold, yield uint64, masternodes int) (masternodeRewards, bool) {
+	if period == 0 || epoch == 0 {
+		return masternodeRewards{}, false
+	}
+	blocksPerYear := 31536000 / period
+	epochsPerYear := blocksPerYear / epoch
+	if epochsPerYear == 0 {
+		return masternodeRewards{}, false
+	}
+	rewardsPerYear := float64(threshold) * (float64(yield) / 100)
+	rewardPerEpochPerMNWithoutFoundation := rewardsPerYear / float64(epochsPerYear)
+	rewardPerEpochPerMN := rewardPerEpochPerMNWithoutFoundation * 100 / float64(100-common.RewardFoundationPercent)
+	totalRewardPerEpoch := rewardPerEpochPerMN * float64(masternodes)
+
+	return masternodeRewards{
+		TotalPerEpoch:    uint64(math.Round(totalRewardPerEpoch)),
+		MasternodeReward: math.Round(rewardPerEpochPerMN*10000) / 10000,
+		ProtectorReward:  math.Round(rewardPerEpochPerMN*0.8*10000) / 10000,
+		ObserverReward:   math.Round(rewardPerEpochPerMN*0.4*10000) / 10000,
+	}, true
+}
+
 func (w *wizard) makeGenesis() {
 	genesis := &core.Genesis{
 		Timestamp:  uint64(time.Now().Unix()),
@@ -267,36 +311,42 @@ func (w *wizard) makeGenesis() {
 		} else {
 			yield = uint64(w.readDefaultInt(10))
 		}
-		if genesis.Config.XDPoS.Period > 0 && genesis.Config.XDPoS.Epoch > 0 {
-			blocksPerYear := 31536000 / genesis.Config.XDPoS.Period
-			epochsPerYear := blocksPerYear / genesis.Config.XDPoS.Epoch
-			if epochsPerYear > 0 {
-				rewardsPerYear := float64(threshold) * (float64(yield) / float64(100))
-				rewardPerEpochPerMN := uint64(rewardsPerYear / float64(epochsPerYear))
-				totalRewardPerEpoch := rewardPerEpochPerMN * uint64(len(signers))
-				fmt.Println()
-				fmt.Println("Calculated Total Masternode rewards per epoch based on yield: ", totalRewardPerEpoch)
-				genesis.Config.XDPoS.Reward = totalRewardPerEpoch
-				genesis.Config.XDPoS.V2.CurrentConfig.MasternodeReward = math.Round(float64(rewardPerEpochPerMN)*1000) / 1000
-				genesis.Config.XDPoS.V2.CurrentConfig.ProtectorReward = math.Round(float64(rewardPerEpochPerMN)*0.8*1000) / 1000
-				genesis.Config.XDPoS.V2.CurrentConfig.ObserverReward = math.Round(float64(rewardPerEpochPerMN)*0.6*1000) / 1000
-
+		if input != nil {
+			if input.Epoch == 0 {
+				log.Crit("Invalid epoch length", "epoch", input.Epoch)
 			}
+			genesis.Config.XDPoS.Epoch = input.Epoch
+		}
+		if rewards, ok := calcMasternodeRewards(genesis.Config.XDPoS.Period, genesis.Config.XDPoS.Epoch, threshold, yield, len(signers)); ok {
+			fmt.Println()
+			fmt.Println("Calculated Total Masternode rewards per epoch based on yield: ", rewards.TotalPerEpoch)
+			genesis.Config.XDPoS.Reward = rewards.TotalPerEpoch
+			genesis.Config.XDPoS.V2.CurrentConfig.MasternodeReward = rewards.MasternodeReward
+			genesis.Config.XDPoS.V2.CurrentConfig.ProtectorReward = rewards.ProtectorReward
+			genesis.Config.XDPoS.V2.CurrentConfig.ObserverReward = rewards.ObserverReward
 		}
 
 		fmt.Println()
 		fmt.Println("What is foundation wallet address (collect 10% of all rewards)? (default = xdc0000000000000000000000000000000000000068)")
 		if input == nil {
 			genesis.Config.XDPoS.FoundationWalletAddr = w.readDefaultAddress(common.FoundationAddrBinary)
+		} else {
+			if !common.IsHexAddress(input.FoundationWalletAddress) {
+				log.Crit("Invalid foundation wallet address", "address", input.FoundationWalletAddress)
+			}
+			genesis.Config.XDPoS.FoundationWalletAddr = common.HexToAddress(input.FoundationWalletAddress)
 		}
 
 		// Validator Smart Contract Code
 		pKey, _ := crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
 		addr := crypto.PubkeyToAddress(pKey.PublicKey)
 		deployerFunds := new(big.Int).Mul(big.NewInt(1_000_000), big.NewInt(1e18)) // 1,000,000 ETH
+		deployConfig := params.LocalnetChainConfig.Clone()
+		deployConfig.XDPoS.V2.SwitchBlock = new(big.Int).SetUint64(deployChainV2SwitchBlock)
+		deployConfig.XDPoS.V2.SwitchEpoch = deployChainV2SwitchBlock / deployConfig.XDPoS.Epoch
 		// Gas limit increased to 10,000,000,000 to support validator contract deployment with large masternode counts (>38).
-		contractBackend := backends.NewXDCSimulatedBackend(types.GenesisAlloc{addr: {Balance: deployerFunds}}, 10_000_000_000, params.TestXDPoSMockChainConfig)
-		transactOpts, err := bind.NewKeyedTransactorWithChainID(pKey, new(big.Int).SetUint64(params.ConsensusOptionalTestChainID))
+		contractBackend := backends.NewXDCSimulatedBackend(types.GenesisAlloc{addr: {Balance: deployerFunds}}, 10_000_000_000, deployConfig)
+		transactOpts, err := bind.NewKeyedTransactorWithChainID(pKey, deployConfig.ChainID)
 		if err != nil {
 			log.Crit("Failed to create genesis contract deployer", "err", err)
 		}
