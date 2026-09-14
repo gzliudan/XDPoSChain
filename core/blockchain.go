@@ -2891,7 +2891,31 @@ func (bc *BlockChain) insertSideChain(block *types.Block, it *insertIterator, ve
 	for ; block != nil && (errors.Is(err, consensus.ErrPrunedAncestor)); block, err = it.next() {
 		// Check the canonical state root for that number
 		if number := block.NumberU64(); current >= number {
-			if canonical := bc.GetBlockByNumber(number); canonical != nil && canonical.Root() == block.Root() {
+			canonical := bc.GetBlockByNumber(number)
+			if canonical != nil && canonical.Hash() == block.Hash() {
+				// Not a sidechain block, this is a re-import of a canon block which has it's state pruned.
+				// Carry its total difficulty over: it is the baseline the sidechain blocks
+				// above it are accumulated onto, and a batch made only of such blocks would
+				// otherwise leave externTd nil.
+				//
+				// The scan can pass several of them before it reaches the fork point, so the
+				// value has to follow the last one: keeping only the first would drop the
+				// difficulty of every canonical block in between and underestimate the
+				// segment, which would let a heavier sidechain look lighter than it is.
+				//
+				// A record this node cannot read is not carried over either. Keeping the
+				// previous value would weigh the segment from an earlier canonical block, so
+				// the same underestimate would come back through the missing record; clearing
+				// it hands the case to the two guards around this value, which report it for
+				// what it is. The accumulation below re-reads the parent of the first
+				// sidechain block - this block, when the batch has one - and the comparison
+				// after the scan rejects a segment that accumulated nothing. A later canonical
+				// block whose record is readable restores the baseline, so a hole only weighs
+				// in at the fork point, where the value is actually needed.
+				externTd = bc.GetTd(block.Hash(), number)
+				continue
+			}
+			if canonical != nil && canonical.Root() == block.Root() {
 				// This is most likely a shadow-state attack. When a fork is imported into the
 				// database, and it eventually reaches a block height which is not pruned, we
 				// just found that the state already exist! This means that the sidechain block
@@ -3048,6 +3072,18 @@ func (bc *BlockChain) insertSideChain(block *types.Block, it *insertIterator, ve
 		// the rest was imported on top of it, so the index is the batch length - the same
 		// "blocks consumed" the failure path above maps its sub-batch index back to.
 		return len(it.chain), withChainHeadEvent(events, adoptedHead), logs, nil
+	}
+	// A batch without a single sidechain block carries no total difficulty to compare, and
+	// it added nothing to the chain either: every one of its blocks was already stored and
+	// canonical. Comparing against a total difficulty that was never accumulated is not
+	// possible, and the scan error - ErrUnknownAncestor for the block that could not be
+	// linked - says nothing about the peer either, because this node's missing numbers, not
+	// the blocks, are what stopped the segment. Report it as what it is: a local condition
+	// the downloader cancels the content processing for instead of dropping the peer.
+	if externTd == nil {
+		log.Debug("Sidechain segment holds no sidechain block", "start", it.first().NumberU64(), "index", it.index)
+		return it.index, nil, nil, fmt.Errorf("%w: sidechain segment holds no sidechain block",
+			ErrLocalInsertCondition)
 	}
 	// If the externTd was larger than our local TD, we now need to reimport the previous
 	// blocks to regenerate the required state
