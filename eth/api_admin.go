@@ -61,14 +61,16 @@ func (api *AdminAPI) ExportChain(file string) (bool, error) {
 	return true, nil
 }
 
+// hasAllBlocks answers whether this node already imported every block of the batch, with the
+// same line cmd/utils.missingBlocks draws over the same batch. That line lives in core - see
+// BlockChain.FirstMissingImportedBlock, which carries the reasoning - so this importer and the
+// CLI one cannot drift apart.
+//
+// A batch this node executed above a head that stops below it is answered as imported too:
+// this precheck decides what the import skips, not where the head ends up. Recovering that
+// shape is left to the sync paths, which do not come through here.
 func hasAllBlocks(chain *core.BlockChain, bs []*types.Block) bool {
-	for _, b := range bs {
-		if !chain.HasBlock(b.Hash(), b.NumberU64()) {
-			return false
-		}
-	}
-
-	return true
+	return chain.FirstMissingImportedBlock(bs) < 0
 }
 
 // ImportChain imports a blockchain from a local file.
