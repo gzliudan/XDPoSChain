@@ -241,6 +241,16 @@ func ImportChain(chain *core.BlockChain, fn string) error {
 	return nil
 }
 
+// missingBlocks returns the suffix of the file that still has to be run, starting at the
+// first block this node cannot answer for: below the head the state is available at that
+// head, so a body on disk says the block was imported, while at or above it the block has to
+// have been executed by this node (see HasExecutedBlock, which answers the same line for an
+// admin import batch in eth/api_admin.go).
+//
+// The suffix is what this command runs, not where the head ends up: a block this node
+// executed at or above a head that stops below it answers as imported, so re-delivering that
+// range is skipped. That shape is recovered by the paths that do not come through here - the
+// batch importer the downloader drives, and insertBlock for a propagated block.
 func missingBlocks(chain *core.BlockChain, blocks []*types.Block) []*types.Block {
 	head := chain.CurrentBlock()
 	for i, block := range blocks {
@@ -251,8 +261,10 @@ func missingBlocks(chain *core.BlockChain, blocks []*types.Block) []*types.Block
 			}
 			continue
 		}
-		// If we're above the chain head, state availability is a must
-		if !chain.HasBlockAndFullState(block.Hash(), block.NumberU64()) {
+		// If we're above the chain head, having executed the block is a must: one that is on
+		// disk without the marker its execution leaves behind was never executed by this node,
+		// so the import has to start there and run it. See HasExecutedBlock.
+		if !chain.HasExecutedBlock(block.Hash(), block.NumberU64()) {
 			return blocks[i:]
 		}
 	}
