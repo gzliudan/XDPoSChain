@@ -2385,9 +2385,13 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, []
 			parent = bc.GetHeader(block.ParentHash(), block.NumberU64()-1)
 		}
 		// Create a new statedb using the parent block and report an error if it fails.
-		statedb, err := state.NewWithChainConfig(parent.Root, bc.stateCache, bc.chainConfig)
-		if err != nil {
-			return it.index, events, coalescedLogs, err
+		//
+		// stateErr rather than err: err is the loop's own, and shadowing it here made the
+		// ErrInsertionInterrupted assignment further down look like it wrote a variable
+		// nothing reads. The two are different values and have to keep different names.
+		statedb, stateErr := state.NewWithChainConfig(parent.Root, bc.stateCache, bc.chainConfig)
+		if stateErr != nil {
+			return it.index, events, coalescedLogs, stateErr
 		}
 
 		// If we have a followup block, run that against the current state to pre-cache
@@ -2604,6 +2608,9 @@ func (bc *BlockChain) processBlock(block *types.Block, parent *types.Header, sta
 // never reaches are remote data this node holds no verification result for, so when they are
 // imported below they have to be verified at that same level; only the blocks read back out
 // of the local database are re-imported with it off.
+//
+// Every index it returns is relative to the batch the caller handed in, never to a segment
+// rebuilt from stored ancestors: those have no offset into that batch.
 func (bc *BlockChain) insertSideChain(block *types.Block, it *insertIterator, verifySeals bool) (int, []interface{}, []*types.Log, error) {
 	var (
 		externTd *big.Int
@@ -2836,7 +2843,10 @@ func (bc *BlockChain) insertSideChain(block *types.Block, it *insertIterator, ve
 			// validation in the middle of the segment: abort the sidechain import
 			// instead of continuing with a state that can only be rebuilt partially.
 			if _, _, _, err := bc.insertChain(blocks, false); err != nil {
-				return 0, nil, nil, err
+				// The index handed back is the batch's, not the re-imported segment's:
+				// the segment is rebuilt from stored ancestors, so it has no offset into
+				// the batch. it.index is the first block this batch has not consumed.
+				return it.index, nil, nil, err
 			}
 			blocks, memory = blocks[:0], 0
 
@@ -2844,18 +2854,27 @@ func (bc *BlockChain) insertSideChain(block *types.Block, it *insertIterator, ve
 			if bc.insertStopped() {
 				log.Debug("Abort during blocks processing")
 				// Report the interruption instead of a success, see the entry guard of
-				// insertChain: the rest of the segment was not imported.
-				return 0, nil, nil, ErrInsertionInterrupted
+				// insertChain: the rest of the segment was not imported. Same index as
+				// the failure above, for the same reason.
+				return it.index, nil, nil, ErrInsertionInterrupted
 			}
 		}
 	}
 	if len(blocks) > 0 {
 		log.Info("Importing sidechain segment", "start", blocks[0].NumberU64(), "end", blocks[len(blocks)-1].NumberU64())
 		// The error of a partially imported segment is propagated as well, see the
-		// comment on the heavy segment import above.
-		return bc.insertChain(blocks, false)
+		// comment on the heavy segment import above. The index is the batch's for the
+		// same reason as there: the segment is rebuilt from stored ancestors, so its own
+		// offset says nothing about where this batch stopped.
+		_, events, logs, err := bc.insertChain(blocks, false)
+		if err != nil {
+			return it.index, nil, nil, err
+		}
+		// Unlike the heavy chunks above, the last segment keeps its events and logs: it is
+		// the end of this batch, not a chunk dropped to stay within the memory allowance.
+		return it.index, events, logs, nil
 	}
-	return 0, nil, nil, nil
+	return it.index, nil, nil, nil
 }
 
 func (bc *BlockChain) InsertBlock(block *types.Block) error {
@@ -2935,9 +2954,19 @@ func (bc *BlockChain) getResultBlock(block *types.Block, verifiedM2 bool) (*Resu
 	case errors.Is(err, consensus.ErrPrunedAncestor):
 		// Block competing with the canonical chain, store in the db, but don't process
 		// until the competitor TD goes above the canonical TD
+		parentTd := bc.GetTd(block.ParentHash(), block.NumberU64()-1)
+		if parentTd == nil {
+			// big.Int.Add dereferences its operands, so a parent whose total difficulty
+			// is not stored used to panic here instead of failing the call. The record
+			// lives in this node rather than in the block, so the failure is reported as
+			// a local condition: a bare error would have the classification blame the
+			// blocks for it and hold the peer to it.
+			return nil, fmt.Errorf("%w: no total difficulty for the parent of block %d (%v)",
+				ErrLocalInsertCondition, block.NumberU64(), block.ParentHash())
+		}
 		currentBlock := bc.CurrentBlock()
 		localTd := bc.GetTd(currentBlock.Hash(), currentBlock.Number.Uint64())
-		externTd := new(big.Int).Add(bc.GetTd(block.ParentHash(), block.NumberU64()-1), block.Difficulty())
+		externTd := new(big.Int).Add(parentTd, block.Difficulty())
 		if localTd.Cmp(externTd) > 0 {
 			return nil, err
 		}
