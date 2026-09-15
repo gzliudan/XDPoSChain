@@ -3318,10 +3318,13 @@ func (bc *BlockChain) UpdateBlocksHashCache(block *types.Block) []common.Hash {
 	return hashArr
 }
 
-// blockAlreadyImported reports whether the import can be skipped for the block: the block
-// and the state execution leaves behind are both on disk for it.
+// blockAlreadyImported reports whether the import can be skipped for the block: this node
+// executed it, so the block is on disk together with the state and the receipts its execution
+// leaves behind. HasBlockAndFullState does not answer that - a side entry stored by
+// writeBlockWithoutState has a body, and a state root that may well resolve, but no receipts -
+// which is why the callers that read "known" as "this node already did the work" ask here.
 func (bc *BlockChain) blockAlreadyImported(block *types.Block) bool {
-	return bc.HasBlockAndFullState(block.Hash(), block.NumberU64())
+	return bc.HasExecutedBlock(block.Hash(), block.NumberU64())
 }
 
 // insertChain will execute the actual chain insertion and event aggregation. The
