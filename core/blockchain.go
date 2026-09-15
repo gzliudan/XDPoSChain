@@ -2282,9 +2282,7 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, []
 		// non-queueable error. Record the reject like the tail path below: the local
 		// conditions and a future timestamp are legitimate states, not invalid blocks, and
 		// classifyInsertErr is what says so.
-		if stopErr != nil && stopped != nil && classifyInsertErr(stopErr).badBlock {
-			bc.reportBlock(stopped, nil, stopErr)
-		}
+		bc.reportBlockIfFault(stopped, stopErr)
 		return it.index, events, coalescedLogs, stopErr
 
 	// First block (and state) is known
@@ -2310,6 +2308,12 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, []
 			stats.ignored++
 			block, err = it.next()
 		}
+		// The loop ends on either a nil error (the batch drained), an ErrKnownBlock (the
+		// fall-through below), or the error that stopped it. That last shape is the same
+		// stop the first-block case and the future tail record, so it is recorded here as
+		// well: a batch that stops on an invalid block has to leave that block behind in the
+		// bad-block database, wherever in the batch the known prefix ended.
+		bc.reportBlockIfFault(block, err)
 		// A known block that wins fork choice is not skipped: it falls through to
 		// the import loop below, which adopts it with writeKnownBlock and then
 		// carries on with the rest of the batch instead of stopping on it.
@@ -2320,9 +2324,7 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, []
 		// queue-stop paths. Behaviourally identical today - every unclassified error is
 		// classified as the block's fault - but it keeps the "is this a bad block" answer in
 		// one place if a local sentinel ever becomes reachable from verification.
-		if classifyInsertErr(err).badBlock {
-			bc.reportBlock(block, nil, err)
-		}
+		bc.reportBlockIfFault(block, err)
 		return it.index, events, coalescedLogs, err
 	}
 
@@ -2461,9 +2463,7 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, []
 		// non-queueable error. Record the reject like the first-block failure path: the
 		// local conditions and a future timestamp are legitimate states, not invalid
 		// blocks, and classifyInsertErr is what says so.
-		if err != nil && block != nil && classifyInsertErr(err).badBlock {
-			bc.reportBlock(block, nil, err)
-		}
+		bc.reportBlockIfFault(block, err)
 		// A stop on ErrKnownBlock is reported instead of adopted here, and this tail is the
 		// only place the sentinel can leave insertChain: the loop above consumes every known
 		// block it meets and a nil error is what it ends on otherwise, so nothing else hands
@@ -2690,6 +2690,12 @@ func (bc *BlockChain) insertSideChain(block *types.Block, it *insertIterator, ve
 		// engine_v2/verifyHeader.go), so the parent is never consulted. It is not queued either -
 		// a side entry is not the future chain - and the clock is this node's, not the peer's:
 		// see classifyInsertErr for why a local condition is never blamed on the peer.
+		//
+		// The reject is recorded through the same table as the stops of insertChain: this
+		// is the one place a batch ends without asking it, and a block whose body does not
+		// match its header is the peer's fault like any other bad block. Asking before the
+		// wrap is safe - the table answers no for the future timestamp below.
+		bc.reportBlockIfFault(block, err)
 		if errors.Is(err, consensus.ErrFutureBlock) {
 			return it.index, nil, nil, fmt.Errorf("%w: %w", ErrLocalInsertCondition, err)
 		}
@@ -3428,6 +3434,18 @@ func (bc *BlockChain) futureBlocksLoop() {
 			return
 		}
 	}
+}
+
+// reportBlockIfFault records block as a bad block when err is a failure the classification
+// blames on the block, and does nothing for the local conditions and for a nil error. It is
+// the single place the insertion paths ask the question, so a sentinel registered in
+// classifyInsertErr is answered the same way wherever it stops a batch - and a failure that
+// says nothing about the block is never written into the bad-block database.
+func (bc *BlockChain) reportBlockIfFault(block *types.Block, err error) {
+	if block == nil || err == nil || !classifyInsertErr(err).badBlock {
+		return
+	}
+	bc.reportBlock(block, nil, err)
 }
 
 // reportBlock logs a bad block error.
