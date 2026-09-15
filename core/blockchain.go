@@ -2545,9 +2545,13 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, []
 			parent = bc.GetHeader(block.ParentHash(), block.NumberU64()-1)
 		}
 		// Create a new statedb using the parent block and report an error if it fails.
-		statedb, err := state.NewWithChainConfig(parent.Root, bc.stateCache, bc.chainConfig)
-		if err != nil {
-			return it.index, events, coalescedLogs, err
+		//
+		// stateErr rather than err: err is the loop's own - the loop condition and the post
+		// statement carry it, and the ErrInsertionInterrupted assignment above writes it.
+		// The two are different values and have to keep different names.
+		statedb, stateErr := state.NewWithChainConfig(parent.Root, bc.stateCache, bc.chainConfig)
+		if stateErr != nil {
+			return it.index, events, coalescedLogs, stateErr
 		}
 
 		// If we have a followup block, run that against the current state to pre-cache
@@ -3152,7 +3156,17 @@ func (bc *BlockChain) getResultBlock(block *types.Block, verifiedM2 bool) (*Resu
 		// Block competing with the canonical chain, store in the db, but don't process
 		// until the competitor TD goes above the canonical TD. The competitor's total
 		// difficulty is read first: it is the number this comparison is about.
-		externTd := new(big.Int).Add(bc.GetTd(block.ParentHash(), block.NumberU64()-1), block.Difficulty())
+		parentTd := bc.GetTd(block.ParentHash(), block.NumberU64()-1)
+		if parentTd == nil {
+			// big.Int.Add dereferences its operands, so a parent whose total difficulty
+			// is not stored used to panic here instead of failing the call. The record
+			// lives in this node rather than in the block, so the failure is reported as
+			// a local condition: a bare error would have the classification blame the
+			// blocks for it and hold the peer to it.
+			return nil, fmt.Errorf("%w: no total difficulty for the parent of block %d (%v)",
+				ErrLocalInsertCondition, block.NumberU64(), block.ParentHash())
+		}
+		externTd := new(big.Int).Add(parentTd, block.Difficulty())
 
 		currentBlock := bc.CurrentBlock()
 		localTd := bc.GetTd(currentBlock.Hash(), currentBlock.Number.Uint64())
