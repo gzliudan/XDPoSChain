@@ -24,6 +24,7 @@ import (
 
 	"github.com/XinFinOrg/XDPoSChain/common"
 	"github.com/XinFinOrg/XDPoSChain/consensus"
+	"github.com/XinFinOrg/XDPoSChain/consensus/XDPoS"
 	"github.com/XinFinOrg/XDPoSChain/consensus/ethash"
 	"github.com/XinFinOrg/XDPoSChain/core/rawdb"
 	"github.com/XinFinOrg/XDPoSChain/core/types"
@@ -762,5 +763,74 @@ func TestKnownBlockNeverExecutedIsNotAdopted(t *testing.T) {
 				t.Fatalf("the head moved to #%d %s, a block this node never executed", got.Number.Uint64(), got.Hash())
 			}
 		})
+	}
+}
+
+// TestInsertChainAdoptsKnownBatchAheadOfHeadWithXDPoS is the XDPoS counterpart of
+// TestInsertChainAdoptsKnownBatchAheadOfHead: the same rollback-and-redeliver shape, but on a
+// chain driven by the real XDPoS faker instead of ethash. The ethash fixture cannot show that
+// the adoption path leaves the engine's own view of the head intact, and XDPoS reads the block
+// author back out of the seal (processTradingAndLendingStates), so a batch that is adopted
+// rather than executed has to keep the engine able to place it.
+func TestInsertChainAdoptsKnownBatchAheadOfHeadWithXDPoS(t *testing.T) {
+	// Epoch 3 with Gap 0, the fixture of TestReorgSignalsEpochSwitchOnIntermediateBlock: the
+	// epoch switch blocks sit inside the chain, and Gap 0 keeps the masternode-set refresh
+	// (UpdateM1, which needs snapshots) out of the adoption.
+	cfg := params.TestXDPoSMockChainConfig.Clone()
+	xdpos := *cfg.XDPoS
+	xdpos.Epoch = 3
+	xdpos.Gap = 0
+	xdpos.SkipV1Validation = true
+	cfg.XDPoS = &xdpos
+
+	engine := XDPoS.NewFaker(rawdb.NewMemoryDatabase(), cfg)
+	if engine == nil {
+		t.Fatal("failed to create the XDPoS faker engine")
+	}
+	// An XDPoS genesis has to name signers, and the faker engine never reads them.
+	extraData := make([]byte, 32)
+	for _, signer := range []common.Address{{1}, {2}, {3}, {4}} {
+		extraData = append(extraData, signer.Bytes()...)
+	}
+	genesis := &Genesis{BaseFee: big.NewInt(params.InitialBaseFee), Config: cfg, ExtraData: extraData}
+	chain, err := NewBlockChain(rawdb.NewMemoryDatabase(), nil, genesis, engine, vm.Config{})
+	if err != nil {
+		t.Fatalf("failed to create chain: %v", err)
+	}
+	defer chain.Stop()
+	defer drainCheckpointCh() // block 3 switches the epoch and signals the staking loop
+
+	blocks := makeSealedChain(t, cfg, genesis, engine, 5)
+	if _, err := chain.InsertChain(blocks); err != nil {
+		t.Fatalf("failed to insert the chain: %v", err)
+	}
+	if head := chain.CurrentBlock(); head.Number.Uint64() != 5 {
+		t.Fatalf("head after the initial import: have %d, want 5", head.Number.Uint64())
+	}
+	// Rewind the head markers to block 3 without touching the blocks themselves: 4 and 5 stay
+	// stored and executed, and a rollback leaves their canonical mappings in place, which is
+	// what makes the batch below a re-delivery of an already imported range.
+	rewindHeadMarkers(chain, blocks[2])
+	if head := chain.CurrentBlock(); head.Number.Uint64() != 3 {
+		t.Fatalf("head after the rollback: have %d, want 3", head.Number.Uint64())
+	}
+
+	n, err := chain.InsertChain(blocks[3:])
+	if err != nil {
+		t.Fatalf("block %d: batch that is fully on disk reported as failure: %v", n, err)
+	}
+	if head := chain.CurrentBlock(); head.Number.Uint64() != 5 {
+		t.Fatalf("head after the adoption: have %d, want 5", head.Number.Uint64())
+	}
+	if block := chain.GetBlockByNumber(5); block == nil || block.Hash() != blocks[4].Hash() {
+		t.Fatal("block #5 is not canonical after the batch was adopted")
+	}
+	// The blocks were executed when they were first imported, so the adoption has to recognise
+	// them as executed rather than run them again, and their receipts and state have to be the
+	// ones written back then.
+	for i := uint64(4); i <= 5; i++ {
+		if !chain.HasExecutedBlock(blocks[i-1].Hash(), i) {
+			t.Fatalf("block #%d is not reported as executed after the adoption", i)
+		}
 	}
 }
