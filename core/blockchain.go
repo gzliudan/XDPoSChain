@@ -1808,6 +1808,13 @@ func (bc *BlockChain) blockTd(block *types.Block) *big.Int {
 // notifyEpochSwitchBlock sends a checkpoint notification when block switches the
 // epoch, so that the consensus parameters and the masternode set are refreshed.
 // It is a no-op for non-XDPoS chains and for engines that are not XDPoS.
+//
+// An epoch switch this node cannot read is only logged, never reported as a bad block:
+// no block this node stored can fail the read - engine_v2 decodes the same extra fields
+// in verifyHeader, outside its fullVerify gate, so a header that passed verification
+// cannot fail here, and engine_v1 never fails it - and the blocks this helper is handed
+// are the ones this node stored, so reportBlock would write a block this node already
+// accepted into the bad-block table.
 func (bc *BlockChain) notifyEpochSwitchBlock(block *types.Block) {
 	if bc.chainConfig.XDPoS == nil {
 		return
@@ -1819,7 +1826,6 @@ func (bc *BlockChain) notifyEpochSwitchBlock(block *types.Block) {
 	isEpochSwitch, _, err := engine.IsEpochSwitch(block.Header())
 	if err != nil {
 		log.Error("[notifyEpochSwitchBlock] Error while checking if the incoming block is epoch switch block", "Hash", block.Hash(), "Number", block.Number())
-		bc.reportBlock(block, nil, err)
 		return
 	}
 	if isEpochSwitch {
