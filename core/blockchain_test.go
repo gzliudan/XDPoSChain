@@ -3077,8 +3077,8 @@ func TestInsertSidechainReportsMissingParentTd(t *testing.T) {
 	block, it := sidechainSegmentIterator(t, chain, blocks[3:5])
 
 	n, _, _, err := chain.insertSidechain(block, it)
-	if !errors.Is(err, errMissingTotalDifficulty) {
-		t.Fatalf("unexpected error: have %v want %v", err, errMissingTotalDifficulty)
+	if !errors.Is(err, ErrLocalInsertCondition) {
+		t.Fatalf("unexpected error: have %v want %v", err, ErrLocalInsertCondition)
 	}
 	if want := 0; n != want {
 		t.Fatalf("unexpected failing index: have %d want %d", n, want)
@@ -3110,8 +3110,8 @@ func TestInsertSidechainReportsMissingLocalTd(t *testing.T) {
 	block, it := sidechainSegmentIterator(t, chain, blocks[4:6])
 
 	n, _, _, err := chain.insertSidechain(block, it)
-	if !errors.Is(err, errMissingTotalDifficulty) {
-		t.Fatalf("unexpected error: have %v want %v", err, errMissingTotalDifficulty)
+	if !errors.Is(err, ErrLocalInsertCondition) {
+		t.Fatalf("unexpected error: have %v want %v", err, ErrLocalInsertCondition)
 	}
 	// The scan ran off the end of the batch looking for a block to weigh.
 	if want := 2; n != want {
@@ -3140,8 +3140,8 @@ func TestGetResultBlockReportsMissingTd(t *testing.T) {
 	// copy has to go as well.
 	dropTd(t, chain, lastPruned)
 
-	if _, err := chain.getResultBlock(fork[0], false); !errors.Is(err, errMissingTotalDifficulty) {
-		t.Fatalf("unexpected error: have %v want %v", err, errMissingTotalDifficulty)
+	if _, err := chain.getResultBlock(fork[0], false); !errors.Is(err, ErrLocalInsertCondition) {
+		t.Fatalf("unexpected error: have %v want %v", err, ErrLocalInsertCondition)
 	}
 }
 
@@ -3164,8 +3164,8 @@ func TestGetResultBlockReportsMissingLocalTd(t *testing.T) {
 	// to go as well. The competitor's parent stays readable.
 	dropTd(t, chain, blocks[2*TriesInMemory-1])
 
-	if _, err := chain.getResultBlock(fork[0], false); !errors.Is(err, errMissingTotalDifficulty) {
-		t.Fatalf("unexpected error: have %v want %v", err, errMissingTotalDifficulty)
+	if _, err := chain.getResultBlock(fork[0], false); !errors.Is(err, ErrLocalInsertCondition) {
+		t.Fatalf("unexpected error: have %v want %v", err, ErrLocalInsertCondition)
 	}
 }
 
@@ -3198,8 +3198,8 @@ func TestWriteBlockWithStateReportsMissingLocalTd(t *testing.T) {
 	}
 	dropTd(t, chain, blocks[3])
 
-	if _, err := chain.WriteBlockWithState(child[0], nil, statedb, nil, nil); !errors.Is(err, errMissingTotalDifficulty) {
-		t.Fatalf("unexpected error: have %v want %v", err, errMissingTotalDifficulty)
+	if _, err := chain.WriteBlockWithState(child[0], nil, statedb, nil, nil); !errors.Is(err, ErrLocalInsertCondition) {
+		t.Fatalf("unexpected error: have %v want %v", err, ErrLocalInsertCondition)
 	}
 	if want := uint64(4); chain.CurrentBlock().Number.Uint64() != want {
 		t.Fatalf("unexpected head number: have %d want %d", chain.CurrentBlock().Number.Uint64(), want)
