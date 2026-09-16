@@ -3472,6 +3472,32 @@ func (bc *BlockChain) insertBlock(block *types.Block) ([]interface{}, []*types.L
 		log.Debug("Stop fetcher a block because downloading", "number", block.NumberU64(), "hash", block.Hash())
 		return events, coalescedLogs, nil
 	}
+	// A block this node already executed has nothing left to compute: getResultBlock would
+	// run it in full only for the adoption below to throw the result away. Answer it here
+	// instead. The look is taken without the chain mutex so that the execution stays out of
+	// the lock; adoptExecutedBlock asks again under it. A block that turns out not to be
+	// executed - the second look disagreeing, or the first never agreeing - falls through
+	// to the regular path below.
+	if bc.blockAlreadyImported(block) {
+		adopted, promoted, hit, adoptErr := bc.adoptExecutedBlock(block)
+		if adoptErr != nil {
+			return events, coalescedLogs, adoptErr
+		}
+		if hit {
+			if adopted == nil {
+				// The block is executed and on disk, this node simply does not adopt this
+				// branch - the same answer writeKnownBlock gives the batch path.
+				return events, coalescedLogs, nil
+			}
+			blockEvents, blockLogs := bc.announceKnownBlock(adopted, promoted)
+			events = append(events, blockEvents...)
+			// The batch path raises a single head event, for the highest block that moved
+			// the head; on the single-block path the adopted block is that block.
+			events = append(events, ChainHeadEvent{adopted})
+			coalescedLogs = append(coalescedLogs, blockLogs...)
+			return events, coalescedLogs, nil
+		}
+	}
 	result, blockEvents, blockLogs, err := bc.getResultBlock(block, true)
 	// The events of the pruned ancestors that had to be re-imported belong to this call as
 	// well, and they are posted on the failing path too: a segment that promoted a stored
@@ -3555,6 +3581,52 @@ func (bc *BlockChain) insertBlock(block *types.Block) ([]interface{}, []*types.L
 		log.Debug("New ChainHeadEvent from fetcher ", "number", block.NumberU64(), "hash", block.Hash())
 	}
 	return events, coalescedLogs, nil
+}
+
+// adoptExecutedBlock adopts block as the chain head when this node already executed it, and
+// reports through hit whether it did. It is what insertBlock answers an already executed
+// block with instead of calling getResultBlock on it: that call would run the block in full,
+// and the adoption that follows would then throw the result away.
+//
+// The caller looks HasExecutedBlock up without the chain mutex first, so that the execution
+// stays out of the lock. This asks again under the mutex, which is the answer the adoption
+// acts on - the reason hit is a separate return rather than something the caller decides.
+//
+// hit is false when the block is not executed, which includes a rewind having dropped its
+// receipts between the caller's look and this one. The caller then runs the block like any
+// other; neither shape is an error.
+//
+// The second look of insertBlock - the one taken after getResultBlock - only sees a block
+// this call did not already adopt: a block this node executed before the call never gets
+// there, because the caller answers it here. What is left for that look is a block that was
+// executed while getResultBlock ran - the result it computed is thrown away and the stored
+// block is adopted instead - which is a concurrency window rather than a shape a
+// single-threaded caller can produce. That is why the look is kept.
+func (bc *BlockChain) adoptExecutedBlock(block *types.Block) (adopted *types.Block, promoted, hit bool, err error) {
+	// Registered like the rest of the single-block import: this writes the chain, and Stop
+	// waits for that to end.
+	bc.wg.Add(1)
+	defer bc.wg.Done()
+
+	if !bc.chainmu.TryLock() {
+		return nil, false, false, ErrChainStopped
+	}
+	defer bc.chainmu.Unlock()
+
+	// A chain that is being interrupted must not move its head either: the batch entry
+	// point answers the same interruption in insertChain (at its entry and at the head of
+	// its loop), and this is the single-block entry point that no longer reaches
+	// getResultBlock's insertStopped check - it returns before it. See
+	// ErrInsertionInterrupted.
+	if bc.insertStopped() {
+		return nil, false, false, ErrInsertionInterrupted
+	}
+
+	if !bc.blockAlreadyImported(block) {
+		return nil, false, false, nil
+	}
+	adopted, promoted, err = bc.writeKnownBlock(block)
+	return adopted, promoted, true, err
 }
 
 // collectLogs collects the logs that were generated or removed during
