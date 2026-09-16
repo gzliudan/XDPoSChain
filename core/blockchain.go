@@ -2812,7 +2812,17 @@ func (bc *BlockChain) insertSideChain(block *types.Block, it *insertIterator, ve
 			}
 		}
 		if externTd == nil {
-			externTd = bc.GetTd(block.ParentHash(), block.NumberU64()-1)
+			// big.Int.Add dereferences its operands, so the read has to be checked before
+			// the accumulation below can use it. A parent this node holds no record for is
+			// a condition of its database rather than of the block, so it is reported the
+			// way getResultBlock reports the same read: a local condition, which keeps the
+			// failure out of the peer-blame and bad-block paths.
+			parentTd := bc.GetTd(block.ParentHash(), block.NumberU64()-1)
+			if parentTd == nil {
+				return it.index, nil, nil, fmt.Errorf("%w: no total difficulty for the parent of block %d (%v)",
+					ErrLocalInsertCondition, block.NumberU64(), block.ParentHash())
+			}
+			externTd = parentTd
 		}
 		externTd = new(big.Int).Add(externTd, block.Difficulty())
 
