@@ -2597,6 +2597,23 @@ func (bc *BlockChain) processBlock(block *types.Block, parent *types.Header, sta
 	return &blockProcessingResult{usedGas: usedGas, procTime: proctime, status: status, logs: logs}, nil
 }
 
+// headTd reads the total difficulty of head. A head this node holds no record for is reported as a
+// local condition instead of dereferenced: the methods of big.Int panic on a nil receiver, and a
+// missing record for our own head is a condition of this node rather than something the blocks can
+// be blamed for. The sentinel keeps it out of the peer-blame and bad-block paths of the
+// classification, exactly as the segment with no accumulated total difficulty below.
+func (bc *BlockChain) headTd(head *types.Header) (*big.Int, error) {
+	if head == nil {
+		return nil, fmt.Errorf("%w: no head block", ErrLocalInsertCondition)
+	}
+	td := bc.GetTd(head.Hash(), head.Number.Uint64())
+	if td == nil {
+		return nil, fmt.Errorf("%w: no total difficulty for head %d (%v)",
+			ErrLocalInsertCondition, head.Number.Uint64(), head.Hash())
+	}
+	return td, nil
+}
+
 // insertSideChain is called when an import batch hits upon a pruned ancestor
 // error, which happens when a sidechain with a sufficiently old fork-block is
 // found.
@@ -2802,7 +2819,10 @@ func (bc *BlockChain) insertSideChain(block *types.Block, it *insertIterator, ve
 	}
 	// If the externTd was larger than our local TD, we now need to reimport the previous
 	// blocks to regenerate the required state
-	localTd := bc.GetTd(bc.CurrentBlock().Hash(), current)
+	localTd, localErr := bc.headTd(bc.CurrentBlock())
+	if localErr != nil {
+		return it.index, nil, nil, localErr
+	}
 	if localTd.Cmp(externTd) > 0 {
 		log.Info("Sidechain written to disk", "start", it.first().NumberU64(), "end", it.previous().Number, "sidetd", externTd, "localtd", localTd)
 		return it.index, nil, nil, err
@@ -2820,7 +2840,9 @@ func (bc *BlockChain) insertSideChain(block *types.Block, it *insertIterator, ve
 		parent = bc.GetHeader(parent.ParentHash, parent.Number.Uint64()-1)
 	}
 	if parent == nil {
-		return it.index, nil, nil, errors.New("missing parent")
+		// The numbers this node is missing, not the blocks, are what stopped the walk, so the
+		// failure is local for the same reason the empty segment above is.
+		return it.index, nil, nil, fmt.Errorf("%w: segment has no stored ancestor", ErrLocalInsertCondition)
 	}
 	// Import all the pruned blocks to make the state available
 	var (
@@ -2964,8 +2986,10 @@ func (bc *BlockChain) getResultBlock(block *types.Block, verifiedM2 bool) (*Resu
 			return nil, fmt.Errorf("%w: no total difficulty for the parent of block %d (%v)",
 				ErrLocalInsertCondition, block.NumberU64(), block.ParentHash())
 		}
-		currentBlock := bc.CurrentBlock()
-		localTd := bc.GetTd(currentBlock.Hash(), currentBlock.Number.Uint64())
+		localTd, localErr := bc.headTd(bc.CurrentBlock())
+		if localErr != nil {
+			return nil, localErr
+		}
 		externTd := new(big.Int).Add(parentTd, block.Difficulty())
 		if localTd.Cmp(externTd) > 0 {
 			return nil, err
@@ -2999,7 +3023,9 @@ func (bc *BlockChain) getResultBlock(block *types.Block, verifiedM2 bool) (*Resu
 			return nil, err
 		}
 	case err != nil:
-		bc.reportBlock(block, nil, err)
+		// The table decides whether the block is at fault, as it does at every other stop of
+		// the insertion paths: a ValidateBody failure is the block's, so it is reported.
+		bc.reportBlockIfFault(block, err)
 		return nil, err
 	}
 	var parent = bc.GetHeader(block.ParentHash(), block.NumberU64()-1)
