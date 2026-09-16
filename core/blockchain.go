@@ -3474,7 +3474,35 @@ func (bc *BlockChain) insertBlock(block *types.Block) ([]interface{}, []*types.L
 		return events, coalescedLogs, ErrChainStopped
 	}
 	defer bc.chainmu.Unlock()
+	// An interrupted chain does not adopt either: the lock is only taken after
+	// getResultBlock has answered its own insertStopped check, so without this the
+	// window in between would write a head the batch path refuses to write.
+	if bc.insertStopped() {
+		return events, coalescedLogs, ErrInsertionInterrupted
+	}
+	// There is still a head to move. This entry point is the one the fetcher uses for a
+	// propagated block and it never goes through insertChain, so the adoption that path
+	// performs for a known block has to be repeated here: a rollback or a crash can leave
+	// the block and its state on disk while the head stops below them, and returning a
+	// success without writing the head would leave it there until a full sync reassigned
+	// it. writeKnownBlock asks the same fork choice writeBlockWithState does, so the
+	// single-block path adopts exactly the chain the batch path would.
 	if bc.blockAlreadyImported(block) {
+		adopted, promoted, adoptErr := bc.writeKnownBlock(block)
+		if adoptErr != nil {
+			return events, coalescedLogs, adoptErr
+		}
+		if adopted == nil {
+			// The block is executed and on disk, this node simply does not adopt this
+			// branch - the same answer writeKnownBlock gives the batch path.
+			return events, coalescedLogs, nil
+		}
+		blockEvents, blockLogs := bc.announceKnownBlock(adopted, promoted)
+		events = append(events, blockEvents...)
+		// The batch path raises the head event once for the highest block that moved
+		// the head; here the adopted block is that block.
+		events = append(events, ChainHeadEvent{adopted})
+		coalescedLogs = append(coalescedLogs, blockLogs...)
 		return events, coalescedLogs, nil
 	}
 	status, err := bc.writeBlockWithState(block, result.receipts, result.state, result.tradingState, result.lendingState)
