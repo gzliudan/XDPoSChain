@@ -3108,13 +3108,9 @@ func (bc *BlockChain) insertSideChain(block *types.Block, it *insertIterator, ve
 	}
 	// If the externTd was larger than our local TD, we now need to reimport the previous
 	// blocks to regenerate the required state
-	localTd := bc.GetTd(bc.CurrentBlock().Hash(), current)
-	if localTd == nil {
-		// The segment is stored, but this node cannot read the head's total difficulty to
-		// weigh it against: a local condition, not something to blame the blocks for.
-		log.Warn("Sidechain segment has no comparable local total difficulty",
-			"number", current, "hash", bc.CurrentBlock().Hash(), "index", it.index)
-		return it.index, nil, nil, ErrLocalInsertCondition
+	localTd, localErr := bc.headTd(bc.CurrentBlock())
+	if localErr != nil {
+		return it.index, nil, nil, localErr
 	}
 	if localTd.Cmp(externTd) > 0 {
 		log.Info("Sidechain written to disk", "start", it.first().NumberU64(), "end", it.previous().Number, "sidetd", externTd, "localtd", localTd)
@@ -3133,7 +3129,9 @@ func (bc *BlockChain) insertSideChain(block *types.Block, it *insertIterator, ve
 		parent = bc.GetHeader(parent.ParentHash, parent.Number.Uint64()-1)
 	}
 	if parent == nil {
-		return it.index, nil, nil, errors.New("missing parent")
+		// The numbers this node is missing, not the blocks, are what stopped the walk, so the
+		// failure is local for the same reason the empty segment above is.
+		return it.index, nil, nil, fmt.Errorf("%w: segment has no stored ancestor", ErrLocalInsertCondition)
 	}
 	// Import all the pruned blocks to make the state available
 	var (
@@ -3322,18 +3320,21 @@ func (bc *BlockChain) getResultBlock(block *types.Block, verifiedM2 bool) (*Resu
 		// until the competitor TD goes above the canonical TD. The competitor's total
 		// difficulty is read first: it is the number this comparison is about.
 		parentTd := bc.GetTd(block.ParentHash(), block.NumberU64()-1)
-
-		currentBlock := bc.CurrentBlock()
-		localTd := bc.GetTd(currentBlock.Hash(), currentBlock.Number.Uint64())
-		if localTd == nil || parentTd == nil {
-			// Without both total difficulties the competitor cannot be weighed against
-			// this node's chain. That says nothing about the block, so the caller must not
-			// report it as a consensus failure.
-			log.Warn("Competing block has no comparable total difficulty",
-				"number", block.NumberU64(), "hash", block.Hash(), "parent", block.ParentHash())
-			return nil, nil, nil, ErrLocalInsertCondition
+		if parentTd == nil {
+			// big.Int.Add dereferences its operands, so a parent whose total difficulty
+			// is not stored used to panic here instead of failing the call. The record
+			// lives in this node rather than in the block, so the failure is reported as
+			// a local condition: a bare error would have the classification blame the
+			// blocks for it and hold the peer to it.
+			return nil, nil, nil, fmt.Errorf("%w: no total difficulty for the parent of block %d (%v)",
+				ErrLocalInsertCondition, block.NumberU64(), block.ParentHash())
 		}
 		externTd := new(big.Int).Add(parentTd, block.Difficulty())
+
+		localTd, localErr := bc.headTd(bc.CurrentBlock())
+		if localErr != nil {
+			return nil, nil, nil, localErr
+		}
 		if localTd.Cmp(externTd) > 0 {
 			return nil, nil, nil, err
 		}
@@ -3369,7 +3370,9 @@ func (bc *BlockChain) getResultBlock(block *types.Block, verifiedM2 bool) (*Resu
 			return nil, nestedEvents, nestedLogs, err
 		}
 	case err != nil:
-		bc.reportBlock(block, nil, err)
+		// The table decides whether the block is at fault, as it does at every other stop of
+		// the insertion paths: a ValidateBody failure is the block's, so it is reported.
+		bc.reportBlockIfFault(block, err)
 		return nil, nil, nil, err
 	}
 	var parent = bc.GetHeader(block.ParentHash(), block.NumberU64()-1)
