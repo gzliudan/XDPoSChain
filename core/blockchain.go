@@ -3114,7 +3114,25 @@ func (bc *BlockChain) insertSideChain(block *types.Block, it *insertIterator, ve
 	}
 	if localTd.Cmp(externTd) > 0 {
 		log.Info("Sidechain written to disk", "start", it.first().NumberU64(), "end", it.previous().Number, "sidetd", externTd, "localtd", localTd)
-		return it.index, nil, nil, err
+		// The segment linked and was written to disk; this node simply does not switch
+		// to it, because its total difficulty stays below the head. That verdict was
+		// made here, on totals this node holds, so it must not reach the downloader as
+		// an unclassified error: it would be read as errInvalidChain and drop the peer
+		// that served exactly the range it was asked for. The err the scan stopped on -
+		// ErrUnknownAncestor, every other failure having returned above - is the reason,
+		// kept by wrapping.
+		//
+		// ErrLocalInsertRefused rather than ErrLocalInsertCondition: the head does not
+		// move, so the same segment loses the same comparison on every retry, and
+		// procFutureBlocks has to evict a parked block for it instead of re-verifying it
+		// on every tick.
+		//
+		// A nil error is the segment that was fully delivered - the scan ran out of
+		// blocks rather than into a failure - and it stays a success.
+		if err != nil {
+			return it.index, nil, nil, fmt.Errorf("%w: %v", ErrLocalInsertRefused, err)
+		}
+		return it.index, nil, nil, nil
 	}
 	// Gather all the sidechain hashes (full blocks may be memory heavy)
 	var (
