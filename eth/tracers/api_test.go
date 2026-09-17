@@ -196,7 +196,12 @@ func (b *freshStateTraceBackend) StateAtTransaction(ctx context.Context, block *
 			return tx, context, statedb, release, nil
 		}
 		msg, _ := core.TransactionToMessage(tx, signer, nil, block.Number(), block.BaseFee(), b.chainConfig)
-		if _, err := core.ApplyMessage(evm, msg, new(core.GasPool).AddGas(tx.Gas()), common.Address{}); err != nil {
+		// Replay through the block processing entry point, mirroring the routing and the
+		// nonce handling of the production stateAtTransaction, so the pre-state handed to
+		// the tracer matches the block that is being traced. The transaction context is set
+		// the way production sets it: the native routes record their log under it.
+		statedb.SetTxContext(tx.Hash(), idx)
+		if err := core.ApplyTransactionForReplay(msg, new(core.GasPool).AddGas(msg.GasLimit), block.Number(), tx, evm, nil); err != nil {
 			return nil, vm.BlockContext{}, nil, nil, fmt.Errorf("transaction %#x failed: %v", tx.Hash(), err)
 		}
 		statedb.Finalise(evm.ChainConfig().IsEIP158(block.Number()))
@@ -225,7 +230,12 @@ func (b *testBackend) StateAtTransaction(ctx context.Context, block *types.Block
 			return tx, context, statedb, release, nil
 		}
 		msg, _ := core.TransactionToMessage(tx, signer, nil, block.Number(), block.BaseFee(), b.chainConfig)
-		if _, err := core.ApplyMessage(evm, msg, new(core.GasPool).AddGas(tx.Gas()), common.Address{}); err != nil {
+		// Replay through the block processing entry point, mirroring the routing and the
+		// nonce handling of the production stateAtTransaction, so the pre-state handed to
+		// the tracer matches the block that is being traced. The transaction context is set
+		// the way production sets it: the native routes record their log under it.
+		statedb.SetTxContext(tx.Hash(), idx)
+		if err := core.ApplyTransactionForReplay(msg, new(core.GasPool).AddGas(msg.GasLimit), block.Number(), tx, evm, nil); err != nil {
 			return nil, vm.BlockContext{}, nil, nil, fmt.Errorf("transaction %#x failed: %v", tx.Hash(), err)
 		}
 		statedb.Finalise(evm.ChainConfig().IsEIP158(block.Number()))
@@ -1024,6 +1034,74 @@ type Account struct {
 	addr common.Address
 }
 
+// skipNonceForkCases are the receiver fork settings the skip-nonce test below runs over.
+// With the fork active the first transaction of the block leaves the sender nonce
+// untouched, so the second one reuses its nonce; without it the first transaction bumps the
+// nonce and the second one carries nonce+1.
+var skipNonceForkCases = []struct {
+	name         string
+	tipXDCXBlock *big.Int
+	secondNonce  uint64
+}{
+	{name: "receiver fork inactive", tipXDCXBlock: nil, secondNonce: 1},
+	{name: "receiver fork active", tipXDCXBlock: common.Big0, secondNonce: 0},
+}
+
+// newSkipNonceBackend builds a chain whose block carries two transactions of the same
+// sender. The first one goes to the XDCX trading state address, which block processing
+// routes to ApplyEmptyTransaction while the receiver fork is active: it neither checks nor
+// increments the sender nonce, so the second transaction is an ordinary transfer that
+// reuses that nonce. Replaying the first one with core.ApplyMessage instead bumps the nonce
+// and makes the second one fail with "nonce too low" (Apothem block 0x2e69c13,
+// issue gzliudan/XDPoSChain#256).
+func newSkipNonceBackend(t *testing.T, tipXDCXBlock *big.Int, secondNonce uint64) (*testBackend, *types.Transaction, *types.Transaction) {
+	t.Helper()
+
+	config := *params.TestChainConfig
+	config.TIPXDCXBlock = tipXDCXBlock
+	config.TIPXDCXReceiverDisableBlock = nil
+
+	accounts := newAccounts(2)
+	genesis := &core.Genesis{
+		Config: &config,
+		Alloc: types.GenesisAlloc{
+			accounts[0].addr: {Balance: big.NewInt(9000000000000000000)},
+			accounts[1].addr: {Balance: big.NewInt(9000000000000000000)},
+		},
+	}
+	signer := types.MakeSigner(&config, common.Big1)
+	tradingState := common.TradingStateAddrBinary
+	var first, second *types.Transaction
+
+	backend := newTestBackend(t, 1, genesis, func(i int, b *core.BlockGen) {
+		var err error
+		first, err = types.SignTx(types.NewTx(&types.LegacyTx{
+			Nonce:    0,
+			To:       &tradingState,
+			Value:    big.NewInt(1000),
+			Gas:      params.TxGas,
+			GasPrice: b.BaseFee(),
+		}), signer, accounts[0].key)
+		if err != nil {
+			t.Fatalf("failed to sign the trading transaction: %v", err)
+		}
+		b.AddTx(first)
+
+		second, err = types.SignTx(types.NewTx(&types.LegacyTx{
+			Nonce:    secondNonce,
+			To:       &accounts[1].addr,
+			Value:    big.NewInt(1000),
+			Gas:      params.TxGas,
+			GasPrice: b.BaseFee(),
+		}), signer, accounts[0].key)
+		if err != nil {
+			t.Fatalf("failed to sign the following transaction: %v", err)
+		}
+		b.AddTx(second)
+	})
+	return backend, first, second
+}
+
 func newAccounts(n int) (accounts []Account) {
 	for i := 0; i < n; i++ {
 		key, _ := crypto.GenerateKey()
@@ -1347,4 +1425,38 @@ func uintPtr(i int) *hexutil.Uint {
 func uint64Ptr(u uint64) *hexutil.Uint64 {
 	ret := hexutil.Uint64(u)
 	return &ret
+}
+
+// TestTraceTransactionSkipNonceTransactions traces both transactions of a block in
+// which the second one reuses the nonce of the first, because the first goes through
+// ApplyEmptyTransaction while the XDCX receiver fork is active and does not increment
+// the sender nonce. With the fork inactive the first transaction bumps the nonce, so
+// the second one carries nonce+1.
+//
+// stateAtTransaction rebuilds the pre-state by replaying the earlier transactions;
+// replaying the first one with core.ApplyMessage bumps the nonce while the fork is
+// active and makes the second one fail with "nonce too low" (Apothem block 0x2e69c13,
+// issue gzliudan/XDPoSChain#256).
+func TestTraceTransactionSkipNonceTransactions(t *testing.T) {
+	for _, tc := range skipNonceForkCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			backend, first, second := newSkipNonceBackend(t, tc.tipXDCXBlock, tc.secondNonce)
+			defer backend.teardown()
+
+			api := NewAPI(backend)
+			for _, traced := range []struct {
+				name string
+				tx   *types.Transaction
+			}{
+				{name: "first, to the trading state address", tx: first},
+				{name: "second, reusing the nonce", tx: second},
+			} {
+				if _, err := api.TraceTransaction(context.Background(), traced.tx.Hash(), nil); err != nil {
+					t.Errorf("%s: TraceTransaction failed: %v", traced.name, err)
+				}
+			}
+		})
+	}
 }
