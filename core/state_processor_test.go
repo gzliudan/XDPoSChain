@@ -1448,3 +1448,134 @@ func getParentBlockHash(statedb *state.StateDB, number uint64) common.Hash {
 	binary.BigEndian.PutUint64(key[24:], ringIndex)
 	return statedb.GetState(params.HistoryStorageAddress, key)
 }
+
+// TestApplyTransactionForReplayKeepsTheNonEVMTxLog checks that a replay records the same log
+// entry block processing does for a transaction the EVM never executes. The entry is not a
+// receipt artefact: StateDB.AddLog advances the block wide log count, so a replay that left
+// it out would give every log the following transactions emit an index the chain never had,
+// and callTracer reports those indexes.
+//
+// The two routes do not only share that log: the sign route also bumps the sender nonce and
+// the empty route leaves it alone, so the nonce is a second observable effect the replay has
+// to reproduce. It is checked here as well, because a replay that dropped the nonce handling
+// would still match on the log while leaving every later transaction of the sender one nonce
+// behind.
+func TestApplyTransactionForReplayKeepsTheNonEVMTxLog(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		to         common.Address
+		tipSigning *big.Int
+		tipXDCX    *big.Int
+		wantNonce  uint64
+	}{
+		{name: "trading state address, receiver fork active", to: common.TradingStateAddrBinary, tipXDCX: common.Big0, wantNonce: 0},
+		{name: "block signers address, signing fork active", to: common.BlockSignersBinary, tipSigning: common.Big0, wantNonce: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				config = &params.ChainConfig{
+					ChainID:                big.NewInt(1),
+					HomesteadBlock:         big.NewInt(0),
+					EIP150Block:            big.NewInt(0),
+					EIP155Block:            big.NewInt(0),
+					EIP158Block:            big.NewInt(0),
+					ByzantiumBlock:         big.NewInt(0),
+					ConstantinopleBlock:    big.NewInt(0),
+					PetersburgBlock:        big.NewInt(0),
+					IstanbulBlock:          big.NewInt(0),
+					BerlinBlock:            big.NewInt(0),
+					LondonBlock:            big.NewInt(0),
+					EIP1559Block:           big.NewInt(0),
+					TIPTRC21FeeBlock:       big.NewInt(0),
+					Gas50xBlock:            big.NewInt(0),
+					TRC21IssuerSMC:         params.TestnetChainConfig.TRC21IssuerSMC,
+					XDCXListingSMC:         params.TestnetChainConfig.XDCXListingSMC,
+					RelayerRegistrationSMC: params.TestnetChainConfig.RelayerRegistrationSMC,
+					LendingRegistrationSMC: params.TestnetChainConfig.LendingRegistrationSMC,
+					TIPSigningBlock:        tc.tipSigning,
+					TIPXDCXBlock:           tc.tipXDCX,
+					Ethash:                 new(params.EthashConfig),
+				}
+				signer     = types.LatestSigner(config)
+				testKey, _ = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
+				sender     = crypto.PubkeyToAddress(testKey.PublicKey)
+				blockNum   = big.NewInt(1)
+			)
+
+			db := rawdb.NewMemoryDatabase()
+			gspec := &Genesis{
+				Config: config,
+				Alloc: types.GenesisAlloc{
+					sender: {Balance: big.NewInt(1000000000000000000)},
+				},
+			}
+			genesis := gspec.MustCommit(db)
+			blockchain, err := NewBlockChain(db, nil, gspec, ethash.NewFaker(), vm.Config{})
+			if err != nil {
+				t.Fatalf("Failed to create the blockchain: %v", err)
+			}
+			defer blockchain.Stop()
+
+			statedb, err := blockchain.State()
+			if err != nil {
+				t.Fatalf("Failed to get state: %v", err)
+			}
+			to := tc.to
+			signedTx, err := types.SignTx(types.NewTx(&types.LegacyTx{
+				Nonce:    0,
+				To:       &to,
+				Value:    big.NewInt(0),
+				Gas:      21000,
+				GasPrice: big.NewInt(1),
+			}), signer, testKey)
+			if err != nil {
+				t.Fatalf("Failed to sign tx: %v", err)
+			}
+			msg, err := TransactionToMessage(signedTx, signer, nil, blockNum, nil, config)
+			if err != nil {
+				t.Fatalf("Failed to build message: %v", err)
+			}
+
+			// The same transaction, once through the replay and once through block processing.
+			replayState := statedb.Copy()
+			replayEVM := vm.NewEVM(NewEVMBlockContext(blockchain.CurrentBlock(), blockchain, nil), replayState, nil, config, vm.Config{})
+			replayState.SetTxContext(signedTx.Hash(), 0)
+			if err := ApplyTransactionForReplay(msg, new(GasPool).AddGas(1000000), blockNum, signedTx, replayEVM, nil); err != nil {
+				t.Fatalf("ApplyTransactionForReplay failed: %v", err)
+			}
+
+			evmState := statedb.Copy()
+			evmEVM := vm.NewEVM(NewEVMBlockContext(blockchain.CurrentBlock(), blockchain, nil), evmState, nil, config, vm.Config{})
+			evmState.SetTxContext(signedTx.Hash(), 0)
+			var usedGas uint64
+			if _, _, _, err := ApplyTransactionWithEVM(msg, new(GasPool).AddGas(1000000), evmState, blockNum, genesis.Hash(), signedTx, &usedGas, evmEVM, nil); err != nil {
+				t.Fatalf("ApplyTransactionWithEVM failed: %v", err)
+			}
+
+			want := evmState.GetLogs(signedTx.Hash(), blockNum.Uint64(), genesis.Hash())
+			if len(want) != 1 {
+				t.Fatalf("block processing recorded %d logs, want 1", len(want))
+			}
+			got := replayState.GetLogs(signedTx.Hash(), blockNum.Uint64(), genesis.Hash())
+			if len(got) != len(want) {
+				t.Fatalf("replay recorded %d logs, block processing %d", len(got), len(want))
+			}
+			for i := range want {
+				if got[i].Address != want[i].Address || got[i].Index != want[i].Index {
+					t.Fatalf("replay log %d = {address: %v, index: %d}, block processing = {address: %v, index: %d}", i, got[i].Address, got[i].Index, want[i].Address, want[i].Index)
+				}
+			}
+
+			// The nonce the same transaction leaves behind: block processing bumps it on the
+			// sign route and leaves it alone on the empty route. Pin it to the route first, so
+			// the comparison below cannot pass on two paths that both leave the nonce alone.
+			wantNonce := evmState.GetNonce(sender)
+			if wantNonce != tc.wantNonce {
+				t.Fatalf("block processing left nonce %d, want %d", wantNonce, tc.wantNonce)
+			}
+			if gotNonce := replayState.GetNonce(sender); gotNonce != wantNonce {
+				t.Fatalf("replay left nonce %d, block processing %d", gotNonce, wantNonce)
+			}
+		})
+	}
+}
