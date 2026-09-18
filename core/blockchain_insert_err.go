@@ -94,8 +94,10 @@ var insertErrClasses = []struct {
 	// reorg read a record of the chain it does not have or cannot have: the chain's own
 	// markers and records disagree with each other. Not retryable - the same read sees the
 	// same records.
+	{errInvalidOldChain, insertErrClass{local: true}},
 
 	// The same, while adopting the other chain.
+	{errInvalidNewChain, insertErrClass{local: true}},
 
 	// Ahead of this node's clock, so the block is queued rather than classified as a failure.
 	// Not local on its own: the one path that can hand it out wraps it in
@@ -174,6 +176,8 @@ var localFailureReasons = []struct {
 	// Not an interruption: an inconsistent local chain is not a state the file or a retry can
 	// get past, and the message has to say so to keep an operator from re-running the same
 	// file.
+	{errInvalidOldChain, "the local chain is inconsistent"},
+	{errInvalidNewChain, "the local chain is inconsistent"},
 
 	{ErrKnownBlock, "already imported"},
 	{consensus.ErrPrunedAncestor, "ancestor state is pruned"},
