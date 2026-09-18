@@ -141,6 +141,13 @@ var (
 	// IsLocalInsertError for why callers must not treat it as a consensus failure either.
 	ErrLocalInsertRefused = errors.New("local insert refused")
 
+	// errInvalidOldChain and errInvalidNewChain are raised by reorg when it reads a record
+	// of the chain - a block, or a header it has just written a marker for - and does not
+	// find it. That is this node's own chain disagreeing with itself rather than anything
+	// about the blocks, which is why classifyInsertErr calls both local, and neither is
+	// retryable: the same read sees the same records on the next attempt. See
+	// IsLocalInsertError for why a caller must not hold the peer that served the batch to
+	// one of them.
 	errInvalidOldChain = errors.New("invalid old chain")
 	errInvalidNewChain = errors.New("invalid new chain")
 

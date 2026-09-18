@@ -52,11 +52,15 @@ type insertErrClass struct {
 //	                                           be refused again, so it must not stay parked
 //	ErrKnownBlock            local            the block is on disk; the next batch adopts it
 //	ErrPrunedAncestor        local            this node no longer holds the ancestor's state
+//	errInvalidOldChain       local            reorg read a record of the chain it does not
+//	                                           have or cannot have: the chain's own markers
+//	                                           and records disagree with each other
+//	errInvalidNewChain       local            the same, while adopting the other chain
 //	ErrFutureBlock           retryable        ahead of this node's clock, so it is queued
 //	ErrUnknownAncestor       bad block        a batch that cannot be linked is the peer's
 //	anything else           bad block
 //
-// The four local sentinels that have no other class are marked as not bad blocks. They are
+// The local sentinels that have no other class are marked as not bad blocks. They are
 // only ever raised inside this package, so they never reach a caller through the engine's
 // verification results. Writing a local interruption into the bad block database would
 // outlive the condition that caused it - a shutdown, a cancel, a clock that steps back - so
@@ -64,13 +68,14 @@ type insertErrClass struct {
 // flag and ErrFutureBlock, the one retryable error that is not local on its own, are spelled
 // out where they are asked: see IsLocalInsertError.
 //
-// ErrLocalInsertCondition and ErrLocalInsertRefused are the local sentinels that are not
-// retryable as well; they are why the two flags are not a single column. See the comment on
-// ErrLocalInsertCondition for the retry loop that would otherwise re-verify a block this node
-// cannot import, on every futureBlocksLoop tick and forever, and on ErrLocalInsertRefused for
-// the one that would re-run the refused reorg. ErrLocalInsertAheadOfClock is the exception
-// that proves the split: the one local condition that heals, so it is the one local condition
-// a parked block may wait for.
+// ErrLocalInsertCondition, ErrLocalInsertRefused, errInvalidOldChain and errInvalidNewChain
+// are the local sentinels that are not retryable as well; they are why the two flags are not
+// a single column. See the comment on ErrLocalInsertCondition for the retry loop that would
+// otherwise re-verify a block this node cannot import, on every futureBlocksLoop tick and
+// forever, on ErrLocalInsertRefused for the one that would re-run the refused reorg, and on
+// the two chain-record sentinels for why an inconsistent chain is not something a retry
+// repairs. ErrLocalInsertAheadOfClock is the exception that proves the split: the one local
+// condition that heals, so it is the one local condition a parked block may wait for.
 func classifyInsertErr(err error) insertErrClass {
 	class := insertErrClass{badBlock: true} // anything unrecognised is the block's fault
 	switch {
@@ -88,6 +93,13 @@ func classifyInsertErr(err error) insertErrClass {
 		errors.Is(err, ErrLocalInsertRefused),
 		errors.Is(err, ErrLocalInsertCondition):
 		class.local, class.badBlock = true, false
+	case errors.Is(err, errInvalidOldChain),
+		errors.Is(err, errInvalidNewChain):
+		// reorg read a record of the chain and did not find it: the chain's own markers or
+		// records disagree with each other. Not retryable - the same read sees the same
+		// records - and never the block's fault, so neither the block nor the peer that
+		// served the batch is held to it.
+		class.local, class.badBlock = true, false
 	case errors.Is(err, consensus.ErrFutureBlock):
 		class.retryable, class.badBlock = true, false
 	}
@@ -96,9 +108,10 @@ func classifyInsertErr(err error) insertErrClass {
 
 // IsLocalInsertError reports whether an insertion failed for a reason that lives in this
 // node rather than in the blocks: the chain has been stopped, the insertion was cut short by
-// InterruptInsert, an import needs an ancestor whose state this node no longer holds, or
-// adopting an already stored block would need a reorg this node refuses. It is the local flag
-// of classifyInsertErr, the single place that enumerates the local conditions.
+// InterruptInsert, an import needs an ancestor whose state this node no longer holds,
+// adopting an already stored block would need a reorg this node refuses, or a reorg read a
+// record of the chain it does not have. It is the local flag of classifyInsertErr, the single
+// place that enumerates the local conditions.
 //
 // Callers that penalise peers on insertion failures - the downloader turns an unknown error
 // into errInvalidChain, which drops the peer that served the batch - must exempt these:
@@ -148,6 +161,12 @@ func DescribeLocalInsertFailure(err error) (string, bool) {
 		// missing is missing for this file as well, and a block dated ahead of the clock is
 		// one this import cannot place even though a later retry could.
 		return "cannot be imported", true
+	case errors.Is(err, errInvalidOldChain), errors.Is(err, errInvalidNewChain):
+		// The chain's own records disagree with each other, so the file is not at fault -
+		// and this is not an interruption either: the import cannot proceed until the node's
+		// chain is repaired, and saying that is what keeps an operator from re-running the
+		// same file.
+		return "the local chain is inconsistent", true
 	case errors.Is(err, ErrKnownBlock):
 		return "already imported", true
 	case errors.Is(err, consensus.ErrPrunedAncestor):
