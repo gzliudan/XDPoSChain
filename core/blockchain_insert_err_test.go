@@ -79,6 +79,21 @@ func TestClassifyInsertErr(t *testing.T) {
 			want: insertErrClass{local: true},
 		},
 		{
+			// What reorg reports when it reads a record of the chain and does not find it.
+			// The production path that raises it cannot be built in a unit test - reorg
+			// only reads what is already on disk - so the table is what pins the class,
+			// and it pins the two flags that matter: the peer that served the batch must
+			// not be blamed for it, and a retry cannot repair it either.
+			name: "old chain inconsistent",
+			err:  errInvalidOldChain,
+			want: insertErrClass{local: true},
+		},
+		{
+			name: "new chain inconsistent",
+			err:  errInvalidNewChain,
+			want: insertErrClass{local: true},
+		},
+		{
 			// Retryable but not local: a block dated ahead of this node's clock is parked,
 			// while a peer serving it is not at fault. See IsLocalInsertError.
 			name: "future block",
@@ -156,6 +171,8 @@ func TestIsLocalInsertErrorIsTheLocalFlag(t *testing.T) {
 		ErrLocalInsertRefused,
 		ErrKnownBlock,
 		consensus.ErrPrunedAncestor,
+		errInvalidOldChain,
+		errInvalidNewChain,
 		consensus.ErrFutureBlock,
 		consensus.ErrUnknownAncestor,
 		errors.New("boom"),
@@ -188,6 +205,10 @@ func TestDescribeLocalInsertFailure(t *testing.T) {
 		{"pruned ancestor", consensus.ErrPrunedAncestor, "ancestor state is pruned"},
 		{"interrupted import", ErrInsertionInterrupted, "interrupted during import"},
 		{"stopped chain", ErrChainStopped, "interrupted during import"},
+		// Not "interrupted during import": an inconsistent local chain is not a state the
+		// file or a retry can get past, and the reason has to say so.
+		{"old chain inconsistent", errInvalidOldChain, "the local chain is inconsistent"},
+		{"new chain inconsistent", errInvalidNewChain, "the local chain is inconsistent"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
