@@ -152,7 +152,7 @@ func closeAfterReorg(t *testing.T, chain *BlockChain, newHead *types.Block) {
 	t.Helper()
 	t.Cleanup(func() {
 		if have := rawdb.ReadCanonicalHash(chain.db, newHead.NumberU64()); have != newHead.Hash() {
-			chain.writeHeadBlock(newHead)
+			chain.writeHeadBlock(newHead, nil)
 		}
 		chain.Stop()
 	})

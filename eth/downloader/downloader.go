@@ -1712,12 +1712,15 @@ func (d *Downloader) importBlockResults(results []*fetchResult) error {
 	before := d.blockchain.CurrentBlock()
 	// For XDPoS, the header verification of an epoch-switch block reads the
 	// snapshot stored at its gap block, and that snapshot is only written while
-	// the gap block itself is being executed (UpdateMasternodes). VerifyHeaders
-	// verifies the whole batch up-front (its results channel is fully buffered),
-	// so it would race ahead and try to verify the epoch-switch block before the
-	// gap block in the same batch has been executed, failing to find the snapshot.
-	// Split the batch right after each gap block so the gap block is executed -
-	// and its snapshot stored - before the following blocks are verified.
+	// the gap block itself is being executed: for v2 it travels in the batch
+	// that carries the chain markers of that block, for v1 the masternode
+	// refresh (UpdateMasternodes) stores it right after the head is written.
+	// VerifyHeaders verifies the whole batch up-front (its results channel is
+	// fully buffered), so it would race ahead and try to verify the
+	// epoch-switch block before the gap block in the same batch has been
+	// executed, failing to find the snapshot. Split the batch right after each
+	// gap block so the gap block is executed - and its snapshot stored - before
+	// the following blocks are verified.
 	for _, segment := range d.splitBlocksAtGap(blocks) {
 		if index, err := d.blockchain.InsertChain(segment); err != nil {
 			// A local condition says nothing about the peer that served the blocks, so it
