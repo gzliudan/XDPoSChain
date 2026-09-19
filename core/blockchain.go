@@ -952,7 +952,7 @@ func (bc *BlockChain) ResetWithGenesisBlock(genesis *types.Block) error {
 	if err := batch.Write(); err != nil {
 		log.Crit("Failed to write genesis block", "err", err)
 	}
-	bc.writeHeadBlock(genesis, false)
+	bc.writeHeadBlock(genesis)
 
 	// Last update all in-memory chain markers
 	bc.genesisBlock = genesis
@@ -1055,8 +1055,11 @@ func (bc *BlockChain) ExportN(w io.Writer, first uint64, last uint64) error {
 // header and the head fast sync block to this very same block if they are older
 // or if they are on a different side chain.
 //
+// The block itself must already be persisted by the caller, only the chain
+// markers are written here.
+//
 // Note, this function assumes that the `mu` mutex is held!
-func (bc *BlockChain) writeHeadBlock(block *types.Block, writeBlock bool) {
+func (bc *BlockChain) writeHeadBlock(block *types.Block) {
 	blockHash := block.Hash()
 	blockNumberU64 := block.NumberU64()
 
@@ -1067,9 +1070,6 @@ func (bc *BlockChain) writeHeadBlock(block *types.Block, writeBlock bool) {
 	rawdb.WriteCanonicalHash(batch, blockHash, blockNumberU64)
 	rawdb.WriteTxLookupEntriesByBlock(batch, block)
 	rawdb.WriteHeadBlockHash(batch, blockHash)
-	if writeBlock {
-		rawdb.WriteBlock(batch, block)
-	}
 
 	// Flush the whole batch into the disk, exit the node if failed
 	if err := batch.Write(); err != nil {
@@ -1688,8 +1688,7 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 
 	// Set new head.
 	if status == CanonStatTy {
-		// WriteBlock has already been called, no need to write again
-		bc.writeHeadBlock(block, false)
+		bc.writeHeadBlock(block)
 		// prepare set of masternodes for the next epoch
 		if bc.chainConfig.XDPoS != nil && ((block.NumberU64() % bc.chainConfig.XDPoS.Epoch) == (bc.chainConfig.XDPoS.Epoch - bc.chainConfig.XDPoS.Gap)) {
 			if err := bc.UpdateM1(); err != nil {
@@ -2594,8 +2593,11 @@ func (bc *BlockChain) reorg(oldHead, newHead *types.Header) error {
 			bc.logsFeed.Send(rebirthLogs)
 			rebirthLogs = nil
 		}
-		// Update the head block
-		bc.writeHeadBlock(block, true)
+		// Update the head block. The body is on disk already: writeBlockWithState
+		// commits its block batch before calling into reorg, and every other
+		// block of the new chain was read back through GetBlock above. Keep that
+		// order, or the markers written here can outlive the block they point at.
+		bc.writeHeadBlock(block)
 		// prepare set of masternodes for the next epoch
 		if bc.chainConfig.XDPoS != nil && ((block.NumberU64() % bc.chainConfig.XDPoS.Epoch) == (bc.chainConfig.XDPoS.Epoch - bc.chainConfig.XDPoS.Gap)) {
 			if err := bc.UpdateM1(); err != nil {
