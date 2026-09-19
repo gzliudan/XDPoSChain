@@ -59,7 +59,7 @@ func TestReorgLeavesNewHeadToCaller(t *testing.T) {
 	oldHead := blockchain.CurrentBlock()
 	newHead := fork[len(fork)-1]
 	closeAfterReorg(t, blockchain, newHead)
-	if err := blockchain.reorg(oldHead, newHead.Header()); err != nil {
+	if err := blockchain.reorg(oldHead, newHead.Header(), nil); err != nil {
 		t.Fatalf("failed to reorg: %v", err)
 	}
 	// Every non-head block of the new chain must be canonical...
@@ -134,7 +134,7 @@ func TestReorgKeepsTheNewHeadTxLookup(t *testing.T) {
 	closeAfterReorg(t, blockchain, fork[1])
 	// Run the reorg the way writeBlockWithState does, stopping before the caller writes the
 	// new head: the lookup entry has to be intact already at that point.
-	if err := blockchain.reorg(blockchain.CurrentBlock(), fork[1].Header()); err != nil {
+	if err := blockchain.reorg(blockchain.CurrentBlock(), fork[1].Header(), nil); err != nil {
 		t.Fatalf("failed to reorg: %v", err)
 	}
 	if entry := rawdb.ReadTxLookupEntry(blockchain.ChainDb(), tx.Hash()); entry == nil {
@@ -152,7 +152,7 @@ func closeAfterReorg(t *testing.T, chain *BlockChain, newHead *types.Block) {
 	t.Helper()
 	t.Cleanup(func() {
 		if have := rawdb.ReadCanonicalHash(chain.db, newHead.NumberU64()); have != newHead.Hash() {
-			chain.writeHeadBlock(newHead)
+			chain.writeHeadBlock(newHead, nil)
 		}
 		chain.Stop()
 	})
