@@ -2691,7 +2691,11 @@ func (bc *BlockChain) reorg(oldHead, newHead *types.Header) error {
 		// they point at.
 		bc.writeHeadBlock(block)
 		// prepare set of masternodes for the next epoch
-		if bc.chainConfig.XDPoS != nil && ((block.NumberU64() % bc.chainConfig.XDPoS.Epoch) == (bc.chainConfig.XDPoS.Epoch - bc.chainConfig.XDPoS.Gap)) {
+		// The new head stays out of this: the caller refreshes the block it has
+		// just made canonical, the way upstream keeps the tip out of its own
+		// apply loop. This loop owns the blocks below the new head, and
+		// refreshing the tip here as well would refresh the same header twice.
+		if i > 0 && bc.chainConfig.XDPoS != nil && ((block.NumberU64() % bc.chainConfig.XDPoS.Epoch) == (bc.chainConfig.XDPoS.Epoch - bc.chainConfig.XDPoS.Gap)) {
 			if err := bc.UpdateM1(); err != nil {
 				log.Crit("Fail to update masternodes during reorg", "number", block.Number, "hash", block.Hash().Hex(), "err", err)
 			}
