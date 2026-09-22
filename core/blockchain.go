@@ -4239,14 +4239,21 @@ func (bc *BlockChain) nextEpochSnapshotOf(statedb *state.StateDB, number uint64,
 // that both refresh paths name the block they refresh rather than looking the
 // head up a second time.
 //
-// The refresh itself is the v1 one and is unchanged: the candidates come from
-// the head state, falling back to the voting contract over IPC when that state
-// cannot be opened, the stake of every candidate is read from the contract, and
-// the result is handed to the engine, which keeps the v1 set in memory. The head
-// has to be the block the caller has just made canonical, because that is the
-// state this reads. There is nothing to persist: the v1 set is read back from
-// the checkpoint header extra data. Callers therefore keep their position behind
-// the head write and pass the header of the block they just made canonical.
+// The refresh itself is the v1 one: the candidates and their stakes are read off
+// the state committed at that header, and the result is handed to the engine,
+// which keys the v1 set by that very block and keeps it in memory. The header
+// therefore has to be the block whose set this refreshes: candidates read from
+// anywhere else would be stored as the set of a block they did not come from.
+// There is no IPC fallback any more - a state that cannot be read fails the
+// refresh instead of asking the voting contract over this node's own endpoint -
+// and there is nothing to persist, because the v1 set is read back from the
+// checkpoint header extra data. A v2 gap block normally does not come here
+// either: core.BlockChain derives its set with engine_v2.BuildSnapshotFromState
+// and stores it in the same batch as the chain markers of that block. What is
+// left for the engine to store is the set of a gap block the derivation does not
+// cover, which today is a schedule whose gap offset is not usable - see
+// isNextEpochGapBlock. Callers therefore keep their position behind the head
+// write and pass the header of the block they just made canonical.
 func (bc *BlockChain) UpdateM1At(header *types.Header) error {
 	engine, ok := bc.Engine().(*XDPoS.XDPoS)
 	if bc.Config().XDPoS == nil || !ok {
@@ -4256,16 +4263,16 @@ func (bc *BlockChain) UpdateM1At(header *types.Header) error {
 		return errors.New("nil header in UpdateM1At")
 	}
 	log.Info("It's time to update new set of masternodes for the next epoch...")
-	// Read the candidates and their stakes off the state of the head, which is
-	// the block this refresh is for. The stakes used to come back from the
-	// voting contract over this node's own IPC endpoint: that cost an eth_call
-	// per candidate while the chain write lock was held, and it is also what
-	// made the refresh depend on an IPC endpoint at all (a node started with
-	// --ipcdisable fails the refresh, and the callers turn that failure into
+	// Read the candidates and their stakes off the state committed at that
+	// header, which is the block this refresh is for. The stakes used to come
+	// back from the voting contract over this node's own IPC endpoint: that cost
+	// an eth_call per candidate while the chain write lock was held, and it is
+	// also what made the refresh depend on an IPC endpoint at all (a node started
+	// with --ipcdisable fails the refresh, and the callers turn that failure into
 	// log.Crit).
-	stateDB, err := bc.State()
+	stateDB, err := bc.StateAt(header.Root)
 	if err != nil {
-		return fmt.Errorf("failed to open the state of the head for the masternode update: %w", err)
+		return fmt.Errorf("failed to open the state of the block for the masternode update: %w", err)
 	}
 
 	var ms []utils.Masternode
@@ -4298,7 +4305,7 @@ func (bc *BlockChain) UpdateM1At(header *types.Header) error {
 		if err != nil {
 			return err
 		}
-		log.Info("Masternodes are ready for the next epoch")
+		log.Info("Masternodes are ready for the next epoch", "number", header.Number.Uint64(), "hash", header.Hash().Hex())
 	}
 	return nil
 }
