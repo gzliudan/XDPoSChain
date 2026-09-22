@@ -1213,6 +1213,15 @@ func (bc *BlockChain) writeHeadBlock(block *types.Block, snap *engine_v2.Snapsho
 	// closes. The ready line belongs to the same point: it says the set is
 	// durable, not merely derived.
 	if snap != nil {
+		// VERIFY-TEMP: the batch that just landed carried this snapshot.
+		{
+			digest := make([]byte, 0, len(snap.NextEpochCandidates)*20)
+			for _, addr := range snap.NextEpochCandidates {
+				digest = append(digest, addr.Bytes()...)
+			}
+			log.Warn("VERIFY writeHeadBlock flushed snapshot", "number", blockNumberU64, "hash", blockHash.Hex(),
+				"count", len(snap.NextEpochCandidates), "setDigest", crypto.Keccak256Hash(digest).Hex())
+		}
 		log.Info("Masternodes are ready for the next epoch", "number", blockNumberU64, "hash", blockHash.Hex())
 		if engine, ok := bc.Engine().(*XDPoS.XDPoS); ok {
 			engine.EngineV2.CacheSnapshot(snap)
@@ -1967,6 +1976,16 @@ func (bc *BlockChain) adoptHead(block *types.Block, current *types.Header, snap 
 		derived, err := bc.nextEpochSnapshotOf(statedb, block.NumberU64(), block.Hash())
 		if err != nil {
 			return err
+		}
+		// VERIFY-TEMP: the set this adoption had to derive itself, because the block
+		// arrived from disk without one.
+		{
+			digest := make([]byte, 0, len(derived.NextEpochCandidates)*20)
+			for _, addr := range derived.NextEpochCandidates {
+				digest = append(digest, addr.Bytes()...)
+			}
+			log.Warn("VERIFY adoptHead derived missing snapshot", "number", block.NumberU64(), "hash", block.Hash().Hex(),
+				"count", len(derived.NextEpochCandidates), "setDigest", crypto.Keccak256Hash(digest).Hex())
 		}
 		snap = derived
 	}
@@ -4230,6 +4249,15 @@ func (bc *BlockChain) nextEpochSnapshotOf(statedb *state.StateDB, number uint64,
 		return nil, fmt.Errorf("failed to derive the next-epoch masternodes of gap block %d (%s): %w",
 			number, hash.Hex(), err)
 	}
+	// VERIFY-TEMP: the set derived for this gap block, before anything is written.
+	{
+		digest := make([]byte, 0, len(snap.NextEpochCandidates)*20)
+		for _, addr := range snap.NextEpochCandidates {
+			digest = append(digest, addr.Bytes()...)
+		}
+		log.Warn("VERIFY nextEpochSnapshotOf derived", "number", number, "hash", hash.Hex(),
+			"count", len(snap.NextEpochCandidates), "setDigest", crypto.Keccak256Hash(digest).Hex())
+	}
 	log.Info("Updating the next-epoch masternodes", "number", number, "hash", hash.Hex(), "candidates", len(snap.NextEpochCandidates))
 	return snap, nil
 }
@@ -4294,6 +4322,23 @@ func (bc *BlockChain) UpdateM1At(header *types.Header) error {
 		return errors.New("no masternode found")
 	} else {
 		utils.SortMasternodesByStakeDesc(ms)
+		// VERIFY-TEMP: the set this refresh hands over, in the order it hands it over.
+		// The digest is only comparable across nodes after the sort above.
+		{
+			digest := make([]byte, 0, len(ms)*20)
+			for _, m := range ms {
+				digest = append(digest, m.Address.Bytes()...)
+			}
+			head := make([]string, 0, 6)
+			for i, m := range ms {
+				if i >= 6 {
+					break
+				}
+				head = append(head, m.Address.Hex()+"="+m.Stake.String())
+			}
+			log.Warn("VERIFY UpdateM1At read off state", "number", header.Number.Uint64(), "hash", header.Hash().Hex(),
+				"count", len(ms), "setDigest", crypto.Keccak256Hash(digest).Hex(), "head", strings.Join(head, ","))
+		}
 		log.Info("Updating new set of masternodes")
 		// The set above was read from bc.State(), i.e. the state of the current
 		// block, and this header is that same block because both call sites run

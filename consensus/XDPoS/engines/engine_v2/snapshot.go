@@ -10,6 +10,7 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/consensus/XDPoS/utils"
 	"github.com/XinFinOrg/XDPoSChain/core/rawdb"
 	"github.com/XinFinOrg/XDPoSChain/core/state"
+	"github.com/XinFinOrg/XDPoSChain/crypto"
 	"github.com/XinFinOrg/XDPoSChain/ethdb"
 	"github.com/XinFinOrg/XDPoSChain/log"
 )
@@ -253,6 +254,19 @@ func (x *XDPoS_v2) RepairGapSnapshots(chain GapStateReader) {
 			continue
 		}
 		x.snapshots.Add(snap.Hash, snap)
+		// VERIFY-TEMP: the set this startup repair derived, in the order it is
+		// stored. The derivation does not go through
+		// core.BlockChain.nextEpochSnapshotOf, so without this line a repaired
+		// snapshot has no digest to compare across nodes and no partner for the
+		// "writeHeadBlock flushed snapshot" line.
+		{
+			digest := make([]byte, 0, len(snap.NextEpochCandidates)*20)
+			for _, address := range snap.NextEpochCandidates {
+				digest = append(digest, address.Bytes()...)
+			}
+			log.Warn("VERIFY RepairGapSnapshots derived snapshot", "number", gapNum, "hash", gapHash,
+				"count", len(snap.NextEpochCandidates), "setDigest", crypto.Keccak256Hash(digest).Hex())
+		}
 		log.Warn("[RepairGapSnapshots] repaired missing snapshot", "number", gapNum, "hash", gapHash, "candidates", len(snap.NextEpochCandidates))
 	}
 }

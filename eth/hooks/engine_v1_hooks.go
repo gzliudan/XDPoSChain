@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"strings"
 	"time"
 
 	"github.com/XinFinOrg/XDPoSChain/common"
@@ -17,6 +18,7 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/core/tracing"
 	"github.com/XinFinOrg/XDPoSChain/core/types"
 	"github.com/XinFinOrg/XDPoSChain/core/vm"
+	"github.com/XinFinOrg/XDPoSChain/crypto"
 	"github.com/XinFinOrg/XDPoSChain/eth/util"
 	"github.com/XinFinOrg/XDPoSChain/log"
 	"github.com/XinFinOrg/XDPoSChain/params"
@@ -248,6 +250,29 @@ func AttachConsensusV1Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 		for _, candidate := range candidates {
 			result = append(result, candidate.Address)
 		}
+		// VERIFY-TEMP: the signers this fallback hook read off the gap block's
+		// state, in the order it hands them over. The list is the state's
+		// candidate list sorted by stake descending and capped at 150, so the
+		// digest is comparable with the "UpdateM1At read off state" line unless
+		// that cap bites. This hook only runs when the snapshot's own signers
+		// were rejected at a checkpoint - see verifyCascadingFields - so a
+		// clean replay prints none of these.
+		{
+			digest := make([]byte, 0, len(result)*20)
+			for _, address := range result {
+				digest = append(digest, address.Bytes()...)
+			}
+			head := make([]string, 0, 6)
+			for i, candidate := range candidates {
+				if i >= 6 {
+					break
+				}
+				head = append(head, candidate.Address.Hex()+"="+candidate.Stake.String())
+			}
+			log.Warn("VERIFY HookGetSignersFromContract read off state", "number", gapHeader.Number.Uint64(),
+				"hash", gapHeader.Hash().Hex(), "count", len(result),
+				"setDigest", crypto.Keccak256Hash(digest).Hex(), "head", strings.Join(head, ","))
+		}
 		return result, nil
 	}
 
@@ -358,5 +383,20 @@ func getValidatorsAtNumber(bc *core.BlockChain, masternodes []common.Address, pa
 	if err != nil {
 		return nil, err
 	}
-	return contracts.BuildValidatorFromM2(m2), nil
+	validators := contracts.BuildValidatorFromM2(m2)
+	// VERIFY-TEMP: what this checkpoint's validators came out as, together with
+	// the block whose state they were derived from: the parent the caller
+	// resolved, or the head when there was no parent to hand in. The identity is
+	// what tells a fork's own parent apart from the canonical block of the same
+	// height.
+	from := []interface{}{"parent", "none"}
+	if parent != nil {
+		from = []interface{}{"parent", parent.Number.Uint64(), "parentHash", parent.Hash().Hex()}
+	} else if head := bc.CurrentHeader(); head != nil {
+		from = []interface{}{"parent", "none", "head", head.Number.Uint64()}
+	}
+	fields := append([]interface{}{"lenSigners", lenSigners, "randoms", candidates}, from...)
+	fields = append(fields, "validators", common.Bytes2Hex(validators))
+	log.Warn("VERIFY getValidatorsAtNumber", fields...)
+	return validators, nil
 }
