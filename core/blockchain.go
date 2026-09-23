@@ -2953,7 +2953,27 @@ func (bc *BlockChain) headTd(head *types.Header) (*big.Int, error) {
 //
 // Every index it returns is relative to the batch the caller handed in, never to a segment
 // rebuilt from stored ancestors: those have no offset into that batch.
-func (bc *BlockChain) insertSideChain(block *types.Block, it *insertIterator, verifySeals bool) (int, []interface{}, []*types.Log, error) {
+//
+// The head this call moves is announced on the way out, whatever the call returns. The
+// rebuilt segment below is imported in chunks and every chunk but the last drops the events
+// it raised to stay within the memory allowance, so a rebuild that moved the head and then
+// stopped - a chunk that failed, a rebuild that ended on a flush boundary - would otherwise
+// leave subscribers on a head this node has already left. A batch raises one head event, so
+// the events a return already carries win: this is only for the returns that carry none.
+func (bc *BlockChain) insertSideChain(block *types.Block, it *insertIterator, verifySeals bool) (n int, events []interface{}, logs []*types.Log, err error) {
+	// The head this call started from. InsertChain holds the chain mutex across the whole
+	// call, so nothing else can move the head between the two reads.
+	before := bc.CurrentBlock()
+	defer func() {
+		head := bc.CurrentBlock()
+		if before == nil || head == nil || head.Hash() == before.Hash() {
+			return
+		}
+		// The head is a marker holding a header, and the event carries the block.
+		if moved := bc.GetBlock(head.Hash(), head.Number.Uint64()); moved != nil {
+			events = withChainHeadEvent(events, moved)
+		}
+	}()
 	var (
 		externTd *big.Int
 		current  = bc.CurrentBlock().Number.Uint64()
@@ -2962,7 +2982,7 @@ func (bc *BlockChain) insertSideChain(block *types.Block, it *insertIterator, ve
 	// Since we don't import them here, we expect ErrUnknownAncestor for the remaining
 	// ones. Any other errors means that the block is invalid, and should not be written
 	// to disk.
-	err := consensus.ErrPrunedAncestor
+	err = consensus.ErrPrunedAncestor
 	for ; block != nil && (errors.Is(err, consensus.ErrPrunedAncestor)); block, err = it.next() {
 		// Check the canonical state root for that number
 		if number := block.NumberU64(); current >= number {
