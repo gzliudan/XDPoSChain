@@ -85,9 +85,11 @@ func classifyInsertErr(err error) insertErrClass {
 		class.retryable, class.local, class.badBlock = true, true, false
 	// Local and not retryable. ErrLocalInsertCondition belongs here rather than with the
 	// sentinels above: every condition it carries - a segment with nothing stored, a refused
-	// receipt write, a stored block with no total difficulty record - is read the same way
-	// on the next attempt, so a parked block that failed for one has to be evicted instead
-	// of being re-verified ten times a second until the queue happens to drop it.
+	// receipt write, a state or trie commit this node's own trie database refused, a parent
+	// state it can no longer open, a stored block with no total difficulty record - is read
+	// the same way on the next attempt, so a parked block that failed for one has to be
+	// evicted instead of being re-verified ten times a second until the queue happens to
+	// drop it.
 	case errors.Is(err, ErrKnownBlock),
 		errors.Is(err, consensus.ErrPrunedAncestor),
 		errors.Is(err, ErrLocalInsertRefused),
