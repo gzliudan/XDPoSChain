@@ -1698,7 +1698,23 @@ func (bc *BlockChain) InsertReceiptChain(blockChain types.Blocks, receiptChain [
 	head := blockChain[len(blockChain)-1]
 	if td := bc.GetTd(head.Hash(), head.NumberU64()); td != nil { // Rewind may have occurred, skip in that case
 		currentSnapBlock := bc.CurrentSnapBlock()
-		if bc.GetTd(currentSnapBlock.Hash(), currentSnapBlock.Number.Uint64()).Cmp(td) < 0 {
+		// The fast sync head is compared by the total difficulty this node stored for it, and
+		// a database that lost that record - or one that reports no fast sync head at all -
+		// has nothing to compare: dereferencing it panics, and reading it as "does not beat
+		// the fast sync head" would leave the head where it is while the batch is reported as
+		// imported. The missing record is a condition of this node, reported the way
+		// writeBlockWithState reports the same read of the parent and of the head it writes
+		// on, and the fast sync head is left where it is.
+		var snapTd *big.Int
+		if currentSnapBlock != nil {
+			snapTd = bc.GetTd(currentSnapBlock.Hash(), currentSnapBlock.Number.Uint64())
+		}
+		if snapTd == nil {
+			bc.chainmu.Unlock()
+			return 0, fmt.Errorf("%w: no total difficulty for the fast sync head, the receipts up to block %d are written",
+				ErrLocalInsertCondition, head.NumberU64())
+		}
+		if snapTd.Cmp(td) < 0 {
 			rawdb.WriteHeadFastBlockHash(bc.db, head.Hash())
 			bc.currentSnapBlock.Store(head.Header())
 			headFastBlockGauge.Update(int64(head.NumberU64()))
