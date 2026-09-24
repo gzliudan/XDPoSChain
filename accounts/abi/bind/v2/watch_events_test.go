@@ -19,6 +19,7 @@ package bind_test
 import (
 	"testing"
 
+	bindv1 "github.com/XinFinOrg/XDPoSChain/accounts/abi/bind"
 	"github.com/XinFinOrg/XDPoSChain/accounts/abi/bind/v2"
 	"github.com/XinFinOrg/XDPoSChain/accounts/abi/bind/v2/internal/contracts/events"
 	"github.com/XinFinOrg/XDPoSChain/common"
@@ -52,5 +53,18 @@ func TestEventUnpackEmptyTopics(t *testing.T) {
 	}
 	if err != bind.ErrEventSignatureMismatch {
 		t.Fatalf("expected 'event signature mismatch' error, got: %v", err)
+	}
+}
+
+// TestEventSignatureErrorsAreReExportedByV1Bind checks that accounts/abi/bind
+// forwards the two sentinels as the very same values. Bindings generated
+// without --v2 reference them through that package, and errors.Is matches on
+// value identity, so an alias that merely repeats the message would not work.
+func TestEventSignatureErrorsAreReExportedByV1Bind(t *testing.T) {
+	if bindv1.ErrNoEventSignature != bind.ErrNoEventSignature {
+		t.Fatalf("ErrNoEventSignature differs: %v in accounts/abi/bind, %v in accounts/abi/bind/v2", bindv1.ErrNoEventSignature, bind.ErrNoEventSignature)
+	}
+	if bindv1.ErrEventSignatureMismatch != bind.ErrEventSignatureMismatch {
+		t.Fatalf("ErrEventSignatureMismatch differs: %v in accounts/abi/bind, %v in accounts/abi/bind/v2", bindv1.ErrEventSignatureMismatch, bind.ErrEventSignatureMismatch)
 	}
 }
