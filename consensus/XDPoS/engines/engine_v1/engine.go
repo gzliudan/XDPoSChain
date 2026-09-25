@@ -57,10 +57,14 @@ type XDPoS_v1 struct {
 	HookReward            func(chain consensus.ChainReader, state vm.StateDB, parentState *state.StateDB, header *types.Header) (map[string]interface{}, error)
 	HookPenalty           func(chain consensus.ChainReader, blockNumberEpoc uint64) ([]common.Address, error)
 	HookPenaltyTIPSigning func(chain consensus.ChainReader, header *types.Header, candidate []common.Address) ([]common.Address, error)
-	HookValidator         func(header *types.Header, signers []common.Address) ([]byte, error)
-	HookVerifyMNs         func(header *types.Header, signers []common.Address) error
+	// HookValidator and HookVerifyMNs receive the parent of the header they are
+	// asked about, so their state comes from the parent the caller resolved
+	// instead of a lookup by height, which resolves to the canonical block and
+	// would derive validators from the competing branch for a fork.
+	HookValidator func(parent, header *types.Header, signers []common.Address) ([]byte, error)
+	HookVerifyMNs func(parent, header *types.Header, signers []common.Address) error
 
-	HookGetSignersFromContract func(blockHash common.Hash) ([]common.Address, error)
+	HookGetSignersFromContract func(gapHeader *types.Header) ([]common.Address, error)
 }
 
 /*
@@ -272,7 +276,7 @@ func (x *XDPoS_v1) verifyCascadingFields(chain consensus.ChainReader, header *ty
 		}
 
 		signers := snap.GetSigners()
-		err = x.checkSignersOnCheckpoint(chain, header, signers)
+		err = x.checkSignersOnCheckpoint(chain, parent, header, signers)
 		if err == nil {
 			return x.verifySeal(chain, header, parents, fullVerify)
 		}
@@ -282,7 +286,7 @@ func (x *XDPoS_v1) verifyCascadingFields(chain consensus.ChainReader, header *ty
 			log.Error("[verifyCascadingFields] Fail to get signers from smart contract", "number", number, "hash", header.Hash(), "err", err)
 			return err
 		}
-		err = x.checkSignersOnCheckpoint(chain, header, signers)
+		err = x.checkSignersOnCheckpoint(chain, parent, header, signers)
 		if err != nil {
 			log.Error("[verifyCascadingFields] checkSignersOnCheckpoint failed with signers from smart contract", "number", number, "hash", header.Hash(), "err", err)
 			return err
@@ -293,7 +297,7 @@ func (x *XDPoS_v1) verifyCascadingFields(chain consensus.ChainReader, header *ty
 	return x.verifySeal(chain, header, parents, fullVerify)
 }
 
-func (x *XDPoS_v1) checkSignersOnCheckpoint(chain consensus.ChainReader, header *types.Header, signers []common.Address) error {
+func (x *XDPoS_v1) checkSignersOnCheckpoint(chain consensus.ChainReader, parent, header *types.Header, signers []common.Address) error {
 	number := header.Number.Uint64()
 	// ignore signerCheck at checkpoint block.
 	if common.IsIgnoreSignerCheckBlock(number) {
@@ -342,7 +346,7 @@ func (x *XDPoS_v1) checkSignersOnCheckpoint(chain consensus.ChainReader, header 
 		return utils.ErrInvalidCheckpointSigners
 	}
 	if x.HookVerifyMNs != nil {
-		err := x.HookVerifyMNs(header, signers)
+		err := x.HookVerifyMNs(parent, header, signers)
 		if err != nil {
 			return err
 		}
@@ -784,7 +788,7 @@ func (x *XDPoS_v1) Prepare(chain consensus.ChainReader, header *types.Header) er
 			header.Extra = append(header.Extra, masternode[:]...)
 		}
 		if x.HookValidator != nil {
-			validators, err := x.HookValidator(header, masternodes)
+			validators, err := x.HookValidator(parent, header, masternodes)
 			if err != nil {
 				return err
 			}
@@ -1046,8 +1050,11 @@ func (x *XDPoS_v1) getSignersFromContract(chain consensus.ChainReader, checkpoin
 	number := checkpointHeader.Number.Uint64()
 	for step := uint64(1); step <= chain.Config().XDPoS.Gap; step++ {
 		startGapBlockHeader = chain.GetHeader(startGapBlockHeader.ParentHash, number-step)
+		if startGapBlockHeader == nil {
+			return []common.Address{}, fmt.Errorf("no block at %d to get the signers from", number-step)
+		}
 	}
-	signers, err := x.HookGetSignersFromContract(startGapBlockHeader.Hash())
+	signers, err := x.HookGetSignersFromContract(startGapBlockHeader)
 	if err != nil {
 		return []common.Address{}, fmt.Errorf("can't get signers from Smart Contract . Err: %v", err)
 	}
