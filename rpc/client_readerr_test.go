@@ -304,3 +304,98 @@ func TestNotifyAfterReadErrorDoesNotPanic(t *testing.T) {
 		}
 	}
 }
+
+// blockedWriteCodec reports the read error once the write has started and keeps
+// the write blocked until the test releases it.
+type blockedWriteCodec struct {
+	ServerCodec
+
+	writeStartedOnce sync.Once
+	closeOnce        sync.Once
+
+	writeStarted chan struct{}
+	connClosed   chan struct{}
+	releaseWrite chan struct{}
+}
+
+func newBlockedWriteCodec(codec ServerCodec) *blockedWriteCodec {
+	return &blockedWriteCodec{
+		ServerCodec:  codec,
+		writeStarted: make(chan struct{}),
+		connClosed:   make(chan struct{}),
+		releaseWrite: make(chan struct{}),
+	}
+}
+
+func (c *blockedWriteCodec) readBatch() ([]*jsonrpcMessage, bool, error) {
+	<-c.writeStarted
+	return nil, false, errTestRead
+}
+
+func (c *blockedWriteCodec) writeJSON(ctx context.Context, msg interface{}, isError bool) error {
+	c.writeStartedOnce.Do(func() { close(c.writeStarted) })
+	<-c.releaseWrite
+	return nil
+}
+
+// close is called by clientConn.close, which runs handler.close first, so
+// signalling here means dispatch has finished handling the read error.
+func (c *blockedWriteCodec) close() {
+	c.closeOnce.Do(func() { close(c.connClosed) })
+	c.ServerCodec.close()
+}
+
+// TestClientCloseFailsUnansweredRequest checks that closing a client while a
+// request is still being written does not leave that request waiting forever:
+// Close documents that it aborts in-flight requests.
+func TestClientCloseFailsUnansweredRequest(t *testing.T) {
+	p1, p2 := net.Pipe()
+	defer p2.Close()
+
+	codec := newBlockedWriteCodec(NewCodec(p1))
+	client, err := newClient(context.Background(), new(clientConfig), func(context.Context) (ServerCodec, error) {
+		return codec, nil
+	})
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- client.CallContext(ctx, nil, "test_method") }()
+
+	// Wait until dispatch has handled the read error.
+	select {
+	case <-codec.connClosed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("connection was not closed in time")
+	}
+
+	// Close while the write is still blocked: the send completion cannot be
+	// pending in the dispatch select yet, so the close case always wins.
+	closed := make(chan struct{})
+	go func() { client.Close(); close(closed) }()
+	select {
+	case <-closed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("client.Close did not return")
+	}
+
+	// Let the blocked write report success.
+	close(codec.releaseWrite)
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("call succeeded unexpectedly")
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("call was left hanging until its context deadline: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("call did not return")
+	}
+}

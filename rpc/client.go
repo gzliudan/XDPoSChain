@@ -680,6 +680,15 @@ func (c *Client) dispatch(codec ServerCodec) {
 		if reading {
 			conn.close(ErrClientQuit, nil)
 			c.drainRead()
+		} else if unansweredAfterReadErr(connErr, lastOp) {
+			// The read loop already died, so conn.close kept the in-flight
+			// request for a reconnect that will not happen anymore: fail it
+			// instead of leaving the caller waiting. connErr is the read error
+			// that stopped the loop and is never nil here, so failRequestOp
+			// closes op.resp together with an error: a response channel closed
+			// without one would leave the caller reading an empty batch as if
+			// the request had been answered.
+			conn.handler.failRequestOp(lastOp, connErr)
 		}
 		close(c.didClose)
 	}()
