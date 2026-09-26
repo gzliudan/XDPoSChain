@@ -119,21 +119,50 @@ var PrecompiledContractsEIP1559 = PrecompiledContracts{
 	common.BytesToAddress([]byte{9}): &blake2F{},
 }
 
+// PrecompiledContractsPrague contains the set of pre-compiled Ethereum
+// contracts used in the Prague release.
+var PrecompiledContractsPrague = PrecompiledContracts{
+	common.BytesToAddress([]byte{1}):    &ecrecover{},
+	common.BytesToAddress([]byte{2}):    &sha256hash{},
+	common.BytesToAddress([]byte{3}):    &ripemd160hash{},
+	common.BytesToAddress([]byte{4}):    &dataCopy{},
+	common.BytesToAddress([]byte{5}):    &bigModExp{eip2565: true, eip7823: false, eip7883: false},
+	common.BytesToAddress([]byte{6}):    &bn256AddIstanbul{},
+	common.BytesToAddress([]byte{7}):    &bn256ScalarMulIstanbul{},
+	common.BytesToAddress([]byte{8}):    &bn256PairingIstanbul{},
+	common.BytesToAddress([]byte{9}):    &blake2F{},
+	common.BytesToAddress([]byte{0x0b}): &bls12381G1Add{},
+	common.BytesToAddress([]byte{0x0c}): &bls12381G1MultiExp{},
+	common.BytesToAddress([]byte{0x0d}): &bls12381G2Add{},
+	common.BytesToAddress([]byte{0x0e}): &bls12381G2MultiExp{},
+	common.BytesToAddress([]byte{0x0f}): &bls12381Pairing{},
+	common.BytesToAddress([]byte{0x10}): &bls12381MapG1{},
+	common.BytesToAddress([]byte{0x11}): &bls12381MapG2{},
+}
+
 // PrecompiledContractsOsaka contains the set of pre-compiled Ethereum
 // contracts used in the Osaka release.
 var PrecompiledContractsOsaka = PrecompiledContracts{
-	common.BytesToAddress([]byte{1}): &ecrecover{},
-	common.BytesToAddress([]byte{2}): &sha256hash{},
-	common.BytesToAddress([]byte{3}): &ripemd160hash{},
-	common.BytesToAddress([]byte{4}): &dataCopy{},
-	common.BytesToAddress([]byte{5}): &bigModExp{eip2565: true, eip7823: true, eip7883: true},
-	common.BytesToAddress([]byte{6}): &bn256AddIstanbul{},
-	common.BytesToAddress([]byte{7}): &bn256ScalarMulIstanbul{},
-	common.BytesToAddress([]byte{8}): &bn256PairingIstanbul{},
-	common.BytesToAddress([]byte{9}): &blake2F{},
+	common.BytesToAddress([]byte{1}):    &ecrecover{},
+	common.BytesToAddress([]byte{2}):    &sha256hash{},
+	common.BytesToAddress([]byte{3}):    &ripemd160hash{},
+	common.BytesToAddress([]byte{4}):    &dataCopy{},
+	common.BytesToAddress([]byte{5}):    &bigModExp{eip2565: true, eip7823: true, eip7883: true},
+	common.BytesToAddress([]byte{6}):    &bn256AddIstanbul{},
+	common.BytesToAddress([]byte{7}):    &bn256ScalarMulIstanbul{},
+	common.BytesToAddress([]byte{8}):    &bn256PairingIstanbul{},
+	common.BytesToAddress([]byte{9}):    &blake2F{},
+	common.BytesToAddress([]byte{0x0b}): &bls12381G1Add{},
+	common.BytesToAddress([]byte{0x0c}): &bls12381G1MultiExp{},
+	common.BytesToAddress([]byte{0x0d}): &bls12381G2Add{},
+	common.BytesToAddress([]byte{0x0e}): &bls12381G2MultiExp{},
+	common.BytesToAddress([]byte{0x0f}): &bls12381Pairing{},
+	common.BytesToAddress([]byte{0x10}): &bls12381MapG1{},
+	common.BytesToAddress([]byte{0x11}): &bls12381MapG2{},
 }
 
 var (
+	PrecompiledAddressesPrague    []common.Address
 	PrecompiledAddressesOsaka     []common.Address
 	PrecompiledAddressesEIP1559   []common.Address
 	PrecompiledAddressesXDCv2     []common.Address
@@ -158,6 +187,9 @@ func init() {
 	for k := range PrecompiledContractsEIP1559 {
 		PrecompiledAddressesEIP1559 = append(PrecompiledAddressesEIP1559, k)
 	}
+	for k := range PrecompiledContractsPrague {
+		PrecompiledAddressesPrague = append(PrecompiledAddressesPrague, k)
+	}
 	for k := range PrecompiledContractsOsaka {
 		PrecompiledAddressesOsaka = append(PrecompiledAddressesOsaka, k)
 	}
@@ -167,6 +199,8 @@ func activePrecompiledContracts(rules params.Rules) PrecompiledContracts {
 	switch {
 	case rules.IsOsaka:
 		return PrecompiledContractsOsaka
+	case rules.IsPrague:
+		return PrecompiledContractsPrague
 	case rules.IsEIP1559:
 		return PrecompiledContractsEIP1559
 	case rules.IsXDCxDisable:
@@ -190,6 +224,8 @@ func ActivePrecompiles(rules params.Rules) []common.Address {
 	switch {
 	case rules.IsOsaka:
 		return PrecompiledAddressesOsaka
+	case rules.IsPrague:
+		return PrecompiledAddressesPrague
 	case rules.IsEIP1559:
 		return PrecompiledAddressesEIP1559
 	case rules.IsXDCxDisable:
