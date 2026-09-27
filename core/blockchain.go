@@ -97,6 +97,47 @@ var (
 	errInvalidOldChain        = errors.New("invalid old chain")
 	errInvalidNewChain        = errors.New("invalid new chain")
 
+	// ErrInsertionInterrupted is returned by the chain insertion methods when the chain
+	// is terminating or an import was cut short by InterruptInsert. See
+	// IsLocalInsertError for why callers must not treat it as a consensus failure.
+	ErrInsertionInterrupted = errors.New("insertion is interrupted")
+
+	// ErrChainStopped is returned by the insertion methods once the chain has been
+	// stopped. chainmu is a ClosableMutex, so TryLock waits for another insertion to
+	// release the lock and only reports the stopped chain after Stop closed it. See
+	// IsLocalInsertError for why callers must not treat it as a consensus failure.
+	ErrChainStopped = errors.New("blockchain is stopped")
+
+	// ErrLocalInsertCondition keeps the local conditions that have no sentinel of their own
+	// and that a retry cannot repair: a receipt batch the database refused to write, a state
+	// or trie commit this node's own trie database refused, a parent state it can no longer
+	// open, and a stored block whose total difficulty this node no longer holds.
+	// insertSideChain raises it too, as a defensive guard for a segment that stops on a
+	// block with no stored state - a state the validator contract rules out, see the note
+	// there. A block dated ahead of the clock is the one local condition that heals, which
+	// is why it carries a sentinel of its own below. See IsLocalInsertError for why callers
+	// must not treat it as a consensus failure.
+	ErrLocalInsertCondition = errors.New("local insert condition")
+
+	// ErrLocalInsertAheadOfClock is the local condition that heals on its own: the block is
+	// dated further ahead of this node's clock than the future queue may hold, so what has
+	// to fail is the queueing of it rather than the block. Once the clock catches up the
+	// same block is queued, which is why it is retryable while ErrLocalInsertCondition is
+	// not - a parked block that failed for this has to stay parked and be tried again, not
+	// be evicted on the first tick. insertSideChain wraps consensus.ErrFutureBlock in it for
+	// the same reason and for the same clock. See IsLocalInsertError for why callers must
+	// not treat it as a consensus failure either.
+	ErrLocalInsertAheadOfClock = errors.New("local insert condition: block ahead of this node's clock")
+
+	// ErrLocalInsertRefused is the local condition that cannot heal on its own: this node
+	// refused a reorg while adopting an already stored block, and it refuses the same one
+	// again each time, since the head does not move and the block therefore keeps winning
+	// fork choice. It is deliberately not ErrLocalInsertCondition even though both are local
+	// and neither is retryable - a refusal is a verdict this node reached and has to report
+	// as one, while the other local conditions are records it is missing. See
+	// IsLocalInsertError for why callers must not treat it as a consensus failure either.
+	ErrLocalInsertRefused = errors.New("local insert refused")
+
 	CheckpointCh = make(chan int)
 )
 
