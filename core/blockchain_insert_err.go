@@ -90,6 +90,7 @@ var insertErrClasses = []struct {
 	// The gap block of an epoch switch is not on the canonical chain to be read by number.
 	// Reading it keeps failing the same way until the sidechain it sits on is imported, so
 	// keeping the batch parked would only re-verify it on every futureBlocksLoop tick.
+	{consensus.ErrMissingCanonicalGapHeader, insertErrClass{local: true}},
 
 	// reorg read a record of the chain it does not have or cannot have: the chain's own
 	// markers and records disagree with each other. Not retryable - the same read sees the
@@ -185,6 +186,7 @@ var localFailureReasons = []struct {
 	// The gap block of an epoch switch is not on the canonical chain, so a batch that needs
 	// it cannot be verified against this node's chain. Reported as a local condition rather
 	// than as an interruption: retrying reads the same chain.
+	{consensus.ErrMissingCanonicalGapHeader, "the epoch gap block is not canonical"},
 }
 
 // DescribeLocalInsertFailure names why an insertion failed for a local condition, so that the

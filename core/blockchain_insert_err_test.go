@@ -101,6 +101,14 @@ func TestClassifyInsertErr(t *testing.T) {
 			want: insertErrClass{retryable: true},
 		},
 		{
+			// Local but not retryable: the gap block of an epoch switch is read by canonical
+			// number, and it is not there until the sidechain it sits on is imported, so a
+			// parked batch would be re-verified on every futureBlocksLoop tick for nothing.
+			name: "missing canonical gap header",
+			err:  consensus.ErrMissingCanonicalGapHeader,
+			want: insertErrClass{local: true},
+		},
+		{
 			name: "unknown ancestor",
 			err:  consensus.ErrUnknownAncestor,
 			want: insertErrClass{badBlock: true},
@@ -175,6 +183,7 @@ func TestIsLocalInsertErrorIsTheLocalFlag(t *testing.T) {
 		errInvalidNewChain,
 		consensus.ErrFutureBlock,
 		consensus.ErrUnknownAncestor,
+		consensus.ErrMissingCanonicalGapHeader,
 		errors.New("boom"),
 	} {
 		if got, want := IsLocalInsertError(err), classifyInsertErr(err).local; got != want {
@@ -203,6 +212,7 @@ func TestDescribeLocalInsertFailure(t *testing.T) {
 		{"ahead of the local clock", ErrLocalInsertAheadOfClock, "cannot be imported"},
 		{"known block", ErrKnownBlock, "already imported"},
 		{"pruned ancestor", consensus.ErrPrunedAncestor, "ancestor state is pruned"},
+		{"missing canonical gap header", consensus.ErrMissingCanonicalGapHeader, "the epoch gap block is not canonical"},
 		{"interrupted import", ErrInsertionInterrupted, "interrupted during import"},
 		{"stopped chain", ErrChainStopped, "interrupted during import"},
 		// Not "interrupted during import": an inconsistent local chain is not a state the
