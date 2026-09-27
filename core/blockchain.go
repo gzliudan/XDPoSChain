@@ -3403,7 +3403,13 @@ func (bc *BlockChain) reimportPrunedAncestors(from *types.Header, localTd, exter
 	for i := len(hashes) - 1; i >= 0; i-- {
 		// Append the next block to our batch
 		block := bc.GetBlock(hashes[i], numbers[i])
-
+		if block == nil {
+			// The walk has just read this block's header, and a header is written together
+			// with the body it belongs to, so this is a pruned or corrupt database rather
+			// than a block that is wrong.
+			return nil, nil, fmt.Errorf("%w: pruned ancestor %d (%v) has no stored body",
+				ErrLocalInsertCondition, numbers[i], hashes[i])
+		}
 		blocks = append(blocks, block)
 		memory += block.Size()
 
