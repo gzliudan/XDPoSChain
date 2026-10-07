@@ -178,6 +178,7 @@ type blockInject struct {
 type parkedBlock struct {
 	block    *types.Block
 	deadline time.Time
+	claimed  bool // the scan has collected the entry and is creating its signature
 }
 
 // BlockFetcher is responsible for accumulating block announcements from various peers
@@ -838,19 +839,48 @@ func (f *BlockFetcher) insert(peer string, block *types.Block) {
 			// engine itself. Only nodes with a signing hook (XDPoS) park;
 			// without one there is nothing to wait for.
 			f.parkForSignature(block)
-			if isM2 {
-				blockBroadcastOutTimer.UpdateSince(block.ReceivedAt)
-				go f.broadcastBlock(block, true)
-			} else {
-				blockAnnounceOutTimer.UpdateSince(block.ReceivedAt)
-				go f.broadcastBlock(block, false)
-			}
+			f.relayBlock(block, isM2)
 			return
 		}
+		// Being in the chain is not enough for the signature, which spends a
+		// transaction: the block must also be canonical and still fresh. A
+		// stored side entry, or one this node declined to adopt, passes the
+		// existence gate but is not worth signing right now. This gate covers
+		// the signature only and must not return: the consensus handling below
+		// keeps the existence gate alone, and procFutureBlocks remains the
+		// owner of the vote.
 		if f.signHook != nil {
-			if err := f.signHook(block); err != nil {
-				log.Error("Can't sign the imported block", "err", err)
-				return
+			switch f.signatureVerdictOf(block) {
+			case signNow:
+				// The parked set can already own this signature: the block was
+				// refused earlier and a scan has claimed it, or it still waits
+				// there and is claimed here. Signing on both paths would spend a
+				// second transaction on the same block.
+				if !f.claimParkedSignature(block.Hash()) {
+					log.Debug("Imported block's signature is being created from the parked set", "peer", peer, "number", block.Number(), "hash", hash)
+				} else if err := f.signBlock(block); err != nil {
+					return
+				}
+			case signNotCanonical:
+				blockParkedRefusedMeter.Mark(1)
+				log.Debug("Imported block is not canonical, parking the signature", "peer", peer, "number", block.Number(), "hash", hash)
+				// The block is stored, so the parked set can revive the
+				// signature if a later reorg adopts this branch; failing that
+				// the uncle-distance and deadline bounds drop it. Voting is
+				// not deferred: handleProposedBlock below still runs now.
+				// Parking a refused block costs a parked-slot (capped by
+				// maxParkedSignatures, drained by the deadline), so a master
+				// equivocating at a height can fill the set, but the slots
+				// clear within parkedImportTimeout.
+				f.parkForSignature(block)
+			case signBelowUncleDist:
+				blockParkedStaleMeter.Mark(1)
+				log.Debug("Imported block fell below the uncle distance, not signing", "peer", peer, "number", block.Number(), "hash", hash)
+				// Parking would hold a slot only until the next scan drops the
+				// entry on the same bound, and the head moves further away from
+				// the block rather than closer, so the signature is given up
+				// here: the stale path of the scan is the one that evicts an
+				// entry, and this block never needs one.
 			}
 		}
 		err = f.handleProposedBlock(block.Header())
@@ -859,19 +889,37 @@ func (f *BlockFetcher) insert(peer string, block *types.Block) {
 			return
 		}
 		// If import succeeded, broadcast the block
-		if isM2 {
-			blockBroadcastOutTimer.UpdateSince(block.ReceivedAt)
-			go f.broadcastBlock(block, true)
-		} else {
-			blockAnnounceOutTimer.UpdateSince(block.ReceivedAt)
-			go f.broadcastBlock(block, false)
-		}
+		f.relayBlock(block, isM2)
 	}()
 }
 
-// parkForSignature records a block whose delivery reported success without
-// importing it, so its signature can be created once another importer stores
-// it. The first park starts waitParkedSignatures; it stops when the set drains.
+// relayBlock re-propagates an imported block to the peers: M2 blocks go out as
+// broadcasts, the rest as announcements.
+func (f *BlockFetcher) relayBlock(block *types.Block, isM2 bool) {
+	if isM2 {
+		blockBroadcastOutTimer.UpdateSince(block.ReceivedAt)
+		go f.broadcastBlock(block, true)
+	} else {
+		blockAnnounceOutTimer.UpdateSince(block.ReceivedAt)
+		go f.broadcastBlock(block, false)
+	}
+}
+
+// signBlock runs the signing hook for a block, logging a failure.
+func (f *BlockFetcher) signBlock(block *types.Block) error {
+	if err := f.signHook(block); err != nil {
+		log.Error("Can't sign the imported block", "err", err)
+		return err
+	}
+	return nil
+}
+
+// parkForSignature records a block whose signature cannot be created yet, so
+// it can be created once the block becomes signable. Two callers feed the set:
+// a delivery that reported success without importing the block (another
+// importer stores it later), and a stored block refused for not being
+// canonical (a later reorg can adopt its branch). The first park starts
+// waitParkedSignatures; it stops when the set drains.
 // The wait is bounded by parkedImportTimeout and the number of parked blocks by
 // maxParkedSignatures. During snap sync the inserter discards propagated blocks
 // outright, so nothing can arrive to sign and the block is not parked at all.
@@ -944,7 +992,7 @@ func (f *BlockFetcher) waitParkedSignatures() {
 	}
 }
 
-// scanParkedSignatures signs the parked blocks another importer has stored and
+// scanParkedSignatures signs the parked blocks that have become signable and
 // drops the rest once one of the two bounds is hit: the block has fallen below
 // the uncle distance, or its deadline has passed. A parked block has exactly
 // four exits: acted on and removed, stale, deadline, or cap reached. Being
@@ -954,8 +1002,12 @@ func (f *BlockFetcher) waitParkedSignatures() {
 // and a reorg landing between the scan and the signature must not lose it for
 // good either. Signing happens outside the lock so a slow signature cannot
 // stall the scan.
+// A parked block is signed by exactly one caller: the scan claims an entry
+// before it signs it, and the delivery path claims it before signing a
+// re-delivered block, so the two paths cannot spend a second transaction on
+// the same block.
 func (f *BlockFetcher) scanParkedSignatures() {
-	var ready []parkedBlock
+	var ready []*types.Block
 
 	// The chain reads below (getBlock, and canSign's canonicalHash and
 	// chainHeight) run under parkedMu on purpose. Beneath the lock are
@@ -971,9 +1023,14 @@ func (f *BlockFetcher) scanParkedSignatures() {
 	// scan exists to prevent. Signing still happens outside the lock, below.
 	f.parkedMu.Lock()
 	for hash, parked := range f.parked {
+		// A previous pass has claimed the entry and is about to create its
+		// signature; acting on it here would create a second transaction.
+		if parked.claimed {
+			continue
+		}
 		if block := f.getBlock(hash); block != nil && f.canSign(block) {
-			ready = append(ready, parkedBlock{block: block, deadline: parked.deadline})
-			delete(f.parked, hash)
+			parked.claimed = true
+			ready = append(ready, block)
 			continue
 		}
 		if parked.block.NumberU64()+maxUncleDist < f.chainHeight() {
@@ -983,52 +1040,82 @@ func (f *BlockFetcher) scanParkedSignatures() {
 			continue
 		}
 		if time.Now().After(parked.deadline) {
-			log.Warn("Block was not imported in time, dropping its signature", "number", parked.block.Number(), "hash", hash)
+			blockParkedDeadlineMeter.Mark(1)
+			if f.getBlock(hash) != nil {
+				log.Debug("Parked block was stored but never became signable, dropping its signature", "number", parked.block.Number(), "hash", hash)
+			} else {
+				log.Warn("Block was not imported in time, dropping its signature", "number", parked.block.Number(), "hash", hash)
+			}
 			delete(f.parked, hash)
 		}
 	}
 	f.parkedMu.Unlock()
 
-	for _, p := range ready {
-		block := p.block
+	for _, block := range ready {
 		// A reorg can land between the scan and this call, so re-check before
 		// signing: a block the chain has moved past must not be signed. A
-		// failed re-check is not an exit - the block goes back with its
-		// original deadline and is evicted only by the stale or deadline
-		// bound, so a branch that is re-adopted later still gets its
-		// signature.
+		// failed re-check is not an exit - the entry never left the set, it
+		// only loses its claim and is evicted by the stale or deadline bound,
+		// so a branch that is re-adopted later still gets its signature.
 		if !f.canSign(block) {
-			log.Debug("Parked block is no longer signable, putting it back", "number", block.Number(), "hash", block.Hash())
-			f.putBackParked(block, p.deadline)
+			log.Debug("Parked block is no longer signable, releasing it", "number", block.Number(), "hash", block.Hash())
+			f.resolveParked(block.Hash(), false)
 			continue
 		}
-		if err := f.signHook(block); err != nil {
-			log.Error("Can't sign the imported block", "err", err)
-		}
+		// A signing failure is logged by signBlock; the scan continues with
+		// the rest of the set.
+		f.signBlock(block)
+		f.resolveParked(block.Hash(), true)
 	}
 }
 
-// putBackParked returns a block collected by scanParkedSignatures to the parked
-// set with its original deadline, so a re-check failure between the scan and
-// the signature is not an exit: the block is evicted only by the stale or
-// deadline bound, and a branch that is re-adopted later still gets its
-// signature. The block is dropped only if the set filled up while the scan was
-// running (the cap is an exit) or if it was parked again meanwhile.
-func (f *BlockFetcher) putBackParked(block *types.Block, deadline time.Time) {
-	hash := block.Hash()
-
+// resolveParked settles an entry the scan claimed: once the signature was
+// attempted the entry is removed, while a failed re-check only releases the
+// claim, leaving the entry - with its original deadline - to the stale and
+// deadline bounds, so a branch that is re-adopted later still gets its
+// signature.
+func (f *BlockFetcher) resolveParked(hash common.Hash, signed bool) {
 	f.parkedMu.Lock()
 	defer f.parkedMu.Unlock()
-	if _, ok := f.parked[hash]; ok {
+
+	parked, ok := f.parked[hash]
+	if !ok {
 		return
 	}
-	if len(f.parked) >= maxParkedSignatures {
-		blockParkedFullMeter.Mark(1)
-		log.Debug("Too many blocks parked for signing, dropping signature", "number", block.Number(), "hash", hash)
+	if !signed {
+		parked.claimed = false
 		return
 	}
-	f.parked[hash] = &parkedBlock{block: block, deadline: deadline}
+	delete(f.parked, hash)
 }
+
+// claimParkedSignature takes the parked entry for hash, if any, into this
+// caller's hands so the scan cannot sign the same block too. It reports whether
+// the caller may create the signature now: not if the scan has already claimed
+// the entry, because that scan's signature is on its way.
+func (f *BlockFetcher) claimParkedSignature(hash common.Hash) bool {
+	f.parkedMu.Lock()
+	defer f.parkedMu.Unlock()
+
+	parked, ok := f.parked[hash]
+	if !ok {
+		return true
+	}
+	if parked.claimed {
+		return false
+	}
+	delete(f.parked, hash)
+	return true
+}
+
+// signatureVerdict is why a stored block is or is not worth a signature now.
+type signatureVerdict int
+
+const (
+	signNow            signatureVerdict = iota // canonical and still fresh
+	signNotCanonical                           // another chain is canonical at this height
+	signBelowUncleDist                         // too far below the head: only a rewind can change it
+)
 
 // canSign reports whether a block is worth a signature: it must be on the
 // canonical chain and not already too far below the head to matter. A stored
@@ -1036,10 +1123,23 @@ func (f *BlockFetcher) putBackParked(block *types.Block, deadline time.Time) {
 // adopt) fails the first test and is never signed. The canonical-hash source
 // is a constructor argument, so every fetcher has one.
 func (f *BlockFetcher) canSign(block *types.Block) bool {
+	return f.signatureVerdictOf(block) == signNow
+}
+
+// signatureVerdictOf reports whether a stored block is worth a signature now,
+// and if not, why. The two refusals call for different reactions: a block that
+// is not canonical at its height can become canonical through a reorg, while one
+// that fell below the uncle distance only loses further ground. They are counted
+// and logged apart so an operator is not sent looking for a canonicality
+// problem that never happened.
+func (f *BlockFetcher) signatureVerdictOf(block *types.Block) signatureVerdict {
 	if f.canonicalHash(block.NumberU64()) != block.Hash() {
-		return false
+		return signNotCanonical
 	}
-	return block.NumberU64()+maxUncleDist >= f.chainHeight()
+	if block.NumberU64()+maxUncleDist < f.chainHeight() {
+		return signBelowUncleDist
+	}
+	return signNow
 }
 
 // forgetHash removes all traces of a block announcement from the fetcher's
