@@ -835,10 +835,32 @@ func (f *BlockFetcher) insert(peer string, block *types.Block) {
 			}
 			return
 		}
+		// Being in the chain is not enough for the signature, which spends a
+		// transaction: the block must also be canonical and still fresh. A
+		// stored side entry, or one this node declined to adopt, passes the
+		// existence gate but is not worth signing right now. This gate covers
+		// the signature only and must not return: the consensus handling below
+		// keeps the existence gate alone, and procFutureBlocks remains the
+		// owner of the vote.
 		if f.signHook != nil {
-			if err := f.signHook(block); err != nil {
-				log.Error("Can't sign the imported block", "err", err)
-				return
+			signable := f.canSign(block)
+			if signable {
+				if err := f.signHook(block); err != nil {
+					log.Error("Can't sign the imported block", "err", err)
+					return
+				}
+			}
+			if !signable {
+				log.Debug("Imported block is not canonical, parking the signature", "peer", peer, "number", block.Number(), "hash", hash)
+				// The block is stored, so the parked set can revive the
+				// signature if a later reorg adopts this branch; failing that
+				// the uncle-distance and deadline bounds drop it. Voting is
+				// not deferred: handleProposedBlock below still runs now.
+				// Parking a refused block costs a parked-slot (capped by
+				// maxParkedSignatures, drained by the deadline), so a master
+				// equivocating at a height can fill the set, but the slots
+				// clear within parkedImportTimeout.
+				f.parkForSignature(block)
 			}
 		}
 		err = f.handleProposedBlock(block.Header())
@@ -857,9 +879,12 @@ func (f *BlockFetcher) insert(peer string, block *types.Block) {
 	}()
 }
 
-// parkForSignature records a block whose delivery reported success without
-// importing it, so its signature can be created once another importer stores
-// it. The first park starts waitParkedSignatures; it stops when the set drains.
+// parkForSignature records a block whose signature cannot be created yet, so
+// it can be created once the block becomes signable. Two callers feed the set:
+// a delivery that reported success without importing the block (another
+// importer stores it later), and a stored block refused for not being
+// canonical (a later reorg can adopt its branch). The first park starts
+// waitParkedSignatures; it stops when the set drains.
 // The wait is bounded by parkedImportTimeout and the number of parked blocks by
 // maxParkedSignatures. During snap sync the inserter discards propagated blocks
 // outright, so nothing can arrive to sign and the block is not parked at all.
@@ -931,7 +956,7 @@ func (f *BlockFetcher) waitParkedSignatures() {
 	}
 }
 
-// scanParkedSignatures signs the parked blocks another importer has stored and
+// scanParkedSignatures signs the parked blocks that have become signable and
 // drops the rest once one of the two bounds is hit: the block has fallen below
 // the uncle distance, or its deadline has passed. A stored block that is not
 // signable *right now* is not a reason to drop it — the body is written
@@ -965,7 +990,11 @@ func (f *BlockFetcher) scanParkedSignatures() {
 			continue
 		}
 		if time.Now().After(parked.deadline) {
-			log.Warn("Block was not imported in time, dropping its signature", "number", parked.block.Number(), "hash", hash)
+			if f.getBlock(hash) != nil {
+				log.Debug("Parked block was stored but never became signable, dropping its signature", "number", parked.block.Number(), "hash", hash)
+			} else {
+				log.Warn("Block was not imported in time, dropping its signature", "number", parked.block.Number(), "hash", hash)
+			}
 			delete(f.parked, hash)
 		}
 	}

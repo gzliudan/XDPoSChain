@@ -1287,6 +1287,53 @@ func TestParkedSignatureTimeoutDropsBlock(t *testing.T) {
 	}
 }
 
+// TestParkedSignatureTimeoutDropsStoredButNeverSignable verifies the deadline
+// arm of the parked-signature scan for a block that was stored but never
+// became signable: it is dropped without a signature, silently at Debug level
+// rather than with the "not imported in time" warning that is reserved for
+// blocks no importer ever wrote.
+func TestParkedSignatureTimeoutDropsStoredButNeverSignable(t *testing.T) {
+	block := types.NewBlockWithHeader(&types.Header{
+		ParentHash: genesis.Hash(),
+		Number:     common.Big1,
+		Difficulty: common.Big1,
+		GasLimit:   params.GenesisGasLimit,
+		Extra:      []byte{0x03},
+	}).WithBody(types.Body{})
+
+	tester := newTester()
+	defer tester.fetcher.Stop()
+	tester.fetcher.parkedTimeout = 200 * time.Millisecond
+
+	// Store the block as a side entry: readable by hash, never canonical.
+	tester.lock.Lock()
+	tester.blocks[block.Hash()] = block
+	tester.lock.Unlock()
+
+	signed := make(chan *types.Block, 1)
+	tester.fetcher.signHook = func(block *types.Block) error {
+		signed <- block
+		return nil
+	}
+	tester.fetcher.parkForSignature(block)
+	if n := parkedCount(tester.fetcher); n != 1 {
+		t.Fatalf("parked count = %d, want 1 for the stored-but-not-canonical block", n)
+	}
+	deadline := time.After(3 * time.Second)
+	for parkedCount(tester.fetcher) != 0 {
+		select {
+		case <-deadline:
+			t.Fatalf("parked block was never dropped after its timeout")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	select {
+	case b := <-signed:
+		t.Fatalf("sign hook ran for a stored-but-never-signable block: %v", b.Hash())
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
 // TestParkedSignatureDroppedWhenStale verifies that a parked block whose height
 // the chain has already moved past is dropped without a signature.
 func TestParkedSignatureDroppedWhenStale(t *testing.T) {
@@ -1449,5 +1496,88 @@ func TestParkedSignatureLimit(t *testing.T) {
 	}
 	if n := parkedCount(tester.fetcher); n != maxParkedSignatures {
 		t.Fatalf("parked count = %d, want %d", n, maxParkedSignatures)
+	}
+}
+
+// TestImportedNonCanonicalBlockIsNotSigned verifies that a stored block that is
+// not on the canonical chain is not signed at delivery time: the existence gate
+// sees it, but the signature is a spending transaction and must not go to a
+// side entry. The refused signature is parked instead, so a later reorg that
+// adopts the block's branch revives it. The consensus handler keeps the
+// existence gate only.
+func TestImportedNonCanonicalBlockIsNotSigned(t *testing.T) {
+	block := types.NewBlockWithHeader(&types.Header{
+		ParentHash: genesis.Hash(),
+		Number:     common.Big1,
+		Difficulty: common.Big1,
+		GasLimit:   params.GenesisGasLimit,
+		Extra:      []byte{0x02},
+	}).WithBody(types.Body{})
+
+	tester := newTester()
+	defer tester.fetcher.Stop()
+
+	// The import stores the block as a side entry: readable by hash, but not
+	// on the tester's canonical chain.
+	tester.fetcher.insertBlock = func(b *types.Block) error {
+		tester.lock.Lock()
+		tester.blocks[b.Hash()] = b
+		tester.lock.Unlock()
+		return nil
+	}
+	signed := make(chan *types.Block, 1)
+	tester.fetcher.signHook = func(b *types.Block) error {
+		signed <- b
+		return nil
+	}
+	proposed := make(chan *types.Header, 1)
+	tester.fetcher.handleProposedBlock = func(h *types.Header) error {
+		proposed <- h
+		return nil
+	}
+	tester.fetcher.Enqueue("test", block)
+
+	// The consensus handler still runs for the stored block (existence gate).
+	select {
+	case h := <-proposed:
+		if h.Hash() != block.Hash() {
+			t.Fatalf("consensus handler ran for %v, want %v", h.Hash(), block.Hash())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("consensus handler never ran for the stored side block")
+	}
+	// ...and the stored side entry is not signed, only parked.
+	select {
+	case b := <-signed:
+		t.Fatalf("sign hook ran for a non-canonical block: %v", b.Hash())
+	case <-time.After(200 * time.Millisecond):
+	}
+	if n := parkedCount(tester.fetcher); n != 1 {
+		t.Fatalf("parked count = %d, want 1 for the refused side block", n)
+	}
+
+	// A reorg adopting the side entry's branch makes the block canonical: the
+	// next scan revives the parked signature, exactly once.
+	tester.lock.Lock()
+	tester.hashes = append(tester.hashes, block.Hash())
+	tester.lock.Unlock()
+
+	tester.fetcher.scanParkedSignatures()
+	select {
+	case b := <-signed:
+		if b.Hash() != block.Hash() {
+			t.Fatalf("sign hook ran for block %v, want %v", b.Hash(), block.Hash())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("parked signature was never revived after the block turned canonical")
+	}
+	if n := parkedCount(tester.fetcher); n != 0 {
+		t.Fatalf("parked count = %d, want 0 after the signature was created", n)
+	}
+	tester.fetcher.scanParkedSignatures()
+	select {
+	case b := <-signed:
+		t.Fatalf("sign hook ran twice for block %v", b.Hash())
+	case <-time.After(100 * time.Millisecond):
 	}
 }
