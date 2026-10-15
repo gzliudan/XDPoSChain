@@ -115,11 +115,6 @@ type TxMatchBatch struct {
 	TxHash    common.Hash
 }
 
-type MatchingResult struct {
-	Trades  []map[string]string
-	Rejects []*OrderItem
-}
-
 func EncodeTxMatchesBatch(txMatchBatch TxMatchBatch) ([]byte, error) {
 	data, err := json.Marshal(txMatchBatch)
 	if err != nil || data == nil {
@@ -188,12 +183,6 @@ func Neg(x *big.Int) *big.Int {
 	return big.NewInt(0).Neg(x)
 }
 
-func ToBigInt(s string) *big.Int {
-	res := big.NewInt(0)
-	res.SetString(s, 10)
-	return res
-}
-
 func CloneBigInt(bigInt *big.Int) *big.Int {
 	return common.CloneBigInt(bigInt)
 }
@@ -212,8 +201,4 @@ func Max(a, b *big.Int) *big.Int {
 
 func GetTradingOrderBookHash(baseToken common.Address, quoteToken common.Address) common.Hash {
 	return common.BytesToHash(append(baseToken[:16], quoteToken[4:]...))
-}
-
-func GetMatchingResultCacheKey(order *OrderItem) common.Hash {
-	return crypto.Keccak256Hash(order.UserAddress.Bytes(), order.Nonce.Bytes())
 }

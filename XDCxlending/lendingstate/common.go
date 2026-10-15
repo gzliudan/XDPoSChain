@@ -83,11 +83,6 @@ type TxLendingBatch struct {
 	TxHash    common.Hash
 }
 
-type MatchingResult struct {
-	Trades  []*LendingTrade
-	Rejects []*LendingItem
-}
-
 type FinalizedResult struct {
 	Liquidated []common.Hash
 	AutoRepay  []common.Hash
@@ -152,12 +147,6 @@ func Sub(x, y *big.Int) *big.Int {
 
 func Neg(x *big.Int) *big.Int {
 	return big.NewInt(0).Neg(x)
-}
-
-func ToBigInt(s string) *big.Int {
-	res := big.NewInt(0)
-	res.SetString(s, 10)
-	return res
 }
 
 func CloneBigInt(bigInt *big.Int) *big.Int {
@@ -242,8 +231,4 @@ func DecodeFinalizedResult(data []byte) (result FinalizedResult, err error) {
 		return FinalizedResult{}, err
 	}
 	return result, nil
-}
-
-func GetLendingCacheKey(item *LendingItem) common.Hash {
-	return crypto.Keccak256Hash(item.UserAddress.Bytes(), item.Nonce.Bytes())
 }
