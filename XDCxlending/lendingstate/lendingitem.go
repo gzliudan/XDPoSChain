@@ -4,13 +4,11 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
-	"strconv"
 	"time"
 
 	"github.com/XinFinOrg/XDPoSChain/common"
 	"github.com/XinFinOrg/XDPoSChain/core/state"
 	"github.com/XinFinOrg/XDPoSChain/core/types"
-	"github.com/XinFinOrg/XDPoSChain/crypto/keccak"
 )
 
 const (
@@ -182,40 +180,6 @@ func (l *LendingItem) VerifyLendingStatus() error {
 		return fmt.Errorf("VerifyLendingStatus: invalid lending status. Status: %s", l.Status)
 	}
 	return nil
-}
-
-func (l *LendingItem) ComputeHash() common.Hash {
-	sha := keccak.NewLegacyKeccak256()
-	if l.Status == LendingStatusNew {
-		sha.Write(l.Relayer.Bytes())
-		sha.Write(l.UserAddress.Bytes())
-		sha.Write(l.LendingToken.Bytes())
-		sha.Write(l.CollateralToken.Bytes())
-		sha.Write([]byte(strconv.FormatInt(int64(l.Term), 10)))
-		sha.Write(common.BigToHash(l.Quantity).Bytes())
-		if l.Type == Limit {
-			if l.Interest != nil {
-				sha.Write(common.BigToHash(l.Interest).Bytes())
-			}
-		}
-		sha.Write(common.BigToHash(l.EncodedSide()).Bytes())
-		sha.Write([]byte(l.Status))
-		sha.Write([]byte(l.Type))
-		sha.Write(common.BigToHash(l.Nonce).Bytes())
-	} else if l.Status == LendingStatusCancelled {
-		sha.Write(l.Hash.Bytes())
-		sha.Write(common.BigToHash(l.Nonce).Bytes())
-		sha.Write(l.UserAddress.Bytes())
-		sha.Write(common.BigToHash(big.NewInt(int64(l.LendingId))).Bytes())
-		sha.Write([]byte(l.Status))
-		sha.Write(l.Relayer.Bytes())
-		sha.Write(l.LendingToken.Bytes())
-		sha.Write(l.CollateralToken.Bytes())
-	} else {
-		return common.Hash{}
-	}
-
-	return common.BytesToHash(sha.Sum(nil))
 }
 
 func (l *LendingItem) EncodedSide() *big.Int {

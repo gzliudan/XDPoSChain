@@ -15,6 +15,22 @@ const (
 	OrderCacheLimit = 10000
 )
 
+// Trade record field names, used as keys when building trade records.
+const (
+	TradeTakerOrderHash = "takerOrderHash"
+	TradeMakerOrderHash = "makerOrderHash"
+	TradeTimestamp      = "timestamp"
+	TradeQuantity       = "quantity"
+	TradeMakerExchange  = "makerExAddr"
+	TradeMaker          = "uAddr"
+	TradeBaseToken      = "bToken"
+	TradeQuoteToken     = "qToken"
+	TradePrice          = "tradedPrice"
+	MakerOrderType      = "makerOrderType"
+	MakerFee            = "makerFee"
+	TakerFee            = "takerFee"
+)
+
 var (
 	EmptyRoot = common.HexToHash("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421")
 	Ask       = "SELL"
