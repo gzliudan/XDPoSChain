@@ -259,9 +259,14 @@ func (a Address) Hash() Hash { return BytesToHash(a[:]) }
 func (a Address) Big() *big.Int { return new(big.Int).SetBytes(a[:]) }
 
 // Hex returns an EIP55-compliant hex string representation of the address.
+// The prefix follows the node configuration: "0x" by default, "xdc" when the
+// node is started with --enable-xdc-prefix. Use String0x or StringXdc to pin a
+// prefix regardless of the flag.
 func (a Address) Hex() string {
-	checksumed := a.checksumHex()
-	return "xdc" + string(checksumed[2:])
+	if Enable0xPrefix {
+		return a.String0x()
+	}
+	return a.StringXdc()
 }
 
 // String implements fmt.Stringer.
