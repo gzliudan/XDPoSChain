@@ -131,7 +131,8 @@ func New(stack *node.Node, config *ethconfig.Config, XDCXServ *XDCx.XDCX, lendin
 		return nil, err
 	}
 	// Resolve the effective chain config before constructing the consensus engine.
-	// NewBlockChainResolved reruns SetupGenesisBlock and applies any required rewind.
+	// NewBlockChainResolved reuses the chain config resolved above and applies any
+	// required rewind while opening the chain.
 	chainConfig, genesisHash, compatErr, err := core.SetupGenesisBlockWithOverride(chainDb, config.Genesis, config.AllowBuiltInCustomRecovery)
 	if err != nil {
 		return nil, err
