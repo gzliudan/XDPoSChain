@@ -266,11 +266,16 @@ func (a Address) Hex() string {
 
 // String implements fmt.Stringer.
 func (a Address) String() string {
-	return a.Hex()
+	return a.StringXdc()
 }
 
 func (a Address) String0x() string {
 	return string(a.checksumHex())
+}
+
+func (a Address) StringXdc() string {
+	checksumed := a.checksumHex()
+	return "xdc" + string(checksumed[2:])
 }
 
 func (a *Address) checksumHex() []byte {
