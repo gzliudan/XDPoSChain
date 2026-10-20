@@ -129,40 +129,12 @@ func ToJSON(object interface{}, args ...string) string {
 	return string(str)
 }
 
-func Mul(x, y *big.Int) *big.Int {
-	return big.NewInt(0).Mul(x, y)
-}
-
-func Div(x, y *big.Int) *big.Int {
-	return big.NewInt(0).Div(x, y)
-}
-
-func Add(x, y *big.Int) *big.Int {
-	return big.NewInt(0).Add(x, y)
-}
-
 func Sub(x, y *big.Int) *big.Int {
 	return big.NewInt(0).Sub(x, y)
 }
 
-func Neg(x *big.Int) *big.Int {
-	return big.NewInt(0).Neg(x)
-}
-
 func CloneBigInt(bigInt *big.Int) *big.Int {
 	return common.CloneBigInt(bigInt)
-}
-
-func Exp(x, y *big.Int) *big.Int {
-	return big.NewInt(0).Exp(x, y, nil)
-}
-
-func Max(a, b *big.Int) *big.Int {
-	if a.Cmp(b) == 1 {
-		return a
-	} else {
-		return b
-	}
 }
 
 func GetLendingOrderBookHash(lendingToken common.Address, term uint64) common.Hash {
@@ -187,10 +159,6 @@ func DecodeTxLendingBatch(data []byte) (TxLendingBatch, error) {
 
 func EtherToWei(amount *big.Int) *big.Int {
 	return new(big.Int).Mul(amount, new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil))
-}
-
-func WeiToEther(amount *big.Int) *big.Int {
-	return new(big.Int).Div(amount, new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil))
 }
 
 func EncodeFinalizedResult(liquidatedTrades, autoRepayTrades, autoTopUpTrades, autoRecallTrades []*LendingTrade) ([]byte, error) {
