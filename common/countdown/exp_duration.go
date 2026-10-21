@@ -56,7 +56,8 @@ func (d *ExpTimeoutDuration) GetTimeoutDuration(currentRound, highestRound types
 	// to exceed MaxInt64, i.e. a configuration whose own maximum timeout is
 	// already out of range. Every network configured in this repository uses
 	// base=1 and maxExponent=0, which never saturates; only a chain that
-	// overrides the timeout config through genesis can reach this branch.
+	// overrides the timeout config through genesis can reach this branch, and
+	// the chain config validation rejects such an override at startup.
 	multiplier := int64(power)
 	if multiplier > 0 && int64(d.duration) > math.MaxInt64/multiplier {
 		return time.Duration(math.MaxInt64)
