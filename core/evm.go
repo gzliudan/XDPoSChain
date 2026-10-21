@@ -25,6 +25,7 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/core/types"
 	"github.com/XinFinOrg/XDPoSChain/core/vm"
 	"github.com/XinFinOrg/XDPoSChain/crypto"
+	"github.com/XinFinOrg/XDPoSChain/params"
 	"github.com/holiman/uint256"
 )
 
@@ -125,8 +126,11 @@ func CanTransfer(db vm.StateDB, addr common.Address, amount *uint256.Int) bool {
 }
 
 // Transfer subtracts amount from sender and adds amount to recipient using the given Db
-func Transfer(db vm.StateDB, sender, recipient common.Address, amount *uint256.Int) {
+func Transfer(db vm.StateDB, sender, recipient common.Address, amount *uint256.Int, rules *params.Rules) {
 	amtBig := amount.ToBig()
 	db.SubBalance(sender, amtBig, tracing.BalanceChangeTransfer)
 	db.AddBalance(recipient, amtBig, tracing.BalanceChangeTransfer)
+	if rules.IsAmsterdam && !amount.IsZero() && sender != recipient {
+		db.AddLog(types.EthTransferLog(sender, recipient, amtBig))
+	}
 }
