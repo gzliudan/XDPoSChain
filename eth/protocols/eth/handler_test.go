@@ -106,7 +106,7 @@ func testGetBlockHeaders(t *testing.T, protocol uint) {
 		// Ensure protocol limits are honored
 		{
 			&GetBlockHeadersPacket{Origin: HashOrNumber{Number: chain.CurrentBlock().Number.Uint64() - 1}, Amount: limit + 10, Reverse: true},
-			chain.GetBlockHashesFromHash(chain.CurrentBlock().Hash(), limit),
+			headerHashRange(chain, chain.CurrentBlock().Number.Uint64()-1, limit),
 		},
 		// Check that requesting more than available is handled gracefully
 		{
@@ -192,6 +192,18 @@ func testGetBlockHeaders(t *testing.T, protocol uint) {
 			}
 		}
 	}
+}
+
+// headerHashRange returns the hashes of the canonical headers at top, top-1, ...,
+// down towards genesis, at most count of them. Tests state the expected reply of
+// a descending query with it instead of asking the chain for the same slice the
+// serving code builds.
+func headerHashRange(chain *core.BlockChain, top, count uint64) []common.Hash {
+	hashes := make([]common.Hash, 0, count)
+	for i := uint64(0); i < count && i <= top; i++ {
+		hashes = append(hashes, chain.GetHeaderByNumber(top-i).Hash())
+	}
+	return hashes
 }
 
 // Tests that block contents can be retrieved from a remote chain based on their hashes.

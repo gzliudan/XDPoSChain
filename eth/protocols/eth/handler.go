@@ -157,6 +157,7 @@ func handleMessage(backend Backend, peer *Peer) error {
 			return errResp(ErrDecode, "%v: %v", msg, err)
 		}
 		hashMode := query.Origin.Hash != (common.Hash{})
+		maxNonCanonical := uint64(100)
 
 		// Gather headers until the fetch or network limits is reached
 		var (
@@ -204,8 +205,9 @@ func handleMessage(backend Backend, peer *Peer) error {
 					unknown = true
 				} else {
 					if header := backend.Chain().GetHeaderByNumber(next); header != nil {
-						if backend.Chain().GetBlockHashesFromHash(header.Hash(), query.Skip+1)[query.Skip] == query.Origin.Hash {
-							query.Origin.Hash = header.Hash()
+						nextHash := header.Hash()
+						if expOldHash, _ := backend.Chain().GetAncestor(nextHash, next, query.Skip+1, &maxNonCanonical); expOldHash == query.Origin.Hash {
+							query.Origin.Hash = nextHash
 						} else {
 							unknown = true
 						}
