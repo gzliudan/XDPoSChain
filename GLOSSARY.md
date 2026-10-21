@@ -4,6 +4,33 @@ Vocabulary for the XDPoS chain: the block schedule its validators run to, the bl
 
 ## Language
 
+### Block schedule
+
+**epoch**:
+The unit the validator schedule runs on, `Epoch` in the chain config (900 on mainnet), counted in blocks under the v1 engine and in rounds under the v2 engine; at each epoch switch block the masternode set is re-taken.
+_Avoid_: cycle, term
+_See_: [params/config_xdpos.go:46](params/config_xdpos.go), [consensus/XDPoS/engines/engine_v2/epochSwitch.go:162](consensus/XDPoS/engines/engine_v2/epochSwitch.go)
+
+**epoch switch block**:
+The block that opens a new epoch — under v1 the block whose number is a multiple of `Epoch`, under v2 the first block whose round falls in a new epoch of rounds.
+_Avoid_: epoch boundary, checkpoint block
+_See_: [consensus/XDPoS/engines/engine_v1/engine.go:1084](consensus/XDPoS/engines/engine_v1/engine.go), [consensus/XDPoS/engines/engine_v2/epochSwitch.go:162](consensus/XDPoS/engines/engine_v2/epochSwitch.go)
+
+**gap block**:
+The one block per epoch sitting `Gap` blocks before the epoch switch block (`number % Epoch == Epoch - Gap`, 450 on mainnet); the next epoch's masternode set is snapshotted from it.
+_Avoid_: empty block, filler block
+_See_: [consensus/XDPoS/engines/engine_v2/engine.go:615](consensus/XDPoS/engines/engine_v2/engine.go), [consensus/errors.go:35](consensus/errors.go)
+
+**round**:
+The attempt counter inside an epoch, `types.Round`; a validator's turn is decided per round, and a timeout moves the chain to the next one and resets the timeout pools.
+_Avoid_: step, attempt
+_See_: [core/types/consensus_v2.go:12](core/types/consensus_v2.go), [consensus/XDPoS/engines/engine_v2/engine.go:1061](consensus/XDPoS/engines/engine_v2/engine.go)
+
+**masternode**:
+A node in the validator set that signs blocks and votes, capped by `MaxMasternodes`; the set is snapshotted at each epoch's gap block.
+_Avoid_: master node, witness
+_See_: [consensus/XDPoS/utils/types.go:17](consensus/XDPoS/utils/types.go), [params/config_xdpos.go:128](params/config_xdpos.go)
+
 ### Chain data
 
 **executed marker**:
