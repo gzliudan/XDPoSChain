@@ -392,8 +392,17 @@ func (hc *HeaderChain) GetAncestor(hash common.Hash, number, ancestor uint64, ma
 	}
 	for ancestor != 0 {
 		if hc.GetCanonicalHash(number) == hash {
-			number -= ancestor
-			return hc.GetCanonicalHash(number), number
+			// Read the ancestor before re-checking the origin: if the canonical
+			// chain is reorganised between the two reads, the origin is no
+			// longer canonical and the walk below takes over instead of
+			// returning a hash that is not an ancestor of it. The window is
+			// concurrent by nature and no test can pin it, so the two reads
+			// have to stay two.
+			ancestorHash := hc.GetCanonicalHash(number - ancestor)
+			if hc.GetCanonicalHash(number) == hash {
+				number -= ancestor
+				return ancestorHash, number
+			}
 		}
 		if *maxNonCanonical == 0 {
 			return common.Hash{}, 0
