@@ -15,8 +15,6 @@ import (
 )
 
 func TestProcessQcShallSetForensicsCommittedQc(t *testing.T) {
-	t.Skip("Skipping this test for now as we disable forensics")
-
 	blockchain, _, currentBlock, signer, signFn, _ := PrepareXDCTestBlockChainForV2Engine(t, 905, params.TestXDPoSMockChainConfig, nil)
 	engineV2 := blockchain.Engine().(*XDPoS.XDPoS).EngineV2
 
@@ -92,8 +90,6 @@ func TestProcessQcShallSetForensicsCommittedQc(t *testing.T) {
 }
 
 func TestSetCommittedQCsInOrder(t *testing.T) {
-	t.Skip("Skipping this test for now as we disable forensics")
-
 	blockchain, _, currentBlock, _, _, _ := PrepareXDCTestBlockChainForV2Engine(t, 905, params.TestXDPoSMockChainConfig, nil)
 	forensics := blockchain.Engine().(*XDPoS.XDPoS).EngineV2.GetForensicsFaker()
 
@@ -120,8 +116,6 @@ func TestSetCommittedQCsInOrder(t *testing.T) {
 
 // Happty path
 func TestForensicsMonitoring(t *testing.T) {
-	t.Skip("Skipping this test for now as we disable forensics")
-
 	blockchain, _, currentBlock, _, _, _ := PrepareXDCTestBlockChainForV2Engine(t, 915, params.TestXDPoSMockChainConfig, nil)
 	forensics := blockchain.Engine().(*XDPoS.XDPoS).EngineV2.GetForensicsFaker()
 	var decodedCurrentblockExtraField types.ExtraFields_v2
