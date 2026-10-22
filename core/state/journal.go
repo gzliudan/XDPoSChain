@@ -166,6 +166,14 @@ func (j *journal) destruct(addr common.Address) {
 	j.append(selfDestructChange{account: addr})
 }
 
+func (j *journal) destructedBalance(addr common.Address, prev *big.Int) {
+	entry := destructedBalanceChange{account: addr}
+	if prev != nil {
+		entry.prev = new(big.Int).Set(prev)
+	}
+	j.append(entry)
+}
+
 func (j *journal) deleteAddress(obj *stateObject) {
 	j.append(newDeleteAddressChange(obj))
 }
@@ -247,6 +255,14 @@ type (
 	}
 	selfDestructChange struct {
 		account common.Address
+	}
+	// destructedBalanceChange restores the balance a self-destruct has cleared
+	// so far when that destruct's contribution is rolled back. Only the first
+	// destruct of a transaction journals the flags (selfDestructChange), so
+	// each destruct journals the value it is about to extend.
+	destructedBalanceChange struct {
+		account common.Address
+		prev    *big.Int
 	}
 
 	// Changes to individual accounts.
@@ -535,6 +551,10 @@ func (ch selfDestructChange) revert(s *StateDB) {
 		// object without needing to journal the preserveBalance bit itself.
 		obj.selfDestructed = false
 		obj.selfDestructedPreserveBalance = false
+		// The burnt balance belongs to the destruction being undone, so it has
+		// to go with the flags: a later destruct in the same transaction starts
+		// from the balance it clears itself.
+		obj.destructedBalance = nil
 	}
 }
 
@@ -546,6 +566,27 @@ func (ch selfDestructChange) copy() journalEntry {
 	return selfDestructChange{
 		account: ch.account,
 	}
+}
+
+func (ch destructedBalanceChange) revert(s *StateDB) {
+	obj := s.getStateObject(ch.account)
+	if obj != nil {
+		obj.destructedBalance = ch.prev
+	}
+}
+
+func (ch destructedBalanceChange) dirtied() *common.Address {
+	return &ch.account
+}
+
+func (ch destructedBalanceChange) copy() journalEntry {
+	clone := destructedBalanceChange{
+		account: ch.account,
+	}
+	if ch.prev != nil {
+		clone.prev = new(big.Int).Set(ch.prev)
+	}
+	return clone
 }
 
 var ripemd = common.HexToAddress("0000000000000000000000000000000000000003")

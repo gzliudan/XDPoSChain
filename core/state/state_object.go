@@ -80,6 +80,12 @@ type stateObject struct {
 	// a balance-only account at transaction finalisation instead of being
 	// deleted.
 	selfDestructedPreserveBalance bool
+
+	// destructedBalance is the balance that selfDestruct cleared from this
+	// object, i.e. the part of its balance that is burnt by the destruction.
+	// It is reported at finalisation, once the destruction is known to survive
+	// the transaction, together with anything paid into the account afterwards.
+	destructedBalance *big.Int
 }
 
 // empty returns whether the account is considered empty.
