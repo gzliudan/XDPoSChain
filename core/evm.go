@@ -125,7 +125,8 @@ func CanTransfer(db vm.StateDB, addr common.Address, amount *uint256.Int) bool {
 	return amount.CmpBig(db.GetBalance(addr)) <= 0
 }
 
-// Transfer subtracts amount from sender and adds amount to recipient using the given Db
+// Transfer subtracts amount from sender and adds amount to recipient using the given Db,
+// emitting an EIP-7708 transfer log for the moved amount from Amsterdam onwards.
 func Transfer(db vm.StateDB, sender, recipient common.Address, amount *uint256.Int, rules *params.Rules) {
 	amtBig := amount.ToBig()
 	db.SubBalance(sender, amtBig, tracing.BalanceChangeTransfer)
