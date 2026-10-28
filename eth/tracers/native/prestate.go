@@ -233,8 +233,10 @@ func (t *prestateTracer) Stop(err error) {
 
 func (t *prestateTracer) processDiffState() {
 	for addr, state := range t.pre {
-		// The deleted account's state is pruned from `post` but kept in `pre`
-		if _, ok := t.deleted[addr]; ok {
+		// The deleted account's state is pruned from `post` but kept in `pre`.
+		// The finalised state decides: EIP-6780 and EIP-8246 both keep a
+		// destructed account alive.
+		if _, ok := t.deleted[addr]; ok && !t.env.StateDB.Exist(addr) {
 			continue
 		}
 		modified := false
