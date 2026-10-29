@@ -296,6 +296,7 @@ func TestUDPv5_pingCall(t *testing.T) {
 // replies are aggregated.
 func TestUDPv5_findnodeCall(t *testing.T) {
 	t.Parallel()
+	testshort.Skip(t)
 	test := newUDPV5Test(t)
 	defer test.close()
 
@@ -345,6 +346,7 @@ func TestUDPv5_findnodeCall(t *testing.T) {
 // This test checks that pending calls are re-sent when a handshake happens.
 func TestUDPv5_callResend(t *testing.T) {
 	t.Parallel()
+	testshort.Skip(t)
 	test := newUDPV5Test(t)
 	defer test.close()
 
@@ -451,6 +453,7 @@ func TestUDPv5_callTimeoutReset(t *testing.T) {
 // This test checks that TALKREQ calls the registered handler function.
 func TestUDPv5_talkHandling(t *testing.T) {
 	t.Parallel()
+	testshort.Skip(t)
 	test := newUDPV5Test(t)
 	defer test.close()
 
