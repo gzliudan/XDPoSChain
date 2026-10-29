@@ -14,7 +14,6 @@ import (
 )
 
 func TestGetMissedRoundsInEpochByBlockNumOnlyForV2Consensus(t *testing.T) {
-	testshort.Skip(t)
 	_, bc, _, _, _ := PrepareXDCTestBlockChainWith128Candidates(t, 1802, params.TestXDPoSMockChainConfig)
 
 	engine := bc.BlockChain().Engine().(*XDPoS.XDPoS)
@@ -27,7 +26,6 @@ func TestGetMissedRoundsInEpochByBlockNumOnlyForV2Consensus(t *testing.T) {
 }
 
 func TestGetMissedRoundsInEpochByBlockNumReturnEmptyForV2(t *testing.T) {
-	testshort.Skip(t)
 	_, bc, cb, _, _ := PrepareXDCTestBlockChainWith128Candidates(t, 1802, params.TestXDPoSMockChainConfig)
 
 	engine := bc.BlockChain().Engine().(*XDPoS.XDPoS)

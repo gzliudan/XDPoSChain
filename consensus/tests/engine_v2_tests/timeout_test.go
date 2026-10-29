@@ -368,7 +368,6 @@ func TestTimeoutPoolKeyGoodHygiene(t *testing.T) {
 }
 
 func TestGetTCEpochInfo(t *testing.T) {
-	testshort.Skip(t)
 	// First epoch, round 1, switch block 901
 	// Second epoch, round 901, block 1800
 	blockchain, _, _, _, _, _ := PrepareXDCTestBlockChainForV2Engine(t, 1805, params.TestXDPoSMockChainConfig, nil)

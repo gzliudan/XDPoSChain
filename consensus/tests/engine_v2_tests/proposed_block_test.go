@@ -241,7 +241,6 @@ func TestShouldNotSetNewRound(t *testing.T) {
 }
 
 func TestShouldNotSendVoteMessageIfAlreadyVoteForThisRound(t *testing.T) {
-	testshort.Skip(t)
 	blockchain, _, currentBlock, _, _, _ := PrepareXDCTestBlockChainForV2Engine(t, 906, params.TestXDPoSMockChainConfig, nil)
 	engineV2 := blockchain.Engine().(*XDPoS.XDPoS).EngineV2
 
@@ -280,7 +279,6 @@ func TestShouldNotSendVoteMessageIfAlreadyVoteForThisRound(t *testing.T) {
 }
 
 func TestShouldNotSendVoteMsgIfBlockInfoRoundNotEqualCurrentRound(t *testing.T) {
-	testshort.Skip(t)
 	blockchain, _, currentBlock, _, _, _ := PrepareXDCTestBlockChainForV2Engine(t, 906, params.TestXDPoSMockChainConfig, nil)
 	engineV2 := blockchain.Engine().(*XDPoS.XDPoS).EngineV2
 
@@ -314,7 +312,6 @@ func TestShouldNotSendVoteMsgIfBlockInfoRoundNotEqualCurrentRound(t *testing.T) 
 	            \ 14'(7)
 */
 func TestShouldNotSendVoteMsgIfBlockNotExtendedFromAncestor(t *testing.T) {
-	testshort.Skip(t)
 	// Block number 905, 906 have forks and forkedBlock is the 906th
 	var numOfForks = new(int)
 	*numOfForks = 3
@@ -460,7 +457,6 @@ func TestShouldSendVoteMsg(t *testing.T) {
 }
 
 func TestProposedBlockMessageHandlerNotGenerateVoteIfSignerNotInMNlist(t *testing.T) {
-	testshort.Skip(t)
 	blockchain, _, currentBlock, _, _, _ := PrepareXDCTestBlockChainForV2Engine(t, 906, params.TestXDPoSMockChainConfig, nil)
 	engineV2 := blockchain.Engine().(*XDPoS.XDPoS).EngineV2
 	differentSigner, differentSignFn, err := backends.SimulateWalletAddressAndSignFn()
