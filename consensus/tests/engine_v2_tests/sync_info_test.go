@@ -9,6 +9,7 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/consensus/XDPoS"
 	"github.com/XinFinOrg/XDPoSChain/consensus/XDPoS/utils"
 	"github.com/XinFinOrg/XDPoSChain/core/types"
+	"github.com/XinFinOrg/XDPoSChain/internal/testshort"
 	"github.com/XinFinOrg/XDPoSChain/params"
 	"github.com/stretchr/testify/assert"
 )
@@ -234,7 +235,7 @@ func TestVerifySyncInfoIfTCRoundIsAtNextEpoch(t *testing.T) {
 }
 
 func TestVerifySyncInfoIfTcUseDifferentEpoch(t *testing.T) {
-	skipLongInShortMode(t)
+	testshort.Skip(t)
 	config := params.TestXDPoSMockChainConfig
 	blockchain, _, currentBlock, signer, signFn, _ := PrepareXDCTestBlockChainForV2Engine(t, 1349, config, nil)
 	adaptor := blockchain.Engine().(*XDPoS.XDPoS)

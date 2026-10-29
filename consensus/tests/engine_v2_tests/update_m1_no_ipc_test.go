@@ -8,6 +8,7 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/consensus/XDPoS"
 	"github.com/XinFinOrg/XDPoSChain/consensus/tests/xdpos_test_utils"
 	"github.com/XinFinOrg/XDPoSChain/core/types"
+	"github.com/XinFinOrg/XDPoSChain/internal/testshort"
 	"github.com/XinFinOrg/XDPoSChain/params"
 	"github.com/stretchr/testify/require"
 )
@@ -33,7 +34,7 @@ import (
 // derivation that still fetched the stakes over IPC would fail there instead of
 // producing the set, and the block would not be imported at all.
 func TestNextEpochSnapshotDoesNotNeedAnIPCEndpoint(t *testing.T) {
-	skipLongInShortMode(t)
+	testshort.Skip(t)
 	config := params.TestXDPoSMockChainConfig
 	blockchain, _, currentBlock, signer, signFn, _ := PrepareXDCTestBlockChainForV2Engine(t, int(config.XDPoS.Epoch+config.XDPoS.Gap)-1, config, nil)
 

@@ -11,12 +11,13 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/consensus/XDPoS"
 	"github.com/XinFinOrg/XDPoSChain/consensus/XDPoS/utils"
 	"github.com/XinFinOrg/XDPoSChain/core/types"
+	"github.com/XinFinOrg/XDPoSChain/internal/testshort"
 	"github.com/XinFinOrg/XDPoSChain/params"
 	"github.com/stretchr/testify/assert"
 )
 
 func TestYourTurnInitialV2(t *testing.T) {
-	skipLongInShortMode(t)
+	testshort.Skip(t)
 	config := params.TestXDPoSMockChainConfig
 	blockchain, _, parentBlock, signer, signFn, _ := PrepareXDCTestBlockChainForV2Engine(t, int(config.XDPoS.Epoch)-1, config, nil)
 	minePeriod := config.XDPoS.V2.CurrentConfig.MinePeriod
@@ -62,7 +63,7 @@ func TestYourTurnInitialV2(t *testing.T) {
 }
 
 func TestShouldMineOncePerRound(t *testing.T) {
-	skipLongInShortMode(t)
+	testshort.Skip(t)
 	config := params.TestXDPoSMockChainConfig
 	blockchain, _, block910, signer, _, _ := PrepareXDCTestBlockChainForV2Engine(t, 910, config, nil)
 	adaptor := blockchain.Engine().(*XDPoS.XDPoS)
@@ -78,7 +79,7 @@ func TestShouldMineOncePerRound(t *testing.T) {
 }
 
 func TestUpdateMasterNodes(t *testing.T) {
-	skipLongInShortMode(t)
+	testshort.Skip(t)
 	config := params.TestXDPoSMockChainConfig
 	blockchain, _, currentBlock, signer, signFn, _ := PrepareXDCTestBlockChainForV2Engine(t, int(config.XDPoS.Epoch+config.XDPoS.Gap)-1, config, nil)
 	adaptor := blockchain.Engine().(*XDPoS.XDPoS)
@@ -224,7 +225,7 @@ func TestPrepareHappyPath(t *testing.T) {
 }
 
 func TestPrepareDifferentMasternode(t *testing.T) {
-	skipLongInShortMode(t)
+	testshort.Skip(t)
 	config := params.TestXDPoSMockChainConfig
 	blockchain, _, currentBlock, _, _, _ := PrepareXDCTestBlockChainForV2Engine(t, 1799, config, nil)
 	adaptor := blockchain.Engine().(*XDPoS.XDPoS)
@@ -237,7 +238,7 @@ func TestPrepareDifferentMasternode(t *testing.T) {
 
 // test if we have 128 candidates, then snapshot will store all of them, and when preparing (and verifying) candidates is truncated to MaxMasternodes
 func TestUpdateMultipleMasterNodes(t *testing.T) {
-	skipLongInShortMode(t)
+	testshort.Skip(t)
 	config := params.TestXDPoSMockChainConfig
 	blockchain, _, currentBlock, signer, signFn := PrepareXDCTestBlockChainWith128Candidates(t, int(config.XDPoS.Epoch+config.XDPoS.Gap)-1, config)
 	adaptor := blockchain.Engine().(*XDPoS.XDPoS)
