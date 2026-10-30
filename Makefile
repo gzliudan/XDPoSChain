@@ -89,9 +89,13 @@ race-test-bulk:
 race-test-rpc:
 	go run build/ci.go test -race -short ./rpc/
 
+# The timeout belongs below the step's watchdog, not above it: ci.go defaults to
+# 45m, which outlives the 12m the lane allows, so a hung test was killed with the
+# runner and left no goroutine dump - the shape of the 12m timeout in #2942.
+# Ten minutes is still several times the slowest lane.
 race-test-full-bulk:
 	set -e; pkgs=$$($(RACE_REST_PKGS) | build/shard.sh $(RACE_SHARD) $(RACE_SHARDS)); \
-	[ -n "$$pkgs" ]; go run build/ci.go test -race -p 4 $$pkgs
+	[ -n "$$pkgs" ]; go run build/ci.go test -race -timeout 10m -p 4 $$pkgs
 
 # The test names of a heavy package are not listed anywhere: a lane asks the
 # package for them, sorts them and takes every GROUP_N-th one, so a test added
@@ -105,7 +109,7 @@ race-test-full-group:
 		| awk -v i=$(GROUP_I) -v n=$(GROUP_N) 'NR % n == i - 1'); \
 	[ -n "$$tests" ]; \
 	pattern=$$(printf '%s\n' "$$tests" | paste -sd '|' -); \
-	go run build/ci.go test -race -run "^($$pattern)$$" $(GROUP_PKG)
+	go run build/ci.go test -race -timeout 10m -run "^($$pattern)$$" $(GROUP_PKG)
 
 # The whole of each heavy package, plus the one the CI lanes skip, for a
 # local full pass.
@@ -113,7 +117,7 @@ race-test-full-groups:
 	set -e; for p in $(RACE_HEAVY) $(RACE_SKIP); do go run build/ci.go test -race -p 4 ./$$p || exit 1; done
 
 race-test-full-rpc:
-	go run build/ci.go test -race ./rpc/
+	go run build/ci.go test -race -timeout 4m ./rpc/
 
 #? check-shards: Verify the detector's shard split covers its package list.
 # The split is derived from the package names, so it cannot drop a package; what

@@ -9,6 +9,14 @@ on:
     tags:
       - "*"
 
+concurrency:
+  # One run per pull request, the newest one. A push that supersedes another
+  # used to leave both running: fifteen jobs each, and the older one only
+  # reported a verdict nobody was waiting for. Pushes to a branch keep their
+  # run - every commit that lands there is meant to be validated.
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   GOPROXY: https://proxy.golang.org,direct
   GO111MODULE: on
@@ -29,6 +37,9 @@ jobs:
       GOPATH: ${{ github.workspace }}
       GOBIN: ${{ github.workspace }}/bin
     runs-on: ubuntu-latest
+    # gofmt, tidy and generate take 84s warm. Without a bound a wedged generator
+    # holds a runner for the default six hours.
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: ${{ env.GOPATH }}/src/XDPoSChain
@@ -186,17 +197,22 @@ jobs:
             ${{ runner.os }}-go-build-race-${{ strategy.job-index }}-${{ hashFiles('**/go.sum') }}-
             ${{ runner.os }}-go-build-race-${{ strategy.job-index }}-
             ${{ runner.os }}-go-build-race-
-      # A warm lane runs two minutes, and one subscription test once ran to
-      # go test's own 45m timeout.
+      # Hang guards, not budgets: a warm lane runs two minutes, and one
+      # subscription test once ran to go test's own 45m timeout. The lanes also
+      # pass -timeout 10m (4m for rpc), below the watchdog, so a hung test
+      # panics with a stack dump instead of being killed silently.
       - name: Run a slice of the tree under the race detector
         if: matrix.kind == 'bulk'
+        timeout-minutes: 12
         run: make race-test-full-bulk RACE_SHARD=${{ matrix.shard }} RACE_SHARDS=${{ env.RACE_SHARDS }}
       - name: Run a slice of a heavy package under the race detector
         if: matrix.kind == 'group'
+        timeout-minutes: 12
         run: make race-test-full-group GROUP_PKG=${{ matrix.pkg }} GROUP_I=${{ matrix.i }} GROUP_N=${{ matrix.n }}
-      # rpc alone, the same guard in miniature.
+      # rpc alone, the same watchdog in miniature.
       - name: Run the rpc package under the race detector
         if: matrix.kind == 'rpc'
+        timeout-minutes: 5
         run: make race-test-full-rpc
 
   # Runs the linters (build/ci.go lint, golangci-lint version pinned in
@@ -208,6 +224,8 @@ jobs:
       GOPATH: ${{ github.workspace }}
       GOBIN: ${{ github.workspace }}/bin
     runs-on: ubuntu-latest
+    # 102s warm; the bound is for a linter that wedges, not for the work.
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: ${{ env.GOPATH }}/src/XDPoSChain
