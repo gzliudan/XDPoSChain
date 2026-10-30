@@ -22,8 +22,6 @@ import (
 	"encoding/json"
 	"math/big"
 	"os"
-	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -73,10 +71,20 @@ func newTestBackend(t *testing.T) (*node.Node, []*types.Block, []common.Hash) {
 	if err != nil {
 		t.Fatalf("can't create new node: %v", err)
 	}
-	xdcxDir := filepath.Join(t.TempDir(), "xdcx")
-	if err := os.MkdirAll(xdcxDir, 0o755); err != nil {
+	// XDCx opens its database and never closes it - XDCX has no lifecycle hook,
+	// so the file stays open for the lifetime of the node - and a directory
+	// t.TempDir owns fails its own cleanup when that happens. Make one here and
+	// remove it best-effort instead: a leftover temp dir is a better trade than
+	// a package that does not run on Windows at all.
+	xdcxDir, err := os.MkdirTemp("", "xdposchain-xdcx-") //nolint:usetesting // t.TempDir cleans up after itself and fails the test when it cannot
+	if err != nil {
 		t.Fatalf("can't create XDCx data dir: %v", err)
 	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(xdcxDir); err != nil {
+			t.Logf("leaving %s behind: %v", xdcxDir, err)
+		}
+	})
 	xdcx := XDCx.New(n, &XDCx.Config{DataDir: xdcxDir})
 	lending := XDCxlending.New(n, xdcx)
 	// Create Ethereum Service
@@ -148,12 +156,6 @@ func generateTestChain(t *testing.T) (*core.Genesis, []*types.Block, []common.Ha
 
 // TestGethClient tests geth client.
 func TestGethClient(t *testing.T) {
-	// The XDCx database holds its log file open for the lifetime of the node,
-	// which keeps t.TempDir's cleanup from removing it on Windows. The test
-	// itself is platform independent, so run it on the other platforms only.
-	if runtime.GOOS == "windows" {
-		t.Skip("the XDCx database keeps its log file open, so TempDir cleanup fails on Windows")
-	}
 	backend, _, txHashes := newTestBackend(t)
 	client := backend.Attach()
 	defer backend.Close()
