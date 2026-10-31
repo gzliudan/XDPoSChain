@@ -137,10 +137,17 @@ func (s *Suite) TestBlockHashAnnounce(t *utesting.T) {
 		t.Fatalf("failed to write to connection: %v", err)
 	}
 	// The node answers the announcement with a single-header query for the
-	// announced hash; assert its shape once it arrives.
-	for {
+	// announced hash; assert its shape once it arrives. The wait is bounded:
+	// read timeouts are retried until the window closes, then the case fails,
+	// so a node that never asks cannot stall the run (upstream #32551).
+	deadline := time.Now().Add(announceTimeout)
+	for time.Now().Before(deadline) {
 		msg, err := sendConn.ReadEth()
 		if err != nil {
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
+				continue
+			}
 			t.Fatalf("failed to read header request: %v", err)
 		}
 		req, ok := msg.(*getBlockHeadersData)
@@ -155,6 +162,7 @@ func (s *Suite) TestBlockHashAnnounce(t *utesting.T) {
 		}
 		return
 	}
+	t.Fatalf("timed out waiting for the header request within %s", announceTimeout)
 }
 
 // TestBlockHashAnnounce_66 runs the block hash announcement case over a
@@ -172,9 +180,15 @@ func (s *Suite) TestBlockHashAnnounce_66(t *utesting.T) {
 	if err := sendConn.Write(ethProto, ethproto.NewBlockHashesMsg, &ethproto.NewBlockHashesPacket{{Hash: hash, Number: number}}); err != nil {
 		t.Fatalf("failed to write to connection: %v", err)
 	}
-	for {
+	// Bounded wait, like the legacy variant above (upstream #32551).
+	deadline := time.Now().Add(announceTimeout)
+	for time.Now().Before(deadline) {
 		_, msg, err := sendConn.ReadEth66()
 		if err != nil {
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
+				continue
+			}
 			t.Fatalf("failed to read header request: %v", err)
 		}
 		req, ok := msg.(*getBlockHeadersData)
@@ -189,6 +203,7 @@ func (s *Suite) TestBlockHashAnnounce_66(t *utesting.T) {
 		}
 		return
 	}
+	t.Fatalf("timed out waiting for the header request within %s", announceTimeout)
 }
 
 // unknownSuccessorHash returns a hash the fixture chain does not carry, one
