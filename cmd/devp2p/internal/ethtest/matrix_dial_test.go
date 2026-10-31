@@ -43,9 +43,14 @@ func TestMatrixPinnedVersionHandshake(t *testing.T) {
 			}
 			defer conn.Close()
 			// Pin: advertise only this version so the negotiation cannot
-			// settle anywhere higher.
+			// settle anywhere higher. The devp2p Hello must go out with the
+			// pinned caps already set — the node picks the shared version
+			// from them.
 			conn.caps = []p2p.Cap{{Name: "eth", Version: version}}
 			conn.ourHighestProtoVersion = version
+			if err := conn.handshake(); err != nil {
+				t.Fatalf("devp2p handshake at pinned xdc/%d failed: %v", version, err)
+			}
 			if err := conn.statusExchange(suite.chain, nil); err != nil {
 				t.Fatalf("status exchange at pinned xdc/%d failed: %v", version, err)
 			}
