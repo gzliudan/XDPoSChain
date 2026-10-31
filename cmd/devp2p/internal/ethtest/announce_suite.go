@@ -177,6 +177,14 @@ func (s *Suite) TestBlockHashAnnounce_66(t *utesting.T) {
 	defer sendConn.Close()
 
 	hash, number := s.unknownSuccessorHash()
+	// Against a live node the height must clear the fetcher's staleness
+	// window: the node reports its total difficulty in status (on this devnet
+	// difficulty is 1 per block, so TD tracks the head height) — announce well
+	// above it. A height from the genesis-only fixture model (1) is stale by
+	// ~1300 blocks and silently ignored.
+	if sendConn.remoteTD != nil {
+		number = sendConn.remoteTD.Uint64() + 64
+	}
 	if err := sendConn.Write(ethProto, ethproto.NewBlockHashesMsg, &ethproto.NewBlockHashesPacket{{Hash: hash, Number: number}}); err != nil {
 		t.Fatalf("failed to write to connection: %v", err)
 	}
