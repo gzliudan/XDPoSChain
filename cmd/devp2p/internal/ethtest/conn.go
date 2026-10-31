@@ -66,6 +66,11 @@ type Conn struct {
 	negotiatedProtoVersion uint
 	ourHighestProtoVersion uint
 	caps                   []p2p.Cap
+	// remoteHead/remoteTD are what the node reported in its status packet;
+	// live-node cases anchor chain-dependent requests on them instead of the
+	// fixture model (the devnet's chain is not the fixture chain).
+	remoteHead common.Hash
+	remoteTD   *big.Int
 }
 
 func (s *Suite) dial() (*Conn, error) {
@@ -248,12 +253,16 @@ forRead:
 					return fmt.Errorf("error decoding status packet: %w", err)
 				}
 				genesisBlock = msg.GenesisBlock
+				c.remoteHead = msg.CurrentBlock
+				c.remoteTD = msg.TD
 			} else {
 				msg := new(statusPacket)
 				if err := rlp.DecodeBytes(data, msg); err != nil {
 					return fmt.Errorf("error decoding status packet: %w", err)
 				}
 				genesisBlock = msg.GenesisBlock
+				c.remoteHead = msg.CurrentBlock
+				c.remoteTD = msg.TD
 			}
 			if genesisBlock != chain.blocks[0].Hash() {
 				return fmt.Errorf("wrong genesis block in status: have %#x want %#x", genesisBlock, chain.blocks[0].Hash())
@@ -376,6 +385,10 @@ func decodeEthPayload(code uint64, data []byte) (interface{}, error) {
 		msg = new(receiptsData)
 	case ethproto.TransactionMsg:
 		msg = new(types.Transactions)
+	case ethproto.NewPooledTransactionHashesMsg:
+		// Announcement broadcasts reach every peer — response waiters must
+		// see them as typed frames they can skip, not hard failures.
+		msg = new(ethproto.NewPooledTransactionHashesPacket)
 	case ethproto.OrderTxMsg:
 		msg = new([]rlp.RawValue)
 	case ethproto.LendingTxMsg:

@@ -22,10 +22,14 @@
 package ethtest
 
 import (
+	"crypto/ecdsa"
 	"errors"
 	"fmt"
+	"github.com/XinFinOrg/XDPoSChain/crypto"
 	"math/big"
 	"net"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/XinFinOrg/XDPoSChain/common"
@@ -76,14 +80,14 @@ func (s *Suite) TestMaliciousTx(t *utesting.T) {
 // announces it back nor tears the receiving connection down over the wait
 // window (upstream #21857).
 func (s *Suite) sendFailingTx(t *utesting.T, tx *types.Transaction) {
-	sendConn, err := s.dialAndPeer(nil)
-	if err != nil {
-		t.Fatalf("peering failed: %v", err)
+	sendConn, ok := s.setupConnection66(t)
+	if !ok {
+		return
 	}
 	defer sendConn.Close()
-	recvConn, err := s.dialAndPeer(nil)
-	if err != nil {
-		t.Fatalf("peering failed: %v", err)
+	recvConn, ok := s.setupConnection66(t)
+	if !ok {
+		return
 	}
 	defer recvConn.Close()
 
@@ -95,8 +99,37 @@ func (s *Suite) sendFailingTx(t *utesting.T, tx *types.Transaction) {
 			t.Fatalf("failed to drain receiver: %v", err)
 		}
 	}
-	if err := sendConn.Write(ethProto, ethproto.TransactionMsg, types.Transactions{tx}); err != nil {
-		t.Fatalf("failed to write TxMsg: %v", err)
+	// From xdc/165 on there is no full-broadcast TxMsg: announce the hash and
+	// serve the body on request. An invalid body must be rejected silently —
+	// no announcement, and the connection stays up.
+	hash := tx.Hash()
+	if err := sendConn.Write(ethProto, ethproto.NewPooledTransactionHashesMsg, ethproto.NewPooledTransactionHashesPacket([]common.Hash{hash})); err != nil {
+		t.Fatalf("failed to write pooled tx announcement: %v", err)
+	}
+	deadline := time.Now().Add(announceTimeout)
+	for time.Now().Before(deadline) {
+		code, data, err := sendConn.Read()
+		if err != nil {
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
+				continue
+			}
+			t.Fatalf("failed to read pooled tx request: %v", err)
+		}
+		if !isEth66MsgCode(code) || code-protoOffset(ethProto) != ethproto.GetPooledTransactionsMsg {
+			continue
+		}
+		var req getPooledTransactionsPacket66
+		if err := rlp.DecodeBytes(data, &req); err != nil {
+			t.Fatalf("failed to decode pooled tx request: %v", err)
+		}
+		if err := sendConn.Write(ethProto, ethproto.PooledTransactionsMsg, &pooledTransactionsPacket66{
+			RequestId: req.RequestId,
+			Txs:       types.Transactions{tx},
+		}); err != nil {
+			t.Fatalf("failed to write pooled tx body: %v", err)
+		}
+		break
 	}
 	if err := expectNoTxAnnouncement(recvConn, announceTimeout); err != nil {
 		t.Fatalf("invalid tx was propagated: %v", err)
@@ -127,11 +160,14 @@ func (s *Suite) invalidNonceTx() (*types.Transaction, bool) {
 	return s.signFixtureTx(from, unsigned)
 }
 
-// hugeAmountTx returns a transaction whose value carries megabytes, far past
-// any balance the fixture sender could back it with.
+// hugeAmountTx returns a transaction whose value exceeds any conceivable
+// balance while staying small on the wire: 2^250 wei is far past the total
+// supply, and a megabyte-scale value field would instead trip the node's
+// message-size cap and drop the connection before validation.
 func (s *Suite) hugeAmountTx() (*types.Transaction, bool) {
 	from, nonce := s.chain.GetSender(0)
-	unsigned := types.NewTransaction(nonce, invalidTxRecipient, largeNumber(2), 21000, big.NewInt(1), nil)
+	value := new(big.Int).Lsh(big.NewInt(1), 250)
+	unsigned := types.NewTransaction(nonce, invalidTxRecipient, value, 21000, big.NewInt(1), nil)
 	return s.signFixtureTx(from, unsigned)
 }
 
@@ -139,7 +175,9 @@ func (s *Suite) hugeAmountTx() (*types.Transaction, bool) {
 // which the sender cannot cover.
 func (s *Suite) hugeGasPriceTx() (*types.Transaction, bool) {
 	from, nonce := s.chain.GetSender(0)
-	unsigned := types.NewTransaction(nonce, invalidTxRecipient, big.NewInt(1), 21000, largeNumber(2), nil)
+	// 2^250 wei is an absurd price in tiny bytes; a megabyte-scale price
+	// field would instead trip the node's message-size cap.
+	unsigned := types.NewTransaction(nonce, invalidTxRecipient, big.NewInt(1), 21000, new(big.Int).Lsh(big.NewInt(1), 250), nil)
 	return s.signFixtureTx(from, unsigned)
 }
 
@@ -214,15 +252,74 @@ func (s *Suite) TestNewPooledTxs_66(t *utesting.T) {
 	t.Fatalf("timed out waiting for the pooled tx request within %s", announceTimeout)
 }
 
+// matrixSender returns the funded sender override for live devnet runs
+// (MATRIX_SENDER_KEY). The devnet genesis funds the matrix validator
+// accounts, not the fixture senders, so live tx-sending cases sign from the
+// funded account instead, starting from nonce zero (the matrix devnet never
+// spends that account).
+func matrixSender() (*ecdsa.PrivateKey, bool) {
+	raw := os.Getenv("MATRIX_SENDER_KEY")
+	if raw == "" {
+		return nil, false
+	}
+	key, err := crypto.HexToECDSA(strings.TrimPrefix(raw, "0x"))
+	if err != nil {
+		return nil, false
+	}
+	return key, true
+}
+
 // TestLargeTxRequest_66 tests whether the node can fulfill a large pooled
 // transaction request covering everything it was just sent (upstream
 // #22630). It skips unless xdc/166 was negotiated: the pooled transaction
 // request path is served from xdc/165 upwards.
 func (s *Suite) TestLargeTxRequest_66(t *utesting.T) {
 	t.Log(`This test sends a large batch of transactions and requests all of them back through a pooled transaction query.`)
-	hashMap, txs, err := s.generateTxs(2000)
-	if err != nil {
-		t.Fatalf("failed to generate transactions: %v", err)
+	numTxs := 2000
+	var hashMap map[common.Hash]common.Hash
+	var txs types.Transactions
+	matrixMode := false
+	if key, ok := matrixSender(); ok {
+		// Live devnet: the genesis funds the matrix validator accounts, not
+		// the fixture senders — sign from the funded account instead. The
+		// legacypool account queue caps one sender at 64 non-executable txs,
+		// so the live batch stays under it; the fixture world keeps the
+		// upstream 2000-tx calibration.
+		matrixMode = true
+		numTxs = 48
+		// The matrix sender's nonce advances as earlier batches get mined;
+		// the runner queries the chain and exports the current value.
+		nonceStart := uint64(0)
+		if v := os.Getenv("MATRIX_SENDER_NONCE"); v != "" {
+			var n uint64
+			if _, err := fmt.Sscanf(v, "%d", &n); err == nil {
+				nonceStart = n
+			}
+		}
+		sender := crypto.PubkeyToAddress(key.PublicKey)
+		hashMap = make(map[common.Hash]common.Hash, numTxs)
+		txs = make(types.Transactions, 0, numTxs)
+		signer := types.LatestSignerForChainID(s.chain.config.ChainID)
+		for i := 0; i < numTxs; i++ {
+			salt := fmt.Sprintf("matrix-salt-%d-%d", time.Now().UnixNano(), i)
+			// The devnet's hydrated floor is DefaultMinGasPrice x 2500
+			// (gas2500x defaults to genesis when the spec omits the fork) —
+			// price the batch above it or the pool silently drops every tx.
+			unsigned := types.NewTransaction(nonceStart+uint64(i), invalidTxRecipient, big.NewInt(1), 100000, big.NewInt(common.DefaultMinGasPrice*2500), []byte(salt))
+			signed, err := types.SignTx(unsigned, signer, key)
+			if err != nil {
+				t.Fatalf("failed to sign matrix tx %d: %v", i, err)
+			}
+			hashMap[signed.Hash()] = signed.Hash()
+			txs = append(txs, signed)
+		}
+		_ = sender
+	} else {
+		var err error
+		hashMap, txs, err = s.generateTxs(numTxs)
+		if err != nil {
+			t.Fatalf("failed to generate transactions: %v", err)
+		}
 	}
 	sendConn, ok := s.setupConnection66(t)
 	if !ok {
@@ -231,9 +328,13 @@ func (s *Suite) TestLargeTxRequest_66(t *utesting.T) {
 	defer sendConn.Close()
 
 	s.sendMultipleSuccessfulTxs(t, sendConn, txs)
-	// Track the consumed nonces locally, like the smoke cases do.
-	from, _ := s.chain.GetSender(0)
-	s.chain.IncNonce(from, uint64(len(txs)))
+	// Track the consumed nonces locally, like the smoke cases do. The matrix
+	// account's nonces are tracked by nothing but this run — the fresh devnet
+	// account starts at zero and the batch is spent exactly once.
+	if !matrixMode {
+		from, _ := s.chain.GetSender(0)
+		s.chain.IncNonce(from, uint64(len(txs)))
+	}
 
 	hashes := make(getPooledTransactionsData, 0, len(hashMap))
 	for hash := range hashMap {
@@ -270,28 +371,73 @@ func (s *Suite) TestLargeTxRequest_66(t *utesting.T) {
 	t.Fatalf("did not receive PooledTransactions response within %d read(s)", max66ResponseReads)
 }
 
-// sendMultipleSuccessfulTxs sends a batch of valid transactions and verifies
-// the node announces every one of them to a freshly peered connection
-// (upstream #22630).
+// sendMultipleSuccessfulTxs announces a batch of pooled transactions, serves
+// the node's body requests, and verifies the node announces every one of them
+// to a freshly peered connection (upstream #22630). From xdc/165 on the wire
+// carries announcements plus body retrieval — there is no full-broadcast
+// TxMsg to send.
 func (s *Suite) sendMultipleSuccessfulTxs(t *utesting.T, sendConn *Conn, txs types.Transactions) {
-	t.Logf("sending %d txs", len(txs))
+	t.Logf("announcing %d txs", len(txs))
+	hashMap := make(map[common.Hash]*types.Transaction, len(txs))
+	hashes := make([]common.Hash, 0, len(txs))
+	for _, tx := range txs {
+		hashMap[tx.Hash()] = tx
+		hashes = append(hashes, tx.Hash())
+	}
+	// The announcement receiver must already be connected when the pool-add
+	// broadcast fires: on this devnet the validators mine every 2 seconds, so
+	// a receiver connected after the announcement misses the broadcast and the
+	// batch is mined away under it.
 	recvConn, ok := s.setupConnection66(t)
 	if !ok {
 		return
 	}
 	defer recvConn.Close()
-
-	if err := sendConn.Write(ethProto, ethproto.TransactionMsg, txs); err != nil {
-		t.Fatalf("failed to write TxMsg: %v", err)
+	if err := sendConn.Write(ethProto, ethproto.NewPooledTransactionHashesMsg, ethproto.NewPooledTransactionHashesPacket(hashes)); err != nil {
+		t.Fatalf("failed to write pooled tx announcement: %v", err)
 	}
-	recvHashes := make([]common.Hash, 0)
+	// Serve the node's body retrieval until the window closes: the request
+	// arrives in its two-element 66 shape and must be answered with the same
+	// request id.
+	deadline := time.Now().Add(announceTimeout)
+	for time.Now().Before(deadline) {
+		code, data, err := sendConn.Read()
+		if err != nil {
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
+				continue
+			}
+			t.Fatalf("failed to read pooled tx request: %v", err)
+		}
+		if !isEth66MsgCode(code) || code-protoOffset(ethProto) != ethproto.GetPooledTransactionsMsg {
+			continue
+		}
+		var req getPooledTransactionsPacket66
+		if err := rlp.DecodeBytes(data, &req); err != nil {
+			t.Fatalf("failed to decode pooled tx request: %v", err)
+		}
+		serve := make(types.Transactions, 0, len(req.Hashes))
+		for _, hash := range req.Hashes {
+			if tx, ok := hashMap[hash]; ok {
+				serve = append(serve, tx)
+			}
+		}
+		if err := sendConn.Write(ethProto, ethproto.PooledTransactionsMsg, &pooledTransactionsPacket66{
+			RequestId: req.RequestId,
+			Txs:       serve,
+		}); err != nil {
+			t.Fatalf("failed to write pooled tx bodies: %v", err)
+		}
+		break
+	}
 	// All transactions should be announced within three wait windows.
+	recvHashes := make([]common.Hash, 0)
 	for i := 0; i < 3; i++ {
-		hashes, err := readTxAnnouncement(recvConn, announceTimeout)
+		announced, err := readTxAnnouncement(recvConn, announceTimeout)
 		if err != nil {
 			t.Fatalf("failed to read tx announcement: %v", err)
 		}
-		recvHashes = append(recvHashes, hashes...)
+		recvHashes = append(recvHashes, announced...)
 		_, missing := compareReceivedTxs(recvHashes, txs)
 		if len(missing) == 0 {
 			t.Logf("successfully received all %d txs", len(txs))

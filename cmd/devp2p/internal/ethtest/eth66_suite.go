@@ -181,18 +181,21 @@ func (s *Suite) TestSameRequestID_66(t *utesting.T) {
 	defer conn.Close()
 
 	reqID := uint64(1234)
+	// Anchor both requests on chain facts the node itself reported in its
+	// status (its head by hash, and the shared genesis by hash) — live devnet
+	// chains are not the fixture chain, so fixture numbers mean nothing here.
 	request1 := &getBlockHeadersPacket66{
 		RequestId: reqID,
 		Request: &getBlockHeadersData{
-			Origin: hashOrNumber{Number: 1},
-			Amount: 2,
+			Origin: hashOrNumber{Hash: conn.remoteHead},
+			Amount: 1,
 		},
 	}
 	request2 := &getBlockHeadersPacket66{
 		RequestId: reqID,
 		Request: &getBlockHeadersData{
-			Origin: hashOrNumber{Number: 33},
-			Amount: 2,
+			Origin: hashOrNumber{Hash: s.chain.blocks[0].Hash()},
+			Amount: 1,
 		},
 	}
 	// Write the first request without reading its response, leaving two
@@ -210,11 +213,17 @@ func (s *Suite) TestSameRequestID_66(t *utesting.T) {
 	if err != nil {
 		t.Fatalf("could not get BlockHeaders response: %v", err)
 	}
-	// The two responses may arrive in either order; every received header must
-	// match the fixture chain's block for its own number.
-	for i, headers := range []blockHeadersData{headers1, headers2} {
-		if matched, detail := headersMatch66(s.chain, headers); !matched {
-			t.Fatalf("received wrong header(s) in response %d: %s", i+1, detail)
+	// The two responses may arrive in either order (they share one request
+	// id); together they must be exactly the requested blocks — the head
+	// header and the genesis header.
+	got := map[common.Hash]bool{headers1[0].Hash(): true, headers2[0].Hash(): true}
+	want := map[common.Hash]bool{conn.remoteHead: true, s.chain.blocks[0].Hash(): true}
+	if len(headers1) != 1 || len(headers2) != 1 {
+		t.Fatalf("expected one header per response, got %d and %d", len(headers1), len(headers2))
+	}
+	for h := range want {
+		if !got[h] {
+			t.Fatalf("responses missing header %s (got %x and %x)", h, headers1[0].Hash(), headers2[0].Hash())
 		}
 	}
 }
