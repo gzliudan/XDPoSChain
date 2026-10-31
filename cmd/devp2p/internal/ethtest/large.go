@@ -21,7 +21,6 @@ import (
 	"math/big"
 
 	"github.com/XinFinOrg/XDPoSChain/common"
-	"github.com/XinFinOrg/XDPoSChain/common/hexutil"
 	"github.com/XinFinOrg/XDPoSChain/core/types"
 )
 
@@ -39,13 +38,6 @@ func largeBuffer(megabytes int) []byte {
 	buf := make([]byte, megabytes*1024*1024)
 	rand.Read(buf)
 	return buf
-}
-
-// largeString returns a very large string.
-func largeString(megabytes int) string {
-	buf := make([]byte, megabytes*1024*1024)
-	rand.Read(buf)
-	return hexutil.Encode(buf)
 }
 
 func largeBlock() *types.Block {

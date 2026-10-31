@@ -151,3 +151,15 @@ func TestEthTestsIncludesBlockHashAnnounceCase(t *testing.T) {
 func TestEthTestsIncludesBlockHashAnnounce66Case(t *testing.T) {
 	assertEthTestsInclude(t, "BlockHashAnnounce_66")
 }
+
+func TestEthTestsIncludesMaliciousTxCase(t *testing.T) {
+	assertEthTestsInclude(t, "MaliciousTx")
+}
+
+func TestEthTestsIncludesNewPooledTxs66Case(t *testing.T) {
+	assertEthTestsInclude(t, "NewPooledTxs_66")
+}
+
+func TestEthTestsIncludesLargeTxRequest66Case(t *testing.T) {
+	assertEthTestsInclude(t, "LargeTxRequest_66")
+}
