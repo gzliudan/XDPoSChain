@@ -23,6 +23,11 @@ const (
 	// client keeps it local on purpose, see the note on the protocol lengths in
 	// protocol.go.
 	ethProtoVersionXDpos2 uint = 100
+	// ethProtoVersionXDpos166 is the xdc/166 wire version, the request-id
+	// multiplexing dialect. It is only advertised by the dial variant used by
+	// the eth66 conformance cases, and a connection only speaks its two-element
+	// packet shapes when the peer actually negotiated it.
+	ethProtoVersionXDpos166 uint = 166
 )
 
 const connTimeout = 2 * time.Second
@@ -110,6 +115,24 @@ func (c *Conn) negotiateEthProtocol(caps []p2p.Cap) {
 		}
 	}
 	c.negotiatedProtoVersion = highest
+}
+
+// dial166 dials the node advertising xdc/166 alongside the base xdc/100
+// capability, so the negotiation can settle on xdc/166 when the peer supports
+// it. The caller must check the negotiated version before sending any
+// 66-shaped packet.
+func (s *Suite) dial166() (*Conn, error) {
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		return nil, err
+	}
+	conn, err := s.dialAs(key)
+	if err != nil {
+		return nil, err
+	}
+	conn.caps = append(conn.caps, p2p.Cap{Name: "eth", Version: ethProtoVersionXDpos166})
+	conn.ourHighestProtoVersion = ethProtoVersionXDpos166
+	return conn, nil
 }
 
 func (s *Suite) dialAndPeer(status *statusPacket) (*Conn, error) {
@@ -242,6 +265,47 @@ func (c *Conn) ReadEth() (interface{}, error) {
 	}
 }
 
+// isEth66MsgCode reports whether the framed message code is inside the xdc/166
+// message space: the legacy core codes plus the XDC BFT codes and the pooled
+// transaction trio (0xe0-0xe5). The latter frame past the drifted ethProtoLen
+// copy, so getProto would panic on them (see the note in protocol.go); the
+// xdc/166 read path classifies with the wire layer's message codes instead.
+func isEth66MsgCode(code uint64) bool {
+	if code < protoOffset(ethProto) {
+		return false
+	}
+	ethCode := code - protoOffset(ethProto)
+	return ethCode <= ethproto.ReceiptsMsg || (ethCode >= ethproto.VoteMsg && ethCode <= ethproto.PooledTransactionsMsg)
+}
+
+// ReadEth66 reads and decodes the next eth-subprotocol message on a connection
+// negotiated to xdc/166. Requests and responses of the five req/rep pairs
+// decode as their 66-shaped two-element packets, and the carried request id is
+// returned alongside the unwrapped legacy payload. It must only be used on
+// connections whose negotiated protocol version is xdc/166; over xdc/100 the
+// same message codes carry legacy one-element payloads (see ReadEth).
+func (c *Conn) ReadEth66() (uint64, interface{}, error) {
+	for {
+		code, data, err := c.Read()
+		if err != nil {
+			return 0, nil, err
+		}
+		if code == discMsg {
+			return 0, nil, errDisc
+		}
+		if code == pingMsg {
+			if err := c.Write(baseProto, pongMsg, []byte{}); err != nil {
+				return 0, nil, fmt.Errorf("failed to reply pong: %w", err)
+			}
+			continue
+		}
+		if !isEth66MsgCode(code) {
+			continue
+		}
+		return decodeEthPayload66(code-protoOffset(ethProto), data)
+	}
+}
+
 func decodeEthPayload(code uint64, data []byte) (interface{}, error) {
 	var msg interface{}
 	switch code {
@@ -286,4 +350,76 @@ func decodeEthPayload(code uint64, data []byte) (interface{}, error) {
 		return nil, fmt.Errorf("unable to decode eth msg: %v", err)
 	}
 	return msg, nil
+}
+
+// decodeEthPayload66 decodes an xdc/166 eth-subprotocol payload. The five
+// req/rep pairs decode as their 66-shaped two-element packets; the carried
+// request id is returned and the payload is unwrapped to its legacy form. Any
+// other code decodes through the legacy path with a zero request id.
+func decodeEthPayload66(code uint64, data []byte) (uint64, interface{}, error) {
+	switch code {
+	case ethproto.GetBlockHeadersMsg:
+		wrapped := new(getBlockHeadersPacket66)
+		if err := rlp.DecodeBytes(data, wrapped); err != nil {
+			return 0, nil, fmt.Errorf("unable to decode eth msg: %v", err)
+		}
+		return wrapped.RequestId, wrapped.Request, nil
+	case ethproto.BlockHeadersMsg:
+		wrapped := new(blockHeadersPacket66)
+		if err := rlp.DecodeBytes(data, wrapped); err != nil {
+			return 0, nil, fmt.Errorf("unable to decode eth msg: %v", err)
+		}
+		return wrapped.RequestId, &wrapped.Headers, nil
+	case ethproto.GetBlockBodiesMsg:
+		wrapped := new(getBlockBodiesPacket66)
+		if err := rlp.DecodeBytes(data, wrapped); err != nil {
+			return 0, nil, fmt.Errorf("unable to decode eth msg: %v", err)
+		}
+		return wrapped.RequestId, &wrapped.Hashes, nil
+	case ethproto.BlockBodiesMsg:
+		wrapped := new(blockBodiesPacket66)
+		if err := rlp.DecodeBytes(data, wrapped); err != nil {
+			return 0, nil, fmt.Errorf("unable to decode eth msg: %v", err)
+		}
+		return wrapped.RequestId, &wrapped.Bodies, nil
+	case ethproto.GetNodeDataMsg:
+		wrapped := new(getNodeDataPacket66)
+		if err := rlp.DecodeBytes(data, wrapped); err != nil {
+			return 0, nil, fmt.Errorf("unable to decode eth msg: %v", err)
+		}
+		return wrapped.RequestId, &wrapped.Hashes, nil
+	case ethproto.NodeDataMsg:
+		wrapped := new(nodeDataPacket66)
+		if err := rlp.DecodeBytes(data, wrapped); err != nil {
+			return 0, nil, fmt.Errorf("unable to decode eth msg: %v", err)
+		}
+		return wrapped.RequestId, &wrapped.Data, nil
+	case ethproto.GetReceiptsMsg:
+		wrapped := new(getReceiptsPacket66)
+		if err := rlp.DecodeBytes(data, wrapped); err != nil {
+			return 0, nil, fmt.Errorf("unable to decode eth msg: %v", err)
+		}
+		return wrapped.RequestId, &wrapped.Hashes, nil
+	case ethproto.ReceiptsMsg:
+		wrapped := new(receiptsPacket66)
+		if err := rlp.DecodeBytes(data, wrapped); err != nil {
+			return 0, nil, fmt.Errorf("unable to decode eth msg: %v", err)
+		}
+		return wrapped.RequestId, &wrapped.Receipts, nil
+	case ethproto.GetPooledTransactionsMsg:
+		wrapped := new(getPooledTransactionsPacket66)
+		if err := rlp.DecodeBytes(data, wrapped); err != nil {
+			return 0, nil, fmt.Errorf("unable to decode eth msg: %v", err)
+		}
+		return wrapped.RequestId, &wrapped.Hashes, nil
+	case ethproto.PooledTransactionsMsg:
+		wrapped := new(pooledTransactionsPacket66)
+		if err := rlp.DecodeBytes(data, wrapped); err != nil {
+			return 0, nil, fmt.Errorf("unable to decode eth msg: %v", err)
+		}
+		return wrapped.RequestId, &wrapped.Txs, nil
+	default:
+		msg, err := decodeEthPayload(code, data)
+		return 0, msg, err
+	}
 }
