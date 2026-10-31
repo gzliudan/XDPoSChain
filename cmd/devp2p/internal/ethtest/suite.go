@@ -103,6 +103,7 @@ func (s *Suite) EthTests() []utesting.Test {
 		{Name: "GetNodeData_66", Fn: s.TestGetNodeData_66},
 		{Name: "GetReceipts_66", Fn: s.TestGetReceipts_66},
 		{Name: "GetPooledTransactions_66", Fn: s.TestGetPooledTransactions_66},
+		{Name: "SameRequestID_66", Fn: s.TestSameRequestID_66},
 
 		// Identity-focused hello boundary tests.
 		{Name: "MalformedHello", Fn: s.TestMalformedHello},

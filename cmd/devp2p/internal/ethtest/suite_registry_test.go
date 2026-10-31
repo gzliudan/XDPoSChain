@@ -131,3 +131,7 @@ func TestEthTestsIncludesGetReceipts66Case(t *testing.T) {
 func TestEthTestsIncludesGetPooledTransactions66Case(t *testing.T) {
 	assertEthTestsInclude(t, "GetPooledTransactions_66")
 }
+
+func TestEthTestsIncludesSameRequestID66Case(t *testing.T) {
+	assertEthTestsInclude(t, "SameRequestID_66")
+}
