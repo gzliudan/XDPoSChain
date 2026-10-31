@@ -189,9 +189,17 @@ func (s *Suite) TestNewPooledTxs_66(t *utesting.T) {
 	if err := conn.Write(ethProto, ethproto.NewPooledTransactionHashesMsg, ethproto.NewPooledTransactionHashesPacket(hashes)); err != nil {
 		t.Fatalf("failed to write pooled tx announcement: %v", err)
 	}
-	for {
+	// The wait for the node's retrieval request is bounded: read timeouts are
+	// retried until the window closes, then the case fails, so a node that
+	// never asks cannot stall the run (upstream #32551).
+	deadline := time.Now().Add(announceTimeout)
+	for time.Now().Before(deadline) {
 		_, msg, err := conn.ReadEth66()
 		if err != nil {
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
+				continue
+			}
 			t.Fatalf("failed to read pooled tx request: %v", err)
 		}
 		req, ok := msg.(*getPooledTransactionsData)
@@ -203,6 +211,7 @@ func (s *Suite) TestNewPooledTxs_66(t *utesting.T) {
 		}
 		return
 	}
+	t.Fatalf("timed out waiting for the pooled tx request within %s", announceTimeout)
 }
 
 // TestLargeTxRequest_66 tests whether the node can fulfill a large pooled

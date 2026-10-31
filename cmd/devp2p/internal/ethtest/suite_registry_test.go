@@ -32,6 +32,10 @@ func TestEthTestsIncludesHeadersByHashCase(t *testing.T) {
 	assertEthTestsInclude(t, "GetBlockHeadersByHash")
 }
 
+func TestEthTestsIncludesNonexistentHeadersRepeatedCase(t *testing.T) {
+	assertEthTestsInclude(t, "GetNonexistentBlockHeadersRepeated")
+}
+
 func TestEthTestsIncludesHeadersReverseFromGenesisCase(t *testing.T) {
 	assertEthTestsInclude(t, "GetBlockHeadersReverseFromGenesis")
 }
