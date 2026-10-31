@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/XinFinOrg/XDPoSChain/common"
+	"github.com/XinFinOrg/XDPoSChain/core/forkid"
 	"github.com/XinFinOrg/XDPoSChain/core/types"
 	"github.com/XinFinOrg/XDPoSChain/crypto"
 	ethproto "github.com/XinFinOrg/XDPoSChain/eth/protocols/eth"
@@ -27,6 +28,7 @@ const (
 	// multiplexing dialect. It is only advertised by the dial variant used by
 	// the eth66 conformance cases, and a connection only speaks its two-element
 	// packet shapes when the peer actually negotiated it.
+	ethProtoVersionXDpos164 uint = 164
 	ethProtoVersionXDpos166 uint = 166
 )
 
@@ -42,6 +44,19 @@ type statusPacket struct {
 	TD              *big.Int
 	CurrentBlock    common.Hash
 	GenesisBlock    common.Hash
+}
+
+// statusPacketFork is the xdc/164+ status shape: the legacy status plus the
+// fork id the node validates with its fork filter (166 shares the 164/165
+// status form — the fork id rides in the sixth field for every version from
+// 164 on, and xdc/100 keeps the five-field shape).
+type statusPacketFork struct {
+	ProtocolVersion uint32
+	NetworkId       uint64
+	TD              *big.Int
+	CurrentBlock    common.Hash
+	GenesisBlock    common.Hash
+	ForkID          forkid.ID
 }
 
 // Conn represents an individual RLPx connection used by ethtest.
@@ -188,17 +203,32 @@ func (c *Conn) handshake() error {
 	return nil
 }
 
-func makeStatusPacket(chain *Chain, version uint) *statusPacket {
-	return &statusPacket{
+// makeStatusPacket builds the status packet for the negotiated version. From
+// xdc/164 on the node validates the fork id (forkFilter on readStatus), so the
+// packet gains the sixth field; the id is derived from the same chain config
+// the node runs (the chainDir genesis), at this chain model's head height.
+func makeStatusPacket(chain *Chain, version uint) interface{} {
+	base := statusPacketFork{
 		ProtocolVersion: uint32(version),
 		NetworkId:       chain.config.ChainID.Uint64(),
 		TD:              chain.TD(),
 		CurrentBlock:    chain.Head().Hash(),
 		GenesisBlock:    chain.blocks[0].Hash(),
 	}
+	if version >= ethProtoVersionXDpos164 {
+		base.ForkID = forkid.NewID(chain.config, chain.blocks[0], uint64(chain.Head().NumberU64()))
+		return &base
+	}
+	return &statusPacket{
+		ProtocolVersion: base.ProtocolVersion,
+		NetworkId:       base.NetworkId,
+		TD:              base.TD,
+		CurrentBlock:    base.CurrentBlock,
+		GenesisBlock:    base.GenesisBlock,
+	}
 }
 
-func (c *Conn) statusExchange(chain *Chain, status *statusPacket) error {
+func (c *Conn) statusExchange(chain *Chain, status interface{}) error {
 	statusCode := protoOffset(ethProto) + statusMsgCode
 forRead:
 	for {
@@ -208,12 +238,25 @@ forRead:
 		}
 		switch code {
 		case statusCode:
-			msg := new(statusPacket)
-			if err := rlp.DecodeBytes(data, msg); err != nil {
-				return fmt.Errorf("error decoding status packet: %w", err)
+			// The node's status grows the fork-id field from xdc/164 on: decode
+			// by the negotiated version or the six-field payload fails the
+			// five-field shape.
+			var genesisBlock common.Hash
+			if c.negotiatedProtoVersion >= ethProtoVersionXDpos164 {
+				msg := new(statusPacketFork)
+				if err := rlp.DecodeBytes(data, msg); err != nil {
+					return fmt.Errorf("error decoding status packet: %w", err)
+				}
+				genesisBlock = msg.GenesisBlock
+			} else {
+				msg := new(statusPacket)
+				if err := rlp.DecodeBytes(data, msg); err != nil {
+					return fmt.Errorf("error decoding status packet: %w", err)
+				}
+				genesisBlock = msg.GenesisBlock
 			}
-			if msg.GenesisBlock != chain.blocks[0].Hash() {
-				return fmt.Errorf("wrong genesis block in status: have %#x want %#x", msg.GenesisBlock, chain.blocks[0].Hash())
+			if genesisBlock != chain.blocks[0].Hash() {
+				return fmt.Errorf("wrong genesis block in status: have %#x want %#x", genesisBlock, chain.blocks[0].Hash())
 			}
 			break forRead
 		case discMsg:
