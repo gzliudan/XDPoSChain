@@ -84,6 +84,9 @@ func (s *Suite) EthTests() []utesting.Test {
 		{Name: "TransactionBatchThenBlockBodiesSmoke", Fn: s.TestTransactionBatchThenBlockBodiesSmoke},
 		{Name: "TransactionBatchThenReceiptsSmoke", Fn: s.TestTransactionBatchThenReceiptsSmoke},
 		{Name: "TransactionEmptyListThenReceiptsSmoke", Fn: s.TestTransactionEmptyListThenReceiptsSmoke},
+
+		// Invalid transaction rejection conformance.
+		{Name: "MaliciousTx", Fn: s.TestMaliciousTx},
 		{Name: "GetBlockBodies", Fn: s.TestGetBlockBodies},
 		{Name: "GetBlockBodiesSequentialRequests", Fn: s.TestGetBlockBodiesSequentialRequests},
 		{Name: "GetBlockBodiesMixedHashes", Fn: s.TestGetBlockBodiesMixedHashes},
@@ -110,6 +113,8 @@ func (s *Suite) EthTests() []utesting.Test {
 		{Name: "GetPooledTransactions_66", Fn: s.TestGetPooledTransactions_66},
 		{Name: "SameRequestID_66", Fn: s.TestSameRequestID_66},
 		{Name: "BlockHashAnnounce_66", Fn: s.TestBlockHashAnnounce_66},
+		{Name: "NewPooledTxs_66", Fn: s.TestNewPooledTxs_66},
+		{Name: "LargeTxRequest_66", Fn: s.TestLargeTxRequest_66},
 
 		// Identity-focused hello boundary tests.
 		{Name: "MalformedHello", Fn: s.TestMalformedHello},
