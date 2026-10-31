@@ -135,3 +135,19 @@ func TestEthTestsIncludesGetPooledTransactions66Case(t *testing.T) {
 func TestEthTestsIncludesSameRequestID66Case(t *testing.T) {
 	assertEthTestsInclude(t, "SameRequestID_66")
 }
+
+func TestEthTestsIncludesLargeAnnounceCase(t *testing.T) {
+	assertEthTestsInclude(t, "LargeAnnounce")
+}
+
+func TestEthTestsIncludesOldAnnounceCase(t *testing.T) {
+	assertEthTestsInclude(t, "OldAnnounce")
+}
+
+func TestEthTestsIncludesBlockHashAnnounceCase(t *testing.T) {
+	assertEthTestsInclude(t, "BlockHashAnnounce")
+}
+
+func TestEthTestsIncludesBlockHashAnnounce66Case(t *testing.T) {
+	assertEthTestsInclude(t, "BlockHashAnnounce_66")
+}
