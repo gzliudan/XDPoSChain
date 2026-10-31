@@ -95,6 +95,15 @@ func (s *Suite) EthTests() []utesting.Test {
 		{Name: "GetReceiptsUnknownOnly", Fn: s.TestGetReceiptsUnknownOnly},
 		{Name: "GetReceiptsUnknownThenKnown", Fn: s.TestGetReceiptsUnknownThenKnown},
 
+		// xdc/166 wire conformance; each case skips unless xdc/166 was
+		// negotiated with the peer.
+		{Name: "Status_66", Fn: s.TestStatus_66},
+		{Name: "GetBlockHeaders_66", Fn: s.TestGetBlockHeaders_66},
+		{Name: "GetBlockBodies_66", Fn: s.TestGetBlockBodies_66},
+		{Name: "GetNodeData_66", Fn: s.TestGetNodeData_66},
+		{Name: "GetReceipts_66", Fn: s.TestGetReceipts_66},
+		{Name: "GetPooledTransactions_66", Fn: s.TestGetPooledTransactions_66},
+
 		// Identity-focused hello boundary tests.
 		{Name: "MalformedHello", Fn: s.TestMalformedHello},
 		{Name: "MalformedHelloShortID", Fn: s.TestMalformedHelloShortID},

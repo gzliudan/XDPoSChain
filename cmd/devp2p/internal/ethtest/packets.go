@@ -38,6 +38,86 @@ type getReceiptsData []common.Hash
 // receiptsData represents a receipts response list aligned to requested blocks.
 type receiptsData []types.Receipts
 
+// getNodeDataPacket represents a node data query payload for eth protocol.
+type getNodeDataPacket []common.Hash
+
+// nodeDataPacket represents a node data response list aligned to requested hashes.
+type nodeDataPacket [][]byte
+
+// getPooledTransactionsData represents a pooled transactions query payload for
+// eth protocol.
+type getPooledTransactionsData []common.Hash
+
+// The *66 packet types below are the xdc/166 wrappers around the legacy
+// payloads above. Over xdc/166 every request and response of the five
+// req/rep pairs is a two-element RLP list [RequestId, legacy-payload], and
+// the receiver of a request echoes the request id back on the response. The
+// legacy payload is a named exported field rather than an embedded one: the
+// rlp package encodes only exported fields, and an embedded unexported type
+// name would be silently dropped.
+
+// getBlockHeadersPacket66 is the xdc/166 block header query carrying the
+// request id to be echoed back on the response.
+type getBlockHeadersPacket66 struct {
+	RequestId uint64
+	Request   *getBlockHeadersData
+}
+
+// blockHeadersPacket66 is the xdc/166 block headers response carrying the
+// request id of the answered query.
+type blockHeadersPacket66 struct {
+	RequestId uint64
+	Headers   blockHeadersData
+}
+
+// getBlockBodiesPacket66 is the xdc/166 block body query.
+type getBlockBodiesPacket66 struct {
+	RequestId uint64
+	Hashes    getBlockBodiesData
+}
+
+// blockBodiesPacket66 is the xdc/166 block bodies response.
+type blockBodiesPacket66 struct {
+	RequestId uint64
+	Bodies    blockBodiesData
+}
+
+// getNodeDataPacket66 is the xdc/166 node data query.
+type getNodeDataPacket66 struct {
+	RequestId uint64
+	Hashes    getNodeDataPacket
+}
+
+// nodeDataPacket66 is the xdc/166 node data response.
+type nodeDataPacket66 struct {
+	RequestId uint64
+	Data      nodeDataPacket
+}
+
+// getReceiptsPacket66 is the xdc/166 receipts query.
+type getReceiptsPacket66 struct {
+	RequestId uint64
+	Hashes    getReceiptsData
+}
+
+// receiptsPacket66 is the xdc/166 receipts response.
+type receiptsPacket66 struct {
+	RequestId uint64
+	Receipts  receiptsData
+}
+
+// getPooledTransactionsPacket66 is the xdc/166 pooled transactions query.
+type getPooledTransactionsPacket66 struct {
+	RequestId uint64
+	Hashes    getPooledTransactionsData
+}
+
+// pooledTransactionsPacket66 is the xdc/166 pooled transactions response.
+type pooledTransactionsPacket66 struct {
+	RequestId uint64
+	Txs       types.Transactions
+}
+
 // hashOrNumber is a union for specifying header request origin.
 type hashOrNumber struct {
 	Hash   common.Hash
