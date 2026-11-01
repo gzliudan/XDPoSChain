@@ -183,7 +183,9 @@ func (s *Suite) TestBlockHashAnnounce_66(t *utesting.T) {
 	// above it. A height from the genesis-only fixture model (1) is stale by
 	// ~1300 blocks and silently ignored.
 	if sendConn.remoteTD != nil {
-		number = sendConn.remoteTD.Uint64() + 64
+		// TD tracks the head height on this devnet (difficulty 1 per block);
+		// announce the immediate successor height.
+		number = sendConn.remoteTD.Uint64()
 	}
 	if err := sendConn.Write(ethProto, ethproto.NewBlockHashesMsg, &ethproto.NewBlockHashesPacket{{Hash: hash, Number: number}}); err != nil {
 		t.Fatalf("failed to write to connection: %v", err)
